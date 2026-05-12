@@ -182,6 +182,10 @@ async def _process_one_file(
         try:
             bytes_written = await client.download_file(file_id, zip_path)
         except KiteworksAPIError as e:
+            err_msg = f"download: HTTP {e.status}: {e.body or e}"
+            logger.warning(
+                "file_download_failed", file_name=name, dataset=dataset, error=err_msg
+            )
             warehouse.ledger_upsert(
                 {
                     "file_id": file_id,
@@ -195,6 +199,8 @@ async def _process_one_file(
                     "loaded_at": None,
                     "row_count": None,
                     "status": "failed",
+                    "error_message": err_msg,
+                    "parse_method": None,
                 }
             )
             return FileOutcome(
@@ -202,7 +208,7 @@ async def _process_one_file(
                 file_name=name,
                 dataset=dataset,
                 status="failed",
-                error=f"download: HTTP {e.status}: {e.body or e}",
+                error=err_msg,
             )
 
         warehouse.ledger_upsert(
@@ -218,14 +224,23 @@ async def _process_one_file(
                 "loaded_at": None,
                 "row_count": None,
                 "status": "downloaded",
+                "error_message": None,
+                "parse_method": None,
             }
         )
 
         # Parse + load.
         loop = asyncio.get_running_loop()
         try:
-            df, _original_cols, _delim = await loop.run_in_executor(None, read_dataframe, zip_path)
+            parse_result = await loop.run_in_executor(None, read_dataframe, zip_path)
         except ParseError as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "file_parse_failed",
+                file_name=name,
+                dataset=dataset,
+                error=err_msg,
+            )
             warehouse.ledger_upsert(
                 {
                     "file_id": file_id,
@@ -239,6 +254,8 @@ async def _process_one_file(
                     "loaded_at": None,
                     "row_count": None,
                     "status": "failed",
+                    "error_message": err_msg,
+                    "parse_method": "failed",
                 }
             )
             return FileOutcome(
@@ -248,6 +265,17 @@ async def _process_one_file(
                 status="failed",
                 bytes=bytes_written,
                 error=f"parse: {e}",
+            )
+
+        df = parse_result.df
+        if parse_result.method != "strict":
+            logger.warning(
+                "file_parse_used_fallback",
+                file_name=name,
+                dataset=dataset,
+                method=parse_result.method,
+                skipped_rows=parse_result.skipped_rows,
+                primary_error=parse_result.primary_error,
             )
 
         columns = derive_duckdb_schema(df)
@@ -269,6 +297,10 @@ async def _process_one_file(
         try:
             rows = warehouse.upsert_dataframe(dataset, df, primary_key=primary_key)
         except Exception as e:
+            err_msg = f"load: {type(e).__name__}: {e}"
+            logger.warning(
+                "file_load_failed", file_name=name, dataset=dataset, error=err_msg
+            )
             warehouse.ledger_upsert(
                 {
                     "file_id": file_id,
@@ -282,6 +314,8 @@ async def _process_one_file(
                     "loaded_at": None,
                     "row_count": None,
                     "status": "failed",
+                    "error_message": err_msg,
+                    "parse_method": parse_result.method,
                 }
             )
             return FileOutcome(
@@ -290,7 +324,18 @@ async def _process_one_file(
                 dataset=dataset,
                 status="failed",
                 bytes=bytes_written,
-                error=f"load: {e}",
+                error=err_msg,
+            )
+
+        # Successful load. If a fallback path was used, record the diagnostic message
+        # alongside the loaded row so users can see *which* files needed permissive
+        # parsing without trawling the logs.
+        loaded_error_msg = None
+        if parse_result.method != "strict":
+            loaded_error_msg = (
+                f"loaded via fallback method={parse_result.method}; "
+                f"skipped {parse_result.skipped_rows} rows; "
+                f"primary error: {parse_result.primary_error}"
             )
 
         warehouse.ledger_upsert(
@@ -306,6 +351,8 @@ async def _process_one_file(
                 "loaded_at": datetime.now(UTC),
                 "row_count": rows,
                 "status": "loaded",
+                "error_message": loaded_error_msg,
+                "parse_method": parse_result.method,
             }
         )
 

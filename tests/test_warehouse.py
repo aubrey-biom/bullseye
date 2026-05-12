@@ -143,3 +143,129 @@ def test_describe_lists_tables_and_columns(tmp_path: Path) -> None:
         assert {c["name"] for c in info["tables"]["sales_daily"]["columns"]} == set(cols)
     finally:
         wh.close()
+
+
+# ---------- Patch #2: error_message / parse_method columns + migration safety ----------
+
+
+def test_ledger_has_error_message_and_parse_method_columns(tmp_path: Path) -> None:
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        _, rows = wh.execute_sql("PRAGMA table_info('_file_ledger')")
+        cols = {r[1] for r in rows}
+        assert "error_message" in cols
+        assert "parse_method" in cols
+    finally:
+        wh.close()
+
+
+def test_migration_idempotent_on_existing_warehouse(tmp_path: Path) -> None:
+    """Opening a warehouse twice should not crash on the ALTER ADD COLUMN IF NOT EXISTS."""
+    db_path = tmp_path / "bpd.duckdb"
+    wh1 = Warehouse(db_path)
+    wh1.close()
+    # Second open re-runs DDL + migrations. Must not throw.
+    wh2 = Warehouse(db_path)
+    try:
+        _, rows = wh2.execute_sql("PRAGMA table_info('_file_ledger')")
+        cols = {r[1] for r in rows}
+        assert "error_message" in cols
+        assert "parse_method" in cols
+    finally:
+        wh2.close()
+
+
+def test_ledger_persists_error_message_and_parse_method(tmp_path: Path) -> None:
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        from datetime import UTC, datetime
+
+        wh.ledger_upsert(
+            {
+                "file_id": "fid-fail",
+                "file_name": "broken.zip",
+                "folder_id": "fold-1",
+                "dataset": "sales_daily",
+                "file_date": None,
+                "bytes": 100,
+                "fingerprint": "xx",
+                "downloaded_at": datetime.now(UTC),
+                "loaded_at": None,
+                "row_count": None,
+                "status": "failed",
+                "error_message": "ParseError: bogus data on line 5",
+                "parse_method": "failed",
+            }
+        )
+        _, rows = wh.execute_sql(
+            "SELECT error_message, parse_method, status FROM _file_ledger WHERE file_id = 'fid-fail'"
+        )
+        assert rows[0][0] == "ParseError: bogus data on line 5"
+        assert rows[0][1] == "failed"
+        assert rows[0][2] == "failed"
+    finally:
+        wh.close()
+
+
+def test_ledger_error_message_truncates_at_2000(tmp_path: Path) -> None:
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        from datetime import UTC, datetime
+
+        huge = "x" * 5000
+        wh.ledger_upsert(
+            {
+                "file_id": "fid-huge",
+                "file_name": "huge.zip",
+                "folder_id": "fold-1",
+                "dataset": "sales_daily",
+                "file_date": None,
+                "bytes": 100,
+                "fingerprint": "xx",
+                "downloaded_at": datetime.now(UTC),
+                "loaded_at": None,
+                "row_count": None,
+                "status": "failed",
+                "error_message": huge,
+                "parse_method": "failed",
+            }
+        )
+        _, rows = wh.execute_sql(
+            "SELECT LENGTH(error_message), error_message FROM _file_ledger WHERE file_id = 'fid-huge'"
+        )
+        assert rows[0][0] == 2000  # truncated
+        assert rows[0][1].endswith("...")
+    finally:
+        wh.close()
+
+
+def test_detect_date_column_prefers_typed_date_over_text(tmp_path: Path) -> None:
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        # Create a table with both a typed DATE column and a text-typed *_date column.
+        wh.execute_sql(
+            "CREATE TABLE sales_daily (tcin BIGINT, sale_date DATE, processed_date TEXT)"
+        )
+        # The DATE-typed sale_date should win over the TEXT processed_date.
+        assert wh.detect_date_column("sales_daily") == "sale_date"
+    finally:
+        wh.close()
+
+
+def test_detect_date_column_falls_back_to_text_name_match(tmp_path: Path) -> None:
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        # Only a text-typed *_date column. detect_date_column should still find it.
+        wh.execute_sql("CREATE TABLE orders_daily (tcin BIGINT, order_date TEXT)")
+        assert wh.detect_date_column("orders_daily") == "order_date"
+    finally:
+        wh.close()
+
+
+def test_detect_date_column_returns_none_when_absent(tmp_path: Path) -> None:
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.execute_sql("CREATE TABLE foo (a BIGINT, b TEXT)")
+        assert wh.detect_date_column("foo") is None
+    finally:
+        wh.close()

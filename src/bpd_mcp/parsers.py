@@ -248,10 +248,19 @@ PATTERNS: tuple[FilePattern, ...] = (
     ),
     FilePattern(
         dataset="po_plan_biweekly",
-        regex=_pat(r"BI_WEEKLY_PO_PLANNING"),
-        granularity="item × bi-weekly period",
+        # Tolerates the `_ITEM_DC` (or `_ITEM_<anything>_DC`) granularity token Target
+        # adds when the planning grain is distribution center rather than store —
+        # the trailing `(?:_[A-Z_]+)?` accepts any extra uppercase/underscore token.
+        regex=_pat(r"BI_WEEKLY_PO_PLANNING(?:_[A-Z_]+)?"),
+        granularity="item × bi-weekly period (DC- or store-grain)",
         frequency="bi-weekly",
         primary_key_candidates=(
+            # If a DC dimension is present, key on it.
+            ("tcin", "dc_id", "period_start_date"),
+            ("tcin", "dc_number", "period_start_date"),
+            ("tcin", "dc_id", "period_end_date"),
+            ("tcin", "dc_number", "period_end_date"),
+            # Otherwise fall back to item-period key.
             ("tcin", "period_start_date"),
             ("tcin", "period_end_date"),
             ("tcin", "week_end_date"),
@@ -356,37 +365,188 @@ def open_zipped_text(zip_path: Path) -> tuple[str, bytes]:
     return chosen.filename, data
 
 
-def read_dataframe(zip_path: Path) -> tuple[pl.DataFrame, list[str], str]:
-    """Parse a BPD zip into a Polars DataFrame.
+@dataclass(frozen=True)
+class ParseResult:
+    """Result of a successful BPD file parse.
 
-    Returns (df, original_columns, delimiter).
+    `method` is one of: 'strict' (polars happy), 'ignore_errors' (polars permissive,
+    some rows skipped), 'pandas_permissive' (fell back to pandas+python engine).
+    `skipped_rows` is only meaningful when method != 'strict'.
+    `primary_error` records the strict-parse failure that triggered fallback (None
+    if method == 'strict').
     """
-    inner_name, raw = open_zipped_text(zip_path)
-    delim = _sniff_delimiter(raw[:64 * 1024])
-    try:
-        df = pl.read_csv(
-            io.BytesIO(raw),
-            separator=delim,
-            has_header=True,
-            infer_schema_length=10000,
-            null_values=["", "NULL", "null"],
-            try_parse_dates=False,
-            truncate_ragged_lines=True,
-            ignore_errors=False,
-        )
-    except Exception as e:
-        # Surface the first 5 problem-looking lines to aid debugging.
-        sample_lines = raw.splitlines()[:6]
-        preview = b"\n".join(sample_lines).decode("utf-8", errors="replace")
-        raise ParseError(
-            f"{zip_path.name} (inner: {inner_name}): polars read failed ({e}).\n"
-            f"delim={delim!r}\nfirst lines:\n{preview}"
-        ) from e
 
+    df: pl.DataFrame
+    original_columns: list[str]
+    delimiter: str
+    method: str
+    skipped_rows: int = 0
+    primary_error: str | None = None
+
+
+def _finalize(df: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
+    """Normalize column names and apply type-hint casts. Shared by all attempts."""
     original = list(df.columns)
     df = df.rename({c: _normalize_column_name(c) for c in df.columns})
     df = _cast_known_columns(df)
-    return df, original, delim
+    return df, original
+
+
+def _attempt_strict(raw: bytes, delim: str) -> pl.DataFrame:
+    """Attempt 1: polars strict. Fail loudly on any schema error."""
+    return pl.read_csv(
+        io.BytesIO(raw),
+        separator=delim,
+        has_header=True,
+        infer_schema_length=10000,
+        null_values=["", "NULL", "null"],
+        try_parse_dates=False,
+        truncate_ragged_lines=True,
+        ignore_errors=False,
+    )
+
+
+def _attempt_polars_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, int]:
+    """Attempt 2: polars with `ignore_errors=True`. Skip rows polars can't parse.
+
+    Returns (df, skipped_rows). `skipped_rows` is estimated as
+    (lines_in_source - header - rows_in_df) and may be 0 if polars accepted
+    everything on the retry (e.g. the strict failure was a schema-inference issue
+    that ignore_errors smoothed over).
+    """
+    df = pl.read_csv(
+        io.BytesIO(raw),
+        separator=delim,
+        has_header=True,
+        infer_schema_length=10000,
+        null_values=["", "NULL", "null"],
+        try_parse_dates=False,
+        truncate_ragged_lines=True,
+        ignore_errors=True,
+    )
+    total_lines = sum(1 for ln in raw.splitlines() if ln.strip())
+    expected_rows = max(0, total_lines - 1)  # subtract header
+    skipped = max(0, expected_rows - df.height)
+    return df, skipped
+
+
+def _attempt_pandas_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, int]:
+    """Attempt 3: pandas python engine with `on_bad_lines='skip'`.
+
+    Slower than polars but tolerates malformed quoting, mixed line endings, BOM,
+    embedded delimiters in unquoted fields, etc. We then hand the result back to
+    polars (without column casting; `_finalize` will handle that).
+    """
+    import pandas as pd  # local import — pandas is only needed on this fallback path
+
+    df_pd = pd.read_csv(
+        io.BytesIO(raw),
+        sep=delim,
+        header=0,
+        engine="python",
+        on_bad_lines="skip",
+        encoding_errors="replace",
+        dtype=str,  # read everything as string; polars/_cast_known_columns handles types
+        keep_default_na=False,
+        na_values=["", "NULL", "null"],
+    )
+    total_lines = sum(1 for ln in raw.splitlines() if ln.strip())
+    expected_rows = max(0, total_lines - 1)
+    skipped = max(0, expected_rows - len(df_pd))
+    df_pl = pl.from_pandas(df_pd)
+    return df_pl, skipped
+
+
+def read_dataframe(zip_path: Path) -> ParseResult:
+    """Parse a BPD zip into a Polars DataFrame with a graceful fallback chain.
+
+    Target ships malformed files occasionally (extra delimiters mid-row, embedded
+    quotes that split fields, BOM, mixed line endings). We attempt three parsers
+    in order from strictest to most permissive, and report which one succeeded
+    via ParseResult.method so the caller can persist that info to the ledger.
+
+    Raises ParseError only if all three attempts fail.
+    """
+    inner_name, raw = open_zipped_text(zip_path)
+    delim = _sniff_delimiter(raw[:64 * 1024])
+
+    # Attempt 1: strict.
+    try:
+        df = _attempt_strict(raw, delim)
+        df, original = _finalize(df)
+        return ParseResult(
+            df=df, original_columns=original, delimiter=delim, method="strict"
+        )
+    except Exception as strict_err:
+        primary_msg = f"{type(strict_err).__name__}: {strict_err}"
+        logger.warning(
+            "parse_strict_failed",
+            file=zip_path.name,
+            inner=inner_name,
+            delim=delim,
+            error=primary_msg,
+        )
+
+    # Attempt 2: polars permissive (ignore_errors).
+    try:
+        df, skipped = _attempt_polars_permissive(raw, delim)
+        df, original = _finalize(df)
+        logger.warning(
+            "parse_fallback_polars_permissive",
+            file=zip_path.name,
+            inner=inner_name,
+            skipped_rows=skipped,
+            primary_error=primary_msg,
+        )
+        return ParseResult(
+            df=df,
+            original_columns=original,
+            delimiter=delim,
+            method="ignore_errors",
+            skipped_rows=skipped,
+            primary_error=primary_msg,
+        )
+    except Exception as polars_err:
+        polars_msg = f"{type(polars_err).__name__}: {polars_err}"
+        logger.warning(
+            "parse_fallback_polars_failed",
+            file=zip_path.name,
+            inner=inner_name,
+            error=polars_msg,
+        )
+
+    # Attempt 3: pandas python engine with on_bad_lines='skip'.
+    try:
+        df, skipped = _attempt_pandas_permissive(raw, delim)
+        df, original = _finalize(df)
+        logger.warning(
+            "parse_fallback_pandas_permissive",
+            file=zip_path.name,
+            inner=inner_name,
+            skipped_rows=skipped,
+            primary_error=primary_msg,
+        )
+        return ParseResult(
+            df=df,
+            original_columns=original,
+            delimiter=delim,
+            method="pandas_permissive",
+            skipped_rows=skipped,
+            primary_error=f"{primary_msg} | polars_permissive: {polars_msg}",
+        )
+    except Exception as pandas_err:
+        pandas_msg = f"{type(pandas_err).__name__}: {pandas_err}"
+
+    # All three attempts failed — surface every error.
+    sample_lines = raw.splitlines()[:6]
+    preview = b"\n".join(sample_lines).decode("utf-8", errors="replace")
+    raise ParseError(
+        f"{zip_path.name} (inner: {inner_name}): all parse attempts failed.\n"
+        f"  strict: {primary_msg}\n"
+        f"  polars_permissive: {polars_msg}\n"
+        f"  pandas_permissive: {pandas_msg}\n"
+        f"delim={delim!r}\nfirst lines:\n{preview}"
+    )
 
 
 # ---------- type casting ----------

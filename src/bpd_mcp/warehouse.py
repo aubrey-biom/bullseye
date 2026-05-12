@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS _file_ledger (
     downloaded_at  TIMESTAMP NOT NULL,
     loaded_at      TIMESTAMP,
     row_count      BIGINT,
-    status         TEXT NOT NULL
+    status         TEXT NOT NULL,
+    error_message  TEXT,
+    parse_method   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS _sync_log (
@@ -60,6 +62,13 @@ CREATE TABLE IF NOT EXISTS _schema_registry (
 );
 """
 
+# Migrations: ALTER ADD COLUMN IF NOT EXISTS so existing warehouses pick up new
+# columns without losing data. Each entry must be idempotent on its own.
+_MIGRATIONS = (
+    "ALTER TABLE _file_ledger ADD COLUMN IF NOT EXISTS error_message TEXT",
+    "ALTER TABLE _file_ledger ADD COLUMN IF NOT EXISTS parse_method TEXT",
+)
+
 
 def _pattern_for(dataset: str) -> FilePattern:
     for p in PATTERNS:
@@ -72,6 +81,26 @@ def quote_ident(name: str) -> str:
     """DuckDB identifier quoting — only safe values are A-Z, a-z, 0-9, underscore."""
     safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in name)
     return f'"{safe}"'
+
+
+def _coerce_date(v: Any) -> Any:
+    """Best-effort: if `v` is a string that looks like an ISO date, parse to a date.
+
+    Returns the original value if it doesn't look like a date (e.g. it's already
+    a date/datetime, or it's NULL, or it's a non-date string we can't interpret).
+    """
+    from datetime import date as _date
+    from datetime import datetime as _dt
+
+    if v is None or isinstance(v, _date | _dt):
+        return v
+    if isinstance(v, str):
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+            try:
+                return _dt.strptime(v[:10], fmt).date()
+            except ValueError:
+                continue
+    return v
 
 
 class Warehouse:
@@ -89,10 +118,14 @@ class Warehouse:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(str(db_path), read_only=read_only)
         # DuckDB connection objects are not thread-safe across operations; serialize.
-        self._lock = threading.Lock()
+        # RLock so helper methods (e.g. detect_date_column) can be called while a
+        # caller already holds the lock without deadlocking.
+        self._lock = threading.RLock()
         if not read_only:
             with self._lock:
                 self._conn.execute(METADATA_DDL)
+                for stmt in _MIGRATIONS:
+                    self._conn.execute(stmt)
 
     @property
     def read_only(self) -> bool:
@@ -245,13 +278,17 @@ class Warehouse:
     def ledger_upsert(self, row: dict[str, Any]) -> None:
         if self._read_only:
             raise RuntimeError("read-only warehouse cannot write ledger")
+        err = row.get("error_message")
+        if isinstance(err, str) and len(err) > 2000:
+            # Truncate only at 2000 to keep diagnostics readable in the DB.
+            err = err[:1997] + "..."
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO _file_ledger
                   (file_id, file_name, folder_id, dataset, file_date, bytes, fingerprint,
-                   downloaded_at, loaded_at, row_count, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   downloaded_at, loaded_at, row_count, status, error_message, parse_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (file_id) DO UPDATE SET
                     file_name = excluded.file_name,
                     folder_id = excluded.folder_id,
@@ -262,7 +299,9 @@ class Warehouse:
                     downloaded_at = excluded.downloaded_at,
                     loaded_at = excluded.loaded_at,
                     row_count = excluded.row_count,
-                    status = excluded.status
+                    status = excluded.status,
+                    error_message = excluded.error_message,
+                    parse_method = excluded.parse_method
                 """,
                 [
                     row["file_id"],
@@ -276,6 +315,8 @@ class Warehouse:
                     row.get("loaded_at"),
                     row.get("row_count"),
                     row["status"],
+                    err,
+                    row.get("parse_method"),
                 ],
             )
 
@@ -372,6 +413,73 @@ class Warehouse:
             rows = cur.fetchall() if cols else []
         return cols, rows
 
+    def detect_date_column(self, table: str) -> str | None:
+        """Return the best date column for `table`, or None.
+
+        Type-driven detection: queries information_schema for columns whose data
+        type is DATE/TIMESTAMP AND whose name contains 'date'. First match wins.
+        Falls back to a per-dataset known-good registry if no type-DATE column
+        exists (e.g. Target ships dates as TEXT, which can still be MIN/MAX-ed).
+        """
+        with self._lock:
+            type_match = self._conn.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'main' AND table_name = ?
+                  AND (UPPER(data_type) LIKE 'DATE%' OR UPPER(data_type) LIKE 'TIMESTAMP%')
+                  AND LOWER(column_name) LIKE '%date%'
+                ORDER BY ordinal_position
+                """,
+                [table],
+            ).fetchall()
+            if type_match:
+                return type_match[0][0]
+            # Type-agnostic name match: any column with 'date' in the name. MIN/MAX
+            # still works on TEXT dates if they're ISO-formatted.
+            name_match = self._conn.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'main' AND table_name = ?
+                  AND LOWER(column_name) LIKE '%date%'
+                ORDER BY ordinal_position
+                """,
+                [table],
+            ).fetchall()
+            if name_match:
+                return name_match[0][0]
+
+        # Per-dataset fallback registry — used only when introspection finds
+        # nothing. These are the canonical primary date columns per dataset.
+        fallback = {
+            "sales_daily": "sale_date",
+            "sales_weekly": "week_end_date",
+            "sales_weekly_item": "week_end_date",
+            "inventory_daily": "snapshot_date",
+            "inventory_weekly": "week_end_date",
+            "inventory_weekly_item": "week_end_date",
+            "gross_margin": "week_end_date",
+            "gross_margin_item": "week_end_date",
+            "item_attr": "as_of_date",
+            "item_attr_extended": "as_of_date",
+            "location_attr": "as_of_date",
+            "orders_daily": "order_date",
+            "po_plan_daily": "plan_date",
+            "po_plan_biweekly": "period_end_date",
+            "forecast_weekly": "week_end_date",
+        }
+        candidate = fallback.get(table)
+        if candidate is None:
+            return None
+        # Only return the fallback if the table actually has that column.
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
+                [table, candidate],
+            ).fetchone()
+        return candidate if row else None
+
     def list_datasets(self) -> list[dict[str, Any]]:
         """One row per known dataset table with summary stats."""
         with self._lock:
@@ -384,25 +492,8 @@ class Warehouse:
             }
             datasets = [p.dataset for p in PATTERNS if p.dataset in tables]
             results: list[dict[str, Any]] = []
-            # Date-column candidates across all 14 datasets. First match in this list
-            # for a given table wins for the row's min/max date display.
-            DATE_COL_CANDIDATES = (
-                "sale_date",
-                "snapshot_date",
-                "week_end_date",
-                "order_date",
-                "po_date",
-                "plan_date",
-                "expected_date",
-                "period_end_date",
-                "period_start_date",
-                "inv_date",
-                "inventory_date",
-                "forecast_date",
-            )
             for ds in datasets:
-                cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info('{ds}')").fetchall()}
-                date_col = next((c for c in DATE_COL_CANDIDATES if c in cols), None)
+                date_col = self.detect_date_column(ds)
                 row_count = self._conn.execute(
                     f"SELECT COUNT(*) FROM {quote_ident(ds)}"
                 ).fetchone()[0]
@@ -412,7 +503,11 @@ class Warehouse:
                         f"SELECT MIN({quote_ident(date_col)}), MAX({quote_ident(date_col)}) "
                         f"FROM {quote_ident(ds)}"
                     ).fetchone()
-                    min_date, max_date = md
+                    # Coerce ISO-formatted text dates to `date` so callers can
+                    # mix-and-match values across datasets that use DATE vs TEXT
+                    # columns (Target ships both).
+                    min_date = _coerce_date(md[0])
+                    max_date = _coerce_date(md[1])
                 file_count, last_loaded = self._conn.execute(
                     "SELECT COUNT(*), MAX(loaded_at) FROM _file_ledger "
                     "WHERE dataset = ? AND status = 'loaded'",

@@ -55,6 +55,25 @@ async def cache_status(
     raw_bytes = _dir_bytes(settings.raw_dir)
     db_bytes = settings.db_path.stat().st_size if settings.db_path.exists() else 0
     dataset_rows = warehouse.list_datasets()
+
+    # Per-dataset breakdown: which date column was detected, the row count, and
+    # min/max. When a dataset has no date column, we expose it as null so the
+    # caller can tell "we tried" from "no data at all".
+    per_dataset: list[dict[str, Any]] = []
+    for r in dataset_rows:
+        date_col = warehouse.detect_date_column(r["dataset"])
+        per_dataset.append(
+            {
+                "dataset": r["dataset"],
+                "row_count": r["row_count"],
+                "date_column": date_col,
+                "min_date": r["min_date"],
+                "max_date": r["max_date"],
+                "file_count": r["file_count"],
+                "last_loaded_at": r["last_loaded_at"],
+            }
+        )
+
     overall_min = min(
         (r["min_date"] for r in dataset_rows if r["min_date"] is not None),
         default=None,
@@ -73,6 +92,7 @@ async def cache_status(
         "earliest_data_date": overall_min,
         "latest_data_date": overall_max,
         "last_sync_finished_at": info["last_sync_finished_at"],
+        "per_dataset": per_dataset,
     }
     return make_kv_response(data=payload, title="Cache status", fmt=params.response_format)
 

@@ -189,6 +189,33 @@ NULL — Target uses it in their data model and silently coercing would lose mea
 Schema drift (new columns) is logged with the diff. The data table is not auto-altered
 in v1; you can re-run `bpd_refresh_dataset` with `full=true` if a real column was added.
 
+### Parse resilience (May 2026 patch)
+
+Target sometimes ships malformed files (extra delimiters, embedded quotes, BOM,
+mixed line endings). The parser uses a three-tier fallback chain and records
+which tier succeeded:
+
+1. **`strict`** — polars `read_csv` with strict parsing. The happy path.
+2. **`ignore_errors`** — polars with `ignore_errors=True`. Rows that fail
+   tokenization are skipped; the file still loads.
+3. **`pandas_permissive`** — pandas python engine with
+   `on_bad_lines='skip'`. Slower but tolerates everything but binary garbage.
+
+`_file_ledger` has two diagnostic columns to expose what happened:
+
+- **`parse_method`** ∈ `{strict, ignore_errors, pandas_permissive, failed}`
+- **`error_message`** — full exception text (truncated only at 2000 chars).
+  Populated on both failures and on fallback successes (so you can find files
+  that loaded *but* needed permissive parsing).
+
+Useful query: `SELECT file_name, dataset, status, parse_method, error_message
+FROM _file_ledger WHERE parse_method != 'strict' OR status = 'failed'`.
+
+The `bpd_cache_status` tool reports overall earliest/latest data dates *and*
+a per-dataset breakdown showing the detected date column and date range per
+table. Date columns are discovered by type (DATE/TIMESTAMP) first, then by
+name heuristic (`*_date`), then by a per-dataset fallback registry.
+
 ---
 
 ## Security model (§15)
