@@ -119,6 +119,14 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | `bpd_get_inventory_snapshot` | Latest known on-hand per TCIN × location at or before a date.               |
 | `bpd_get_sell_through`       | Joins sales + latest inventory to compute weeks-of-supply + sell-through.   |
 
+### S&OP analytics (May 2026 patch)
+
+| Tool                          | Purpose                                                                                  |
+| ----------------------------- | ---------------------------------------------------------------------------------------- |
+| `bpd_get_open_orders`         | Outstanding Target POs summed by SKU. Uses an "open/remaining" qty col if present; else excludes statuses that look fulfilled/closed; else sums all ordered units placed ≤ `as_of_date`. Method chosen is reported in `extra.method`. |
+| `bpd_get_upcoming_pos`        | UNION of `po_plan_daily` + `po_plan_biweekly`, grouped by week. `weeks_forward` (default 8) is anchored at today. |
+| `bpd_get_forecast_vs_actual`  | Joins Target's DFE `forecast_weekly` against `sales_weekly`. Returns forecast/actual/variance per group; `aggregate` picks `by_sku_week` (default), `by_sku_location_week`, or `by_sku`. |
+
 ### Admin
 
 | Tool               | Purpose                                                                                   |
@@ -145,13 +153,18 @@ accepts a `response_format` of `markdown` (default) or `json`.
               +---------------------+         +------------------------+
               | Kiteworks REST API  |         | Local data layer       |
               | /oauth/token        |         | raw/ (zip audit trail) |
-              | /rest/folders/top   |         | bpd.duckdb             |
+              | /rest/folders/top   |         | bpd.duckdb (15 tables) |
               | /rest/folders/{}/.. |         |  ├ sales_daily         |
-              | /rest/files/{}/..   |         |  ├ sales_weekly        |
-              +---------------------+         |  ├ inventory_*         |
-                                              |  ├ item_attr           |
+              | /rest/files/{}/..   |         |  ├ sales_weekly[_item] |
+              +---------------------+         |  ├ inventory_daily     |
+                                              |  ├ inventory_weekly[_item]
+                                              |  ├ gross_margin[_item] |
+                                              |  ├ item_attr[_extended]|
                                               |  ├ location_attr       |
-                                              |  ├ gross_margin        |
+                                              |  ├ orders_daily        |
+                                              |  ├ po_plan_daily       |
+                                              |  ├ po_plan_biweekly    |
+                                              |  ├ forecast_weekly     |
                                               |  ├ _file_ledger        |
                                               |  ├ _sync_log           |
                                               |  └ _schema_registry    |

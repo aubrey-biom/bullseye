@@ -102,12 +102,20 @@ class SearchFilesInput(_BaseModel):
 
 KnownDataset = Literal[
     "sales_daily",
-    "inventory_daily",
     "sales_weekly",
+    "sales_weekly_item",
+    "inventory_daily",
     "inventory_weekly",
-    "item_attr",
-    "location_attr",
+    "inventory_weekly_item",
     "gross_margin",
+    "gross_margin_item",
+    "item_attr",
+    "item_attr_extended",
+    "location_attr",
+    "orders_daily",
+    "po_plan_daily",
+    "po_plan_biweekly",
+    "forecast_weekly",
 ]
 
 
@@ -214,6 +222,65 @@ class SellThroughInput(_BaseModel):
 
 
 class DescribeSchemaInput(_BaseModel):
+    response_format: ResponseFormat = "markdown"
+
+
+# --------------------------------------------------------------------------------------
+# S&OP analytics (May 2026 patch)
+# --------------------------------------------------------------------------------------
+
+
+class OpenOrdersInput(_BaseModel):
+    as_of_date: _date | None = Field(
+        default=None,
+        description=(
+            "Treat orders placed on or before this date as candidates for being open. "
+            "Defaults to today."
+        ),
+    )
+    location_filter: list[int] | None = Field(
+        default=None,
+        description="Restrict to these store/location IDs.",
+    )
+    tcin_filter: list[int] | None = Field(
+        default=None, description="Restrict to these TCINs."
+    )
+    response_format: ResponseFormat = "markdown"
+
+
+class UpcomingPosInput(_BaseModel):
+    weeks_forward: int = Field(
+        default=8,
+        ge=1,
+        le=52,
+        description="How many weeks past `today` to include.",
+    )
+    tcin_filter: list[int] | None = Field(
+        default=None, description="Restrict to these TCINs."
+    )
+    response_format: ResponseFormat = "markdown"
+
+
+class ForecastVsActualInput(_BaseModel):
+    weeks_back: int = Field(
+        default=12,
+        ge=1,
+        le=104,
+        description="How many weeks of history to compare. Anchored at today.",
+    )
+    tcin_filter: list[int] | None = Field(
+        default=None, description="Restrict to these TCINs."
+    )
+    location_filter: list[int] | None = Field(
+        default=None, description="Restrict to these store/location IDs."
+    )
+    aggregate: Literal["by_sku_week", "by_sku_location_week", "by_sku"] = Field(
+        default="by_sku_week",
+        description=(
+            "How to aggregate the join. `by_sku_week` rolls up across locations; "
+            "`by_sku_location_week` is the most granular; `by_sku` collapses time."
+        ),
+    )
     response_format: ResponseFormat = "markdown"
 
 

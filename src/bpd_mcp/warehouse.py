@@ -384,12 +384,25 @@ class Warehouse:
             }
             datasets = [p.dataset for p in PATTERNS if p.dataset in tables]
             results: list[dict[str, Any]] = []
+            # Date-column candidates across all 14 datasets. First match in this list
+            # for a given table wins for the row's min/max date display.
+            DATE_COL_CANDIDATES = (
+                "sale_date",
+                "snapshot_date",
+                "week_end_date",
+                "order_date",
+                "po_date",
+                "plan_date",
+                "expected_date",
+                "period_end_date",
+                "period_start_date",
+                "inv_date",
+                "inventory_date",
+                "forecast_date",
+            )
             for ds in datasets:
                 cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info('{ds}')").fetchall()}
-                date_col = next(
-                    (c for c in ("sale_date", "snapshot_date", "week_end_date") if c in cols),
-                    None,
-                )
+                date_col = next((c for c in DATE_COL_CANDIDATES if c in cols), None)
                 row_count = self._conn.execute(
                     f"SELECT COUNT(*) FROM {quote_ident(ds)}"
                 ).fetchone()[0]

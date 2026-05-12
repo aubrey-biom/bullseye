@@ -46,9 +46,10 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "C4", "SIM", "RUF"]
 # E501: line too long (we keep prose long-form in docstrings)
-# RUF001: ambiguous unicode (em-dashes used stylistically in docstrings)
+# RUF001: ambiguous unicode in identifiers/strings (em-dashes used stylistically)
+# RUF002: ambiguous unicode in docstrings (× for item×location×week is clearer than `x`)
 # SIM105: try/except/pass → contextlib.suppress (the explicit form reads clearer here)
-ignore = ["E501", "RUF001", "SIM105"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "SIM105"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

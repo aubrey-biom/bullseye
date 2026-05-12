@@ -33,12 +33,14 @@ from .schemas import (
     CacheStatusInput,
     ClearCacheInput,
     DescribeSchemaInput,
+    ForecastVsActualInput,
     GetFileMetadataInput,
     InventorySnapshotInput,
     KnownDataset,
     ListDatasetsInput,
     ListFolderContentsInput,
     ListTopFoldersInput,
+    OpenOrdersInput,
     RefreshDatasetInput,
     ResponseFormat,
     RunSqlInput,
@@ -48,6 +50,7 @@ from .schemas import (
     SyncNewFilesInput,
     ToolResponse,
     TopSkusInput,
+    UpcomingPosInput,
 )
 from .tools import admin as admin_tools
 from .tools import files as files_tools
@@ -527,6 +530,113 @@ async def bpd_get_sell_through(
             end_date=end_date,
             tcin=tcin,
             location_id=location_id,
+            response_format=response_format,
+        ),
+    )
+
+
+# --------------------------------------------------------------------------------------
+# S&OP analytics (May 2026 patch)
+# --------------------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="bpd_get_open_orders",
+    description=(
+        "Outstanding Target POs to the vendor, summed by SKU. Reads the orders_daily "
+        "table loaded from `BV_<BPID>_DAILY_ORDER_TCIN_LOC_*.zip`. Uses any of "
+        "{open_units, units_remaining, qty_open, ...} if present; otherwise excludes "
+        "rows whose status looks fulfilled; otherwise sums all ordered units placed "
+        "on or before `as_of_date`. The chosen method is reported in `extra.method`."
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bpd_get_open_orders(
+    ctx: Context,
+    as_of_date: _date | None = None,
+    location_filter: list[int] | None = None,
+    tcin_filter: list[int] | None = None,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await query_tools.get_open_orders(
+        app.warehouse_ro.get(),
+        OpenOrdersInput(
+            as_of_date=as_of_date,
+            location_filter=location_filter,
+            tcin_filter=tcin_filter,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_get_upcoming_pos",
+    description=(
+        "Target's planned future POs to Biom, by week and SKU. Combines po_plan_daily "
+        "and po_plan_biweekly (UNION ALL after projecting to (tcin, week, qty)). The "
+        "qty and date columns on each table are resolved at runtime, not hardcoded."
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bpd_get_upcoming_pos(
+    ctx: Context,
+    weeks_forward: int = 8,
+    tcin_filter: list[int] | None = None,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await query_tools.get_upcoming_pos(
+        app.warehouse_ro.get(),
+        UpcomingPosInput(
+            weeks_forward=weeks_forward,
+            tcin_filter=tcin_filter,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_get_forecast_vs_actual",
+    description=(
+        "Join Target's DFE weekly forecast (forecast_weekly) with sales_weekly actuals. "
+        "Returns forecast_units, actual_units, variance_units, and variance_pct per "
+        "group. `aggregate` controls grouping: by_sku_week (default), "
+        "by_sku_location_week (most granular), or by_sku (collapses time)."
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bpd_get_forecast_vs_actual(
+    ctx: Context,
+    weeks_back: int = 12,
+    tcin_filter: list[int] | None = None,
+    location_filter: list[int] | None = None,
+    aggregate: Literal["by_sku_week", "by_sku_location_week", "by_sku"] = "by_sku_week",
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await query_tools.get_forecast_vs_actual(
+        app.warehouse_ro.get(),
+        ForecastVsActualInput(
+            weeks_back=weeks_back,
+            tcin_filter=tcin_filter,
+            location_filter=location_filter,
+            aggregate=aggregate,
             response_format=response_format,
         ),
     )

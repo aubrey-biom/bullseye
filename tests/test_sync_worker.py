@@ -73,9 +73,9 @@ async def test_sync_new_files_full_path(tmp_path: Path) -> None:
         )
     )
 
-    # --- Children: one zip file matching BV_999000_DLY_SALES_ITEM_LOC_VEND_04212026_KW.zip
+    # --- Children: one zip file matching the May 2026 DAILY_SALES_TCIN_LOC pattern.
     file_id = "00000000-0000-0000-0000-0000000000aa"
-    file_name = "BV_999000_DLY_SALES_ITEM_LOC_VEND_04212026_KW.zip"
+    file_name = "BV_999000_DAILY_SALES_TCIN_LOC_04212026_KW.zip"
     respx.get(
         "https://securesharek.target.com/rest/folders/"
         "00000000-0000-0000-0000-000000000001/children"
@@ -162,7 +162,7 @@ async def test_sync_is_idempotent(tmp_path: Path) -> None:
         return_value=httpx.Response(200, json={"data": [vendor_folder], "metadata": {"total": 1}})
     )
     file_id = "FF"
-    file_name = "BV_999000_WKLY_GM_ITEM_VEND_04252026_KW.zip"
+    file_name = "BV_999000_WEEKLY_GM_TCIN_LOC_04252026_KW.zip"
     respx.get("https://securesharek.target.com/rest/folders/F1/children").mock(
         return_value=httpx.Response(
             200,
