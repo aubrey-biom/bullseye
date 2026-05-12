@@ -868,6 +868,22 @@ async def get_forecast_vs_actual(
     fc_date_expr = fc_date.select_as_date()
     act_date_expr = act_date.select_as_date()
 
+    # Patch #5: forecast_weekly uses Sunday-anchored fiscal_week_begin_d while
+    # sales_weekly uses Saturday-anchored sales_date. Pre-fix, the FULL OUTER
+    # JOIN on week_end_date produced ZERO matches because the two sides were
+    # always 6 days apart. Canonicalize both to week-end (Saturday) when
+    # joining: if the resolved forecast date column is a week-BEGIN field,
+    # shift +6 days. Otherwise leave it alone (some Target variants ship a
+    # week-end column directly).
+    fc_name_lower = fc_date.name.lower()
+    fc_is_week_begin = "begin" in fc_name_lower or "start" in fc_name_lower
+    if fc_is_week_begin:
+        # DuckDB's DATE + INTERVAL returns TIMESTAMP; cast back to DATE so the
+        # join column type matches sales_weekly's pure DATE.
+        fc_week_end_expr = f"CAST({fc_date_expr} + INTERVAL 6 DAY AS DATE)"
+    else:
+        fc_week_end_expr = fc_date_expr
+
     weeks_back = int(params.weeks_back)
     fc_where: list[str] = [
         f"{fc_date_expr} >= current_date - INTERVAL '{weeks_back} weeks'",
@@ -953,8 +969,9 @@ async def get_forecast_vs_actual(
     act_loc_proj = (
         f"{quote_ident(act_loc.name)} AS location_id, " if (act_loc and "location_id" in group_cols) else ""
     )
+    # Project the canonical Saturday week-end on BOTH sides so the join works.
     fc_week_proj = (
-        f"{fc_date_expr} AS week_end_date, " if "week_end_date" in group_cols else ""
+        f"{fc_week_end_expr} AS week_end_date, " if "week_end_date" in group_cols else ""
     )
     act_week_proj = (
         f"{act_date_expr} AS week_end_date, " if "week_end_date" in group_cols else ""
@@ -1007,6 +1024,8 @@ async def get_forecast_vs_actual(
         extra={
             "forecast_date_col": fc_date.name,
             "forecast_date_type": fc_date.duckdb_type,
+            "forecast_week_anchor": "begin" if fc_is_week_begin else "end",
+            "forecast_week_shift_days": 6 if fc_is_week_begin else 0,
             "forecast_units_col": fc_units.name,
             "forecast_snapshot_col": fc_snap.name if fc_snap else None,
             "actual_date_col": act_date.name,

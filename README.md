@@ -165,6 +165,19 @@ revised one. The tool picks the latest `last_update_d` ≤ cutoff per
 
 ---
 
+## Target schema quirks
+
+Worth knowing when writing custom SQL against the warehouse — bugs hide here:
+
+- **Week anchors disagree.** `forecast_weekly.fiscal_week_begin_d` is Sunday-anchored; `sales_weekly.sales_date` is the Saturday week-end. `bpd_get_forecast_vs_actual` normalizes both to Saturday (shifts the forecast +6 days) for joining. If you write a manual join via `bpd_run_sql`, do the same.
+- **`item_attr` is in EAV form** — item attributes are rows (`mta_n`, `mta_value_n`), not columns. Pivot to wide form in your query if you need attributes side-by-side.
+- **`sales_weekly.sales_date` is the week-end Saturday**, not a generic sales date. Don't filter as if it's a "transaction occurred on this day" column.
+- **`forecast_weekly` ships dates as VARCHAR.** `fiscal_week_begin_d` is stored as text like `'2026-05-03'`. The analytics tools insert a `CAST(... AS DATE)` at query time automatically; manual SQL needs the same cast.
+- **`forecast_weekly` carries multiple snapshots per (tcin, location, week)** distinguished by `last_update_d`. Use `bpd_get_forecast_vs_actual`'s `as_of_date` (or `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY last_update_d DESC)`) to pick a single snapshot.
+- **Product names contain unescaped inch marks** (e.g. `6"` in the Bone SKU). The parser uses `quote_char=None` to handle this. If you ever write a custom CSV reader against the raw BPD files, do the same.
+
+---
+
 ## Warehouse design (Patch #3)
 
 The MCP keeps **one** `~/.bpd-mcp/bpd.duckdb` file. Engine-level read-only execution
