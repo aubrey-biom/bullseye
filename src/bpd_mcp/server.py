@@ -33,6 +33,7 @@ from .schemas import (
     CacheStatusInput,
     ClearCacheInput,
     DescribeSchemaInput,
+    ExportQueryToCsvInput,
     ForecastVsActualInput,
     GetFileMetadataInput,
     HealthCheckInput,
@@ -400,6 +401,44 @@ async def bpd_run_sql(
 
 
 @mcp.tool(
+    name="bpd_export_query_to_csv",
+    description=(
+        "Run a read-only SQL query and write the result to a CSV file in "
+        "~/.bpd-mcp/exports/<filename>. Useful for sharing analytical results "
+        "with team members who don't have MCP access. Same read-only safety as "
+        "bpd_run_sql (engine + validator). Returns the absolute path so the user "
+        "can open the file in Finder."
+    ),
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def bpd_export_query_to_csv(
+    ctx: Context,
+    sql: str,
+    filename: str,
+    include_header: bool = True,
+    max_rows: int = 1_000_000,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await query_tools.export_query_to_csv(
+        app.warehouse_ro,
+        app.settings,
+        ExportQueryToCsvInput(
+            sql=sql,
+            filename=filename,
+            include_header=include_header,
+            max_rows=max_rows,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
     name="bpd_describe_schema",
     description=(
         "Return all tables, columns, and types in the local BPD warehouse. Also "
@@ -649,6 +688,7 @@ async def bpd_get_forecast_vs_actual(
     tcin_filter: list[int] | None = None,
     location_filter: list[int] | None = None,
     aggregate: Literal["by_sku_week", "by_sku_location_week", "by_sku"] = "by_sku_week",
+    as_of_date: _date | None = None,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
@@ -659,6 +699,7 @@ async def bpd_get_forecast_vs_actual(
             tcin_filter=tcin_filter,
             location_filter=location_filter,
             aggregate=aggregate,
+            as_of_date=as_of_date,
             response_format=response_format,
         ),
     )

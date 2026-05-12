@@ -183,6 +183,37 @@ class RunSqlInput(_BaseModel):
     response_format: ResponseFormat = "markdown"
 
 
+class ExportQueryToCsvInput(_BaseModel):
+    sql: str = Field(
+        min_length=1,
+        description="The SQL query to execute (must be read-only — same safety as bpd_run_sql).",
+    )
+    filename: str = Field(
+        min_length=1,
+        description=(
+            "Output filename. Must end in .csv and contain no path separators "
+            "(no /, no \\). Saved to ~/.bpd-mcp/exports/<filename>."
+        ),
+    )
+    include_header: bool = Field(
+        default=True, description="Include column headers as the first row."
+    )
+    max_rows: int = Field(
+        default=1_000_000,
+        ge=1,
+        le=10_000_000,
+        description="Hard row cap to avoid run-away exports.",
+    )
+    response_format: ResponseFormat = "markdown"
+
+
+class ExportQueryToCsvOutput(_BaseModel):
+    path: str
+    rows_written: int
+    columns: list[str]
+    bytes_written: int
+
+
 class SalesSummaryInput(_BaseModel):
     grain: Literal["day", "week", "month"] = "week"
     start_date: _date | None = None
@@ -279,6 +310,17 @@ class ForecastVsActualInput(_BaseModel):
         description=(
             "How to aggregate the join. `by_sku_week` rolls up across locations; "
             "`by_sku_location_week` is the most granular; `by_sku` collapses time."
+        ),
+    )
+    as_of_date: _date | None = Field(
+        default=None,
+        description=(
+            "Forecast snapshot cutoff. forecast_weekly contains multiple snapshots "
+            "over time (different last_update_d values per (tcin, location, week)). "
+            "When set, only forecasts with last_update_d <= as_of_date are considered, "
+            "and the latest within that window is used. When omitted, defaults to "
+            "the day before each forecast week begins — giving you the pre-week "
+            "prediction Target actually published, not a post-hoc revised one."
         ),
     )
     response_format: ResponseFormat = "markdown"

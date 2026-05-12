@@ -423,69 +423,61 @@ class Warehouse:
     def detect_date_column(self, table: str) -> str | None:
         """Return the best date column for `table`, or None.
 
-        Type-driven detection: queries information_schema for columns whose data
-        type is DATE/TIMESTAMP AND whose name contains 'date'. First match wins.
-        Falls back to a per-dataset known-good registry if no type-DATE column
-        exists (e.g. Target ships dates as TEXT, which can still be MIN/MAX-ed).
+        Priority order (Patch #4, brief Issue 2):
+          1. Column with DuckDB type DATE or TIMESTAMP (regardless of name).
+          2. Column name ending in `_date` / `_dt` / `_d` (case-insensitive).
+          3. Column name containing `date`, `week`, `period`, `as_of`, or `effective`.
+          4. Per-dataset registry of canonical names (final fallback).
+
+        Within each priority tier, earlier ordinal_position wins. Target uses the
+        `_d` suffix heavily (`fiscal_week_begin_d`, `last_update_d`,
+        `processed_ct_d`), so the suffix tier closes the gap that an earlier
+        substring-only "date" heuristic missed.
         """
         with self._lock:
-            type_match = self._conn.execute(
+            all_cols = self._conn.execute(
                 """
-                SELECT column_name
+                SELECT column_name, data_type
                 FROM information_schema.columns
                 WHERE table_schema = 'main' AND table_name = ?
-                  AND (UPPER(data_type) LIKE 'DATE%' OR UPPER(data_type) LIKE 'TIMESTAMP%')
-                  AND LOWER(column_name) LIKE '%date%'
                 ORDER BY ordinal_position
                 """,
                 [table],
             ).fetchall()
-            if type_match:
-                return type_match[0][0]
-            # Type-agnostic name match: any column with 'date' in the name. MIN/MAX
-            # still works on TEXT dates if they're ISO-formatted.
-            name_match = self._conn.execute(
-                """
-                SELECT column_name FROM information_schema.columns
-                WHERE table_schema = 'main' AND table_name = ?
-                  AND LOWER(column_name) LIKE '%date%'
-                ORDER BY ordinal_position
-                """,
-                [table],
-            ).fetchall()
-            if name_match:
-                return name_match[0][0]
-
-        # Per-dataset fallback registry — used only when introspection finds
-        # nothing. These are the canonical primary date columns per dataset.
-        fallback = {
-            "sales_daily": "sale_date",
-            "sales_weekly": "week_end_date",
-            "sales_weekly_item": "week_end_date",
-            "inventory_daily": "snapshot_date",
-            "inventory_weekly": "week_end_date",
-            "inventory_weekly_item": "week_end_date",
-            "gross_margin": "week_end_date",
-            "gross_margin_item": "week_end_date",
-            "item_attr": "as_of_date",
-            "item_attr_extended": "as_of_date",
-            "location_attr": "as_of_date",
-            "orders_daily": "order_date",
-            "po_plan_daily": "plan_date",
-            "po_plan_biweekly": "period_end_date",
-            "forecast_weekly": "week_end_date",
-        }
-        candidate = fallback.get(table)
-        if candidate is None:
+        if not all_cols:
             return None
-        # Only return the fallback if the table actually has that column.
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM information_schema.columns "
-                "WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
-                [table, candidate],
-            ).fetchone()
-        return candidate if row else None
+
+        # Tier 1: typed DATE/TIMESTAMP.
+        for name, dtype in all_cols:
+            t = str(dtype).upper()
+            if t.startswith("DATE") or t.startswith("TIMESTAMP"):
+                return name
+
+        # Tier 2: suffix-style date names.
+        for name, _ in all_cols:
+            low = name.lower()
+            if low.endswith(("_date", "_dt", "_d")):
+                return name
+
+        # Tier 3: contains a date-like token.
+        DATE_TOKENS = ("date", "week", "period", "as_of", "effective")
+        for name, _ in all_cols:
+            low = name.lower()
+            if any(tok in low for tok in DATE_TOKENS):
+                return name
+
+        # Tier 4: per-dataset registry. The COLUMN_ROLES table knows canonical
+        # date columns per dataset; consult it last (lowest priority) so the
+        # generic heuristic above wins for unknown tables.
+        from .column_roles import COLUMN_ROLES
+
+        candidates = COLUMN_ROLES.get(table, {}).get("date", [])
+        present = {n.lower() for n, _ in all_cols}
+        by_lower = {n.lower(): n for n, _ in all_cols}
+        for candidate in candidates:
+            if candidate.lower() in present:
+                return by_lower[candidate.lower()]
+        return None
 
     def list_datasets(self) -> list[dict[str, Any]]:
         """One row per known dataset table with summary stats."""

@@ -518,3 +518,54 @@ def test_bi_weekly_po_planning_tolerates_granularity_token(name: str) -> None:
     parsed = classify_filename(name)
     assert parsed is not None, f"failed to classify {name}"
     assert parsed.pattern.dataset == "po_plan_biweekly"
+
+
+# ---------- Patch #4 Issue 3: strict parser handles unescaped inch marks ----------
+
+
+def test_parse_strict_handles_unescaped_inch_mark(tmp_path: Path) -> None:
+    """The Biom 'Bone' SKU has `6"` (unescaped inch mark) in its name. The
+    strict parser must now load these rows without falling back. Previously,
+    polars interpreted the `"` as a quoted-field start and broke tokenization.
+    """
+    body = (
+        "TCIN\tNAME\tUNITS\n"
+        "100\tNormal Item\t10\n"
+        '200\tBiom Mini Refillable Wipe Dispenser - Bone: BPA-Free, Silicone, 6" Height\t5\n'
+        "300\tAnother Item\t3\n"
+    )
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_SALES_TCIN_LOC_04252026_KW.zip",
+        "data.txt",
+        body,
+    )
+    result = read_dataframe(p)
+    assert result.method == "strict", (
+        f"expected strict parse, got method={result.method!r}; "
+        f"primary_error={result.primary_error}"
+    )
+    assert result.df.height == 3
+    # The Bone SKU's full name must appear verbatim (inch mark intact).
+    names = result.df["name"].to_list()
+    assert any('6"' in n for n in names), f"inch mark dropped: {names}"
+
+
+def test_parse_strict_inch_mark_inventory_volume(tmp_path: Path) -> None:
+    """Inventory has 1 row per SKU×location, so the bone SKU multiplied across
+    100+ locations was responsible for the bulk of fallback-parsed rows. This
+    test reproduces that pattern in miniature."""
+    rows = ["TCIN\tLOCATION_ID\tNAME\tINV_UNITS"]
+    for store in range(1000, 1100):
+        rows.append(
+            f'200\t{store}\tBone: 6" Height\t10'
+        )
+    body = "\n".join(rows) + "\n"
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_INV_TCIN_LOC_04252026_KW.zip",
+        "data.txt",
+        body,
+    )
+    result = read_dataframe(p)
+    assert result.method == "strict"
+    assert result.df.height == 100
+    assert result.skipped_rows == 0

@@ -393,7 +393,14 @@ def _finalize(df: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
 
 
 def _attempt_strict(raw: bytes, delim: str) -> pl.DataFrame:
-    """Attempt 1: polars strict. Fail loudly on any schema error."""
+    """Attempt 1: polars strict. Fail loudly on any schema error.
+
+    `quote_char=None` disables quoted-field parsing entirely (Patch #4, Issue 3).
+    Target's tab/pipe-delimited files do not use CSV quoting; field values that
+    happen to contain `"` (e.g. `6" Height` in a SKU name) used to be interpreted
+    as quoted strings and broke tokenization. With quoting disabled, those
+    characters are treated as literal data and the row parses cleanly.
+    """
     return pl.read_csv(
         io.BytesIO(raw),
         separator=delim,
@@ -403,11 +410,14 @@ def _attempt_strict(raw: bytes, delim: str) -> pl.DataFrame:
         try_parse_dates=False,
         truncate_ragged_lines=True,
         ignore_errors=False,
+        quote_char=None,
     )
 
 
 def _attempt_polars_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, int]:
     """Attempt 2: polars with `ignore_errors=True`. Skip rows polars can't parse.
+
+    Quoting also disabled (same rationale as `_attempt_strict`).
 
     Returns (df, skipped_rows). `skipped_rows` is estimated as
     (lines_in_source - header - rows_in_df) and may be 0 if polars accepted
@@ -423,6 +433,7 @@ def _attempt_polars_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, in
         try_parse_dates=False,
         truncate_ragged_lines=True,
         ignore_errors=True,
+        quote_char=None,
     )
     total_lines = sum(1 for ln in raw.splitlines() if ln.strip())
     expected_rows = max(0, total_lines - 1)  # subtract header

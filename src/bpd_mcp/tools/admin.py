@@ -64,6 +64,8 @@ def _dir_bytes(path) -> int:
 async def cache_status(
     warehouse: Warehouse, settings: Settings, params: CacheStatusInput
 ) -> ToolResponse:
+    from ..column_roles import DATASET_KINDS
+
     info = warehouse.disk_stats()
     raw_bytes = _dir_bytes(settings.raw_dir)
     db_bytes = settings.db_path.stat().st_size if settings.db_path.exists() else 0
@@ -78,6 +80,7 @@ async def cache_status(
         per_dataset.append(
             {
                 "dataset": r["dataset"],
+                "kind": DATASET_KINDS.get(r["dataset"], "unknown"),
                 "row_count": r["row_count"],
                 "date_column": date_col,
                 "min_date": r["min_date"],
@@ -87,14 +90,22 @@ async def cache_status(
             }
         )
 
-    overall_min = min(
-        (r["min_date"] for r in dataset_rows if r["min_date"] is not None),
-        default=None,
-    )
-    overall_max = max(
-        (r["max_date"] for r in dataset_rows if r["max_date"] is not None),
-        default=None,
-    )
+    # Split into transactional vs dimensional. The transactional range is the
+    # business-meaningful "what data do we have"; the all-datasets range
+    # additionally includes dimensional tables like location_attr whose date
+    # extent (e.g. last_remodel_date back to 2000) isn't relevant for business
+    # data freshness.
+    def _bounds(rows: list[dict[str, Any]]) -> tuple[Any, Any]:
+        mn = min((r["min_date"] for r in rows if r["min_date"] is not None), default=None)
+        mx = max((r["max_date"] for r in rows if r["max_date"] is not None), default=None)
+        return mn, mx
+
+    transactional_rows = [
+        r for r in per_dataset if r["kind"] == "transactional"
+    ]
+    tx_min, tx_max = _bounds(transactional_rows)
+    all_min, all_max = _bounds(per_dataset)
+
     payload = {
         "data_dir": str(settings.data_dir),
         "raw_dir_bytes": raw_bytes,
@@ -102,8 +113,12 @@ async def cache_status(
         "ledger_files": info["ledger_file_count"],
         "ledger_total_bytes": info["ledger_bytes_total"],
         "datasets_loaded": len(dataset_rows),
-        "earliest_data_date": overall_min,
-        "latest_data_date": overall_max,
+        # Business-data range (transactional datasets only).
+        "earliest_data_date": tx_min,
+        "latest_data_date": tx_max,
+        # All-datasets range (includes dimensional tables).
+        "earliest_data_date_including_dimensional": all_min,
+        "latest_data_date_including_dimensional": all_max,
         "last_sync_finished_at": info["last_sync_finished_at"],
         "per_dataset": per_dataset,
     }
@@ -164,8 +179,9 @@ async def clear_cache(
 
 
 # Expected count of registered MCP tools after this patch lands.
-# Prior count: 19 (16 base + 3 S&OP). Adding bpd_health_check = 20.
-EXPECTED_TOOL_COUNT = 20
+# Lineage: 16 base + 3 S&OP analytics (patch #2) + bpd_health_check (patch #3) +
+# bpd_export_query_to_csv (patch #4) = 21.
+EXPECTED_TOOL_COUNT = 21
 
 # Columns the patched ledger must have. Used by `warehouse_schema_current`.
 EXPECTED_LEDGER_COLUMNS = (

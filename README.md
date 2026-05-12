@@ -132,12 +132,36 @@ accepts a `response_format` of `markdown` (default) or `json`.
 
 ### Admin
 
-| Tool               | Purpose                                                                                   |
-| ------------------ | ----------------------------------------------------------------------------------------- |
-| `bpd_auth_status`  | OAuth state, scope, expires_in_s, user email (via `/rest/users/me`).                       |
-| `bpd_cache_status` | Disk usage, row counts, oldest/newest data dates, last sync time.                          |
-| `bpd_clear_cache`  | **Destructive.** Requires `confirm=true`. Otherwise returns a dry-run preview.            |
-| `bpd_health_check` | 14-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
+| Tool                       | Purpose                                                                                   |
+| -------------------------- | ----------------------------------------------------------------------------------------- |
+| `bpd_auth_status`          | OAuth state, scope, expires_in_s, user email (via `/rest/users/me`).                       |
+| `bpd_cache_status`         | Disk usage, row counts. Reports two date ranges: `earliest/latest_data_date` (transactional datasets only — the business-data range) and `earliest/latest_data_date_including_dimensional` (covers `location_attr.last_remodel_date` etc.). Per-dataset breakdown includes the detected date column and dataset `kind`. |
+| `bpd_clear_cache`          | **Destructive.** Requires `confirm=true`. Otherwise returns a dry-run preview.            |
+| `bpd_health_check`         | 14-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
+| `bpd_export_query_to_csv`  | Run a read-only SQL query and write the result to `~/.bpd-mcp/exports/<filename>` (mode 0644). Useful for sharing data with team members who don't have MCP access. Same read-only safety as `bpd_run_sql`. |
+
+---
+
+## Column-role registry (Patch #4)
+
+Real Target schemas use non-obvious column names (`sale_quantity` not `units`,
+`sales_date` not `date`, `selected_forecast_q` not `forecast_units`,
+`fiscal_week_begin_d` not `week_start_date`). The analytics tools (and the
+`forecast_vs_actual` snapshot logic) resolve column names dynamically at call
+time via `src/bpd_mcp/column_roles.py`. To handle a new Target column-name
+variant, append it to the relevant `COLUMN_ROLES["<dataset>"]["<role>"]` list.
+Errors include the candidates tried and the actual columns present, so the fix
+is usually a one-line append.
+
+`DATASET_KINDS` classifies each dataset as `transactional` or `dimensional` —
+used by `bpd_cache_status` to compute the "business data" date range without
+dimensional date columns (e.g. `last_remodel_date` back to 2000) skewing it.
+
+`bpd_get_forecast_vs_actual` accepts `as_of_date` to lock the forecast snapshot
+cutoff. When omitted, the default is "the day before each forecast week begins"
+— giving you the pre-week prediction Target actually published, not a post-hoc
+revised one. The tool picks the latest `last_update_d` ≤ cutoff per
+`(tcin, location, week)`.
 
 ---
 

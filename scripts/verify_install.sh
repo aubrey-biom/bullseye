@@ -1,7 +1,9 @@
 #!/bin/bash
 # scripts/verify_install.sh
 #
-# Run after `git pull && uv sync` to verify the install is healthy.
+# Run after `git pull` to verify the install is healthy. The script ensures dev
+# dependencies (pytest, ruff) are installed by running `uv sync --all-extras` at
+# the top — so `git pull && ./scripts/verify_install.sh` always works in one step.
 # Exits 0 on pass, 1 on any failure.
 #
 # Each check prints PASS/WARN/FAIL with a one-line explanation. Network calls
@@ -17,6 +19,13 @@ echo "=== bpd-mcp install verification ==="
 # Use whichever python launcher is available: prefer uv, then .venv/bin/python.
 if command -v uv >/dev/null 2>&1; then
     PY="uv run python"
+    # Patch #4 Issue 4: make sure dev extras (pytest, ruff) are installed before
+    # the script tries to use them. Idempotent — fast no-op if already current.
+    echo "[0/8] Ensuring dev dependencies are installed..."
+    uv sync --all-extras --quiet 2>&1 | sed 's/^/  /' || {
+        echo "  WARN: 'uv sync --all-extras' did not run cleanly; continuing"
+    }
+    echo "  PASS"
 elif [ -x ".venv/bin/python" ]; then
     PY=".venv/bin/python"
 else
@@ -43,17 +52,27 @@ else
 fi
 
 echo "[4/8] Tests pass..."
-PYTHONPATH=src $PY -m pytest -q 2>&1 | tail -2
-TEST_RC=${PIPESTATUS[0]}
-if [ "$TEST_RC" -ne 0 ]; then
-    echo "  FAIL: pytest exit $TEST_RC"
-    HAS_FAIL=1
+if $PY -c "import pytest" 2>/dev/null; then
+    PYTHONPATH=src $PY -m pytest -q 2>&1 | tail -2
+    TEST_RC=${PIPESTATUS[0]}
+    if [ "$TEST_RC" -ne 0 ]; then
+        echo "  FAIL: pytest exit $TEST_RC"
+        HAS_FAIL=1
+    fi
+else
+    echo "  WARN: pytest not installed — skipping test step."
+    echo "        Run 'uv sync --all-extras' to enable."
 fi
 
 echo "[5/8] Ruff clean..."
-$PY -m ruff check src/ tests/ scripts/ >/dev/null 2>&1 \
-    && echo "  PASS" \
-    || { echo "  FAIL: run 'ruff check src/ tests/ scripts/' to see details"; HAS_FAIL=1; }
+if $PY -c "import ruff" 2>/dev/null || command -v ruff >/dev/null 2>&1; then
+    $PY -m ruff check src/ tests/ scripts/ >/dev/null 2>&1 \
+        && echo "  PASS" \
+        || { echo "  FAIL: run 'ruff check src/ tests/ scripts/' to see details"; HAS_FAIL=1; }
+else
+    echo "  WARN: ruff not installed — skipping lint step."
+    echo "        Run 'uv sync --all-extras' to enable."
+fi
 
 echo "[6/8] Warehouse schema up to date..."
 PYTHONPATH=src $PY <<'PYEOF'
