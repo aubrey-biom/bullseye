@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  bpd_mcp evaluation suite — §17.
+
+  Each <qa_pair> is an end-to-end question that exercises the MCP through at least
+  two tool calls (e.g. bpd_describe_schema → bpd_run_sql → bpd_get_sales_summary).
+
+  The <answer> values are PLACEHOLDERS until Aubrey runs the MCP against her real
+  data and pins them. Re-run this file after every meaningful change to catch
+  regressions. To verify, drive a Claude session against bpd_mcp with each
+  <question> and string-compare the final answer to <answer>.
+
+  Conventions:
+    * Every question is independent (no shared state).
+    * Every question is read-only (no destructive tools).
+    * Questions are realistic — the kind Aubrey would actually ask.
+    * Each <answer> must be a single, stable string. Numeric answers use plain digits
+      (no commas) so string comparison is robust.
+
+  Replace each `__FILL_FROM_REAL_DATA__` with the verified value after a real sync.
+-->
+<evaluation name="bpd_mcp_v1" model_under_test="claude" version="0.1.0">
+
+  <qa_pair id="biom_alpine_mint_wipes_week">
+    <question>
+      What was the total Biom Alpine Mint Wipes unit count sold across all Target stores
+      in the week ending 2026-04-25? Use bpd_describe_schema to find the right table and
+      column names, then run a single SQL query via bpd_run_sql.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="top_store_single_day_march_2026">
+    <question>
+      Which Target store location had the highest single-day Biom sales in March 2026
+      by units? Return the location_id (or store_id) as a bare integer.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="trailing_4w_units_texas">
+    <question>
+      What were Biom total unit sales at Target stores in Texas in the trailing 4 weeks
+      ending 2026-05-09? Use bpd_describe_schema first, then join sales_weekly to
+      location_attr to filter by state == 'TX'. Return a single integer.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="weeks_of_supply_top_sku">
+    <question>
+      For the top-selling Biom TCIN (by units in the trailing 8 weeks ending 2026-05-09),
+      what is the weighted average weeks-of-supply across all stores? Use bpd_get_top_skus
+      then bpd_get_sell_through to compute weeks_of_supply. Round to one decimal.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="sellthrough_under_20pct_count">
+    <question>
+      How many (TCIN, location_id) pairs had a sell-through rate below 20% in the
+      trailing 4 weeks ending 2026-05-09? Compute via bpd_get_sell_through and count.
+      Return a bare integer.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="oos_locations_today">
+    <question>
+      Using bpd_get_inventory_snapshot for as_of=2026-05-12, how many Target store
+      locations are currently out of stock (on_hand == 0) for the Biom Alpine Mint
+      Wipes TCIN? Return a bare integer.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="largest_wow_drop_last_week">
+    <question>
+      Which Biom TCIN had the largest week-over-week decline in unit sales between the
+      week ending 2026-04-25 and the week ending 2026-05-02? Return the TCIN as a bare
+      integer.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="gm_avg_last_4w">
+    <question>
+      What is the average gross margin percent across all Biom SKUs for the four weeks
+      ending 2026-05-09? Use the gross_margin table. Return as a percent with one decimal
+      (e.g. "31.4%").
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="files_loaded_count">
+    <question>
+      How many BPD files has the MCP successfully loaded since the warehouse was created?
+      Use bpd_cache_status. Return a bare integer.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+  <qa_pair id="earliest_data_date">
+    <question>
+      What is the earliest data date present in the warehouse across all loaded
+      datasets? Use bpd_list_datasets and return the date in YYYY-MM-DD format.
+    </question>
+    <answer>__FILL_FROM_REAL_DATA__</answer>
+  </qa_pair>
+
+</evaluation>

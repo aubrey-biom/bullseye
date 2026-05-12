@@ -1,0 +1,61 @@
+[project]
+name = "bpd-mcp"
+version = "0.1.0"
+description = "MCP server exposing Target BPD data over Kiteworks into a local DuckDB warehouse."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Biom" }]
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx[http2]>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "duckdb>=1.0",
+    "polars>=1.0",
+    "pyarrow>=15.0",
+    "tenacity>=8.3",
+    "python-dotenv>=1.0",
+    "structlog>=24.1",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+bpd-mcp = "bpd_mcp.__main__:main"
+bpd-bootstrap = "scripts.bootstrap_auth:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bpd_mcp", "scripts"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "C4", "SIM", "RUF"]
+# E501: line too long (we keep prose long-form in docstrings)
+# RUF001: ambiguous unicode (em-dashes used stylistically in docstrings)
+# SIM105: try/except/pass → contextlib.suppress (the explicit form reads clearer here)
+ignore = ["E501", "RUF001", "SIM105"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+ignore_missing_imports = true
