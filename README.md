@@ -23,10 +23,13 @@ uv sync                      # creates .venv and installs everything
 cp .env.example .env
 $EDITOR .env                 # set KITEWORKS_USERNAME / KITEWORKS_PASSWORD / BPD_VENDOR_ID
 
-# 2. One-time interactive auth bootstrap (saves a refresh token to ~/.bpd-mcp/tokens.json @ 0600)
+# 2. Verify the install is healthy (one command; no MCP needed).
+./scripts/verify_install.sh
+
+# 3. One-time interactive auth bootstrap (saves a refresh token to ~/.bpd-mcp/tokens.json @ 0600)
 uv run bpd-bootstrap
 
-# 3. Run the MCP server (stdio transport — for Claude Desktop / Claude Code)
+# 4. Run the MCP server (stdio transport — for Claude Desktop / Claude Code)
 uv run bpd-mcp
 ```
 
@@ -134,6 +137,32 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | `bpd_auth_status`  | OAuth state, scope, expires_in_s, user email (via `/rest/users/me`).                       |
 | `bpd_cache_status` | Disk usage, row counts, oldest/newest data dates, last sync time.                          |
 | `bpd_clear_cache`  | **Destructive.** Requires `confirm=true`. Otherwise returns a dry-run preview.            |
+| `bpd_health_check` | 14-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
+
+---
+
+## Warehouse design (Patch #3)
+
+The MCP keeps **one** `~/.bpd-mcp/bpd.duckdb` file. Engine-level read-only execution
+for `bpd_run_sql` is provided by wrapping each query in `BEGIN TRANSACTION READ ONLY`
+on a fresh cursor against the writable connection. DuckDB rejects writes inside
+such a transaction at the engine layer (verified on DuckDB 1.5.2).
+
+This replaces the earlier `.duckdb.ro` snapshot file, which caused schema-drift
+bugs whenever migrations applied to the writable copy weren't reflected in the
+snapshot. On startup, the server now deletes any leftover `.duckdb.ro` /
+`.duckdb.ro.wal` from prior installs (look for `removed_legacy_snapshot` events
+in the log).
+
+**Defense in depth for `bpd_run_sql`:**
+1. Validator (app layer): rejects multi-statement, DDL/DML keywords, comment-cloaked
+   writes, `ATTACH`, `COPY`, `INSTALL/LOAD`, `EXPORT DATABASE`.
+2. Engine (DuckDB layer): `BEGIN TRANSACTION READ ONLY` rejects any write that
+   touches the current database.
+
+Note: DuckDB's read-only transaction does NOT cover `ATTACH` / `COPY ... TO` —
+those are stopped at the validator layer instead. The two layers together cover
+every write surface.
 
 ---
 
@@ -263,9 +292,33 @@ Coverage requirements (§13):
 
 * `tests/test_auth.py` — password→refresh transition, 0600 perms, error surface verbatim.
 * `tests/test_parsers.py` — filename catalog, pipe/tab sniff, `-1` sentinel, schema discovery.
-* `tests/test_warehouse.py` — idempotent loads, schema drift, view creation.
-* `tests/test_sql_safety.py` — keyword/AST blocks AND engine-level read-only enforcement.
+* `tests/test_warehouse.py` — idempotent loads, schema drift, view creation, migration idempotency.
+* `tests/test_sql_safety.py` — keyword/AST blocks.
+* `tests/test_read_only_view.py` — engine-level RO enforcement, legacy snapshot cleanup, migration visibility.
+* `tests/test_health_check.py` — every health check has pass + fail tests.
+* `tests/test_audit_drift_guards.py` — pin parallel sources of truth (PATTERNS ↔ KnownDataset, EXPECTED_LEDGER_COLUMNS ↔ DDL, EXPECTED_TOOL_COUNT ↔ registered tools).
 * `tests/test_tools_query.py` — sales_summary math + markdown/json toggle.
+
+---
+
+## Post-patch verification sequence
+
+After every patch lands, the user runs:
+
+```bash
+git pull && uv sync
+pkill -f bpd-mcp && sleep 2
+rm -f ~/.bpd-mcp/bpd.duckdb.ro ~/.bpd-mcp/bpd.duckdb.ro.wal   # one-time, patch #3
+./scripts/verify_install.sh                                   # local checks (8 steps)
+# Fully quit + reopen Claude Desktop
+# In Claude Desktop: call bpd_health_check                    # 14-check audit
+# In Claude Desktop: call bpd_sync_new_files                  # ~99 loaded, 0-2 failed
+```
+
+`verify_install.sh` validates the local install (imports, tests, ruff, ledger schema,
+token perms, tool count) without touching the network. `bpd_health_check` runs once
+the MCP is back up and adds the cross-cutting checks (auth, RO enforcement, sync
+ledger invariants, orphan files, etc.).
 
 ---
 

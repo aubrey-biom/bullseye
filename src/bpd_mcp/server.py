@@ -5,7 +5,7 @@ Holds a single shared lifespan context with:
   * AuthManager + token bundle from disk
   * httpx.AsyncClient (host-pinned)
   * KiteworksClient
-  * Writable Warehouse + a read-only snapshot for `bpd_run_sql` (engine-level RO).
+  * Writable Warehouse + ReadOnlyView (engine-level RO via transaction wrapper).
 
 Each tool function takes its arguments as **top-level** parameters (not a wrapped
 `params:` model) so MCP clients send flat argument dicts. The corresponding Pydantic
@@ -35,6 +35,7 @@ from .schemas import (
     DescribeSchemaInput,
     ForecastVsActualInput,
     GetFileMetadataInput,
+    HealthCheckInput,
     InventorySnapshotInput,
     KnownDataset,
     ListDatasetsInput,
@@ -56,7 +57,7 @@ from .tools import admin as admin_tools
 from .tools import files as files_tools
 from .tools import query as query_tools
 from .tools import sync as sync_tools
-from .warehouse import ReadOnlySnapshot, Warehouse
+from .warehouse import ReadOnlyView, Warehouse, cleanup_legacy_snapshot
 
 logger = get_logger("bpd_mcp.server")
 
@@ -68,27 +69,45 @@ class AppContext:
     auth: AuthManager
     client: KiteworksClient
     warehouse_rw: Warehouse
-    warehouse_ro: ReadOnlySnapshot
+    warehouse_ro: ReadOnlyView
 
     async def aclose(self) -> None:
+        global _active_app_context
         try:
             self.warehouse_rw.close()
         finally:
+            # ReadOnlyView is a facade; closing the writable Warehouse is what
+            # releases the connection.
             try:
-                self.warehouse_ro.close()
-            finally:
                 await self.http.aclose()
+            finally:
+                if _active_app_context is self:
+                    _active_app_context = None
+
+
+# FastMCP resources don't receive the lifespan context, so we keep a module-level
+# reference set by build_context() and cleared by AppContext.aclose(). Used by the
+# `bpd://schema` resource to read the live warehouse without opening a second one.
+_active_app_context: AppContext | None = None
 
 
 async def build_context(settings: Settings | None = None) -> AppContext:
+    global _active_app_context
     s = settings or get_settings()
     s.ensure_dirs()
     configure_logging(s.bpd_log_level, s.log_dir)
+
+    # Patch #3: remove any leftover .ro snapshot file from the prior design BEFORE
+    # opening the writable warehouse, so a stale snapshot can never be picked up.
+    removed = cleanup_legacy_snapshot(s.db_path)
+    for path in removed:
+        logger.info("removed_legacy_snapshot", path=str(path))
+
     http = make_http_client(s)
     auth = AuthManager.load_from_disk(s, http)
     client = KiteworksClient(s, auth, http)
     warehouse_rw = Warehouse(s.db_path, read_only=False)
-    warehouse_ro = ReadOnlySnapshot(s.db_path)
+    warehouse_ro = ReadOnlyView(warehouse_rw)
     logger.info(
         "context_built",
         base_url=s.base_url,
@@ -96,7 +115,7 @@ async def build_context(settings: Settings | None = None) -> AppContext:
         tier=s.bpd_vendor_tier,
         db=str(s.db_path),
     )
-    return AppContext(
+    ctx = AppContext(
         settings=s,
         http=http,
         auth=auth,
@@ -104,6 +123,8 @@ async def build_context(settings: Settings | None = None) -> AppContext:
         warehouse_rw=warehouse_rw,
         warehouse_ro=warehouse_ro,
     )
+    _active_app_context = ctx
+    return ctx
 
 
 @asynccontextmanager
@@ -353,9 +374,10 @@ async def bpd_list_datasets(
     name="bpd_run_sql",
     description=(
         "Execute arbitrary DuckDB SQL against the local warehouse. Read-only is "
-        "enforced at the engine level (a separate read_only=True connection on a "
-        "DB snapshot) AND at the input-validation level (multi-statement and DDL/DML "
-        "tokens rejected). Wraps the result in LIMIT to cap returned rows."
+        "enforced at the engine level (each query runs inside BEGIN TRANSACTION "
+        "READ ONLY on a fresh cursor; DuckDB rejects writes at the engine layer) "
+        "AND at the input-validation level (multi-statement and DDL/DML tokens "
+        "rejected). Wraps the result in LIMIT to cap returned rows."
     ),
     annotations={
         "readOnlyHint": True,
@@ -372,7 +394,7 @@ async def bpd_run_sql(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.run_sql(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         RunSqlInput(sql=sql, limit=limit, response_format=response_format),
     )
 
@@ -395,7 +417,7 @@ async def bpd_describe_schema(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.describe_schema(
-        app.warehouse_ro.get(), DescribeSchemaInput(response_format=response_format)
+        app.warehouse_ro, DescribeSchemaInput(response_format=response_format)
     )
 
 
@@ -424,7 +446,7 @@ async def bpd_get_sales_summary(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_sales_summary(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         SalesSummaryInput(
             grain=grain,
             start_date=start_date,
@@ -456,7 +478,7 @@ async def bpd_get_top_skus(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_top_skus(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         TopSkusInput(
             by=by,
             start_date=start_date,
@@ -490,7 +512,7 @@ async def bpd_get_inventory_snapshot(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_inventory_snapshot(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         InventorySnapshotInput(
             as_of=as_of,
             tcin=tcin,
@@ -524,7 +546,7 @@ async def bpd_get_sell_through(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_sell_through(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         SellThroughInput(
             start_date=start_date,
             end_date=end_date,
@@ -565,7 +587,7 @@ async def bpd_get_open_orders(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_open_orders(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         OpenOrdersInput(
             as_of_date=as_of_date,
             location_filter=location_filter,
@@ -597,7 +619,7 @@ async def bpd_get_upcoming_pos(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_upcoming_pos(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         UpcomingPosInput(
             weeks_forward=weeks_forward,
             tcin_filter=tcin_filter,
@@ -631,7 +653,7 @@ async def bpd_get_forecast_vs_actual(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_forecast_vs_actual(
-        app.warehouse_ro.get(),
+        app.warehouse_ro,
         ForecastVsActualInput(
             weeks_back=weeks_back,
             tcin_filter=tcin_filter,
@@ -715,6 +737,39 @@ async def bpd_clear_cache(
     )
 
 
+@mcp.tool(
+    name="bpd_health_check",
+    description=(
+        "Run a comprehensive 14-check health audit across auth, warehouse, sync ledger, "
+        "disk usage, and MCP self-state. Each check returns pass/warn/fail with a "
+        "human-readable detail. The aggregate `overall_status` is `fail` if any check "
+        "fails, `warn` if any warns and none fail, else `pass`. Use this as the first "
+        "call when diagnosing any MCP issue. Set `skip_network=true` for offline mode."
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bpd_health_check(
+    ctx: Context,
+    skip_network: bool = False,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await admin_tools.health_check(
+        auth=app.auth,
+        client=app.client,
+        warehouse=app.warehouse_rw,
+        settings=app.settings,
+        params=HealthCheckInput(
+            skip_network=skip_network, response_format=response_format
+        ),
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Resources
 # --------------------------------------------------------------------------------------
@@ -722,18 +777,16 @@ async def bpd_clear_cache(
 
 @mcp.resource("bpd://schema", description="The current DuckDB warehouse schema as markdown.")
 async def bpd_schema_resource() -> str:
-    # Resources don't see the lifespan context; open a fresh read-only handle on the
-    # snapshot file (or the source DB itself if no writable connection is open).
-    s = get_settings()
-    snap = ReadOnlySnapshot(s.db_path)
-    try:
-        wh = snap.get()
-        resp = await query_tools.describe_schema(
-            wh, DescribeSchemaInput(response_format="markdown")
-        )
-        return resp.rendered
-    finally:
-        snap.close()
+    # FastMCP resources don't receive Context; reach into the module-level
+    # AppContext singleton set by build_context. This is the same writable
+    # warehouse the rest of the server uses, so the schema we report is the
+    # live schema (no snapshot drift).
+    if _active_app_context is None:
+        return "_(MCP server context not initialized yet — try again after first sync)_"
+    resp = await query_tools.describe_schema(
+        _active_app_context.warehouse_ro, DescribeSchemaInput(response_format="markdown")
+    )
+    return resp.rendered
 
 
 def run() -> None:

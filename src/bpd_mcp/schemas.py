@@ -303,3 +303,29 @@ class ClearCacheInput(_BaseModel):
         description="Must be true to actually wipe. Else returns a dry-run preview.",
     )
     response_format: ResponseFormat = "markdown"
+
+
+# --------------------------------------------------------------------------------------
+# Health check (Patch #3)
+# --------------------------------------------------------------------------------------
+
+
+CheckStatus = Literal["pass", "warn", "fail"]
+
+
+class HealthCheckResult(_BaseModel):
+    name: str
+    status: CheckStatus
+    detail: str
+    duration_ms: int = 0
+
+
+class HealthCheckInput(_BaseModel):
+    skip_network: bool = Field(
+        default=False,
+        description=(
+            "Skip checks that require network access "
+            "(auth_kiteworks_reachable). Useful for offline diagnostics."
+        ),
+    )
+    response_format: ResponseFormat = "markdown"

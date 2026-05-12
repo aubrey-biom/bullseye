@@ -1,16 +1,21 @@
 """DuckDB warehouse helpers: bootstrap schema, register schemas, idempotent loads.
 
-DuckDB constraint (same-process): you cannot hold a writable and a read-only connection
-to the same file simultaneously. To satisfy §9.3's engine-level read-only requirement
-for `bpd_run_sql`, the read-only handle is opened against a *snapshot copy* of the
-writable DB (see `ReadOnlySnapshot`). The snapshot refreshes lazily (mtime check) so
-queries pick up the latest data after a sync without paying a copy cost on every call.
+Patch #3 design: a single physical `bpd.duckdb` file owned by one writable
+connection. Engine-level read-only execution for `bpd_run_sql` is provided by the
+`ReadOnlyView` facade further down: each query runs inside a fresh cursor wrapped
+in `BEGIN TRANSACTION READ ONLY` / `ROLLBACK`. DuckDB rejects writes inside such a
+transaction at the engine layer (verified on 1.5.2).
+
+Earlier patches forked the file into a `.duckdb.ro` snapshot to work around
+DuckDB's same-file-mixed-mode restriction. That approach caused schema drift
+(migrations on the writable copy weren't reflected in the snapshot). The
+`.ro` mechanism has been removed; `cleanup_legacy_snapshot` deletes any leftover
+file from prior installs on startup.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,10 +111,12 @@ def _coerce_date(v: Any) -> Any:
 class Warehouse:
     """Single-process wrapper around a DuckDB connection plus a thread lock.
 
-    Pass `read_only=True` to open an engine-level read-only connection. When the
-    writable warehouse is already open elsewhere in the process, point this at a
-    snapshot file (see `ReadOnlySnapshot`) — DuckDB refuses to mix RW/RO handles
-    against the same physical file.
+    Pass `read_only=True` to open an engine-level read-only connection on a file
+    *no other connection in this process has open*. In production we keep ONE
+    writable Warehouse per process and use the `ReadOnlyView` facade for
+    `bpd_run_sql` (engine-level RO via transaction). The `read_only=True` path
+    is retained for tests that want to verify DuckDB's own write-rejection
+    behavior on a connection it considers read-only.
     """
 
     def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
@@ -542,76 +549,118 @@ class Warehouse:
 
 
 # --------------------------------------------------------------------------------------
-# Read-only snapshot
+# Read-only view (Patch #3)
 # --------------------------------------------------------------------------------------
+#
+# Earlier patches maintained a `.ro` snapshot file alongside the writable DB so we
+# could open one connection RW + one RO. DuckDB 1.5 does not permit mixed RW/RO
+# connections to the same file in a single process, so we forked the file. The
+# trade-off was schema drift: ALTER TABLE on `bpd.duckdb` didn't propagate to the
+# `.ro` copy until a refresh, which surfaced as ghost-old-schema bugs.
+#
+# Patch #3 eliminates the snapshot. The single writable `Warehouse` is the only
+# database file. For engine-level read-only execution, we wrap each query in a
+# `BEGIN TRANSACTION READ ONLY` on a fresh cursor, then `ROLLBACK`. DuckDB rejects
+# writes inside such a transaction at the engine layer (verified empirically on
+# 1.5.2): `TransactionContext Error: Cannot write to database ... — transaction is
+# launched in read-only mode`. This:
+#
+#   * One file, zero divergence between RO and RW views.
+#   * Migrations applied via ALTER on the writable conn are visible immediately.
+#   * Cursor scoping isolates the RO txn from concurrent writes on other cursors.
+#
+# The previous `read_only=True` connection mode is still supported by `Warehouse`
+# itself, but it's no longer used in production. Tests sometimes open the file
+# read-only directly to verify engine-level enforcement on connections that *do*
+# refuse writes.
 
 
-class ReadOnlySnapshot:
-    """Manage a snapshot copy of the writable DB for engine-level read-only access.
+def cleanup_legacy_snapshot(db_path: Path) -> list[Path]:
+    """Delete any `.ro` / `.ro.wal` siblings left behind by the patch #1-#2 design.
 
-    Why: DuckDB refuses to open the same file with mixed read/write modes from a
-    single process. To get a true `read_only=True` connection for `bpd_run_sql`, we
-    copy the writable DB to a snapshot path and open the snapshot read-only.
+    Returns the list of paths that were actually removed (for logging by the caller).
+    Safe to call when nothing is present.
+    """
+    removed: list[Path] = []
+    for suffix in (db_path.suffix + ".ro", db_path.suffix + ".ro.wal"):
+        legacy = db_path.with_suffix(suffix)
+        if legacy.exists():
+            try:
+                legacy.unlink()
+                removed.append(legacy)
+            except OSError:
+                # Best-effort cleanup; if we can't delete, the next startup tries again.
+                logger.warning("legacy_snapshot_unlink_failed", path=str(legacy))
+    return removed
 
-    The snapshot is refreshed lazily — `Warehouse(read_only=True)` is rebuilt only
-    when the source DB's mtime has moved since the last refresh.
+
+class ReadOnlyView:
+    """Engine-enforced read-only facade over a single writable Warehouse.
+
+    All read queries go through a fresh cursor wrapped in
+    `BEGIN TRANSACTION READ ONLY` / `ROLLBACK`. DuckDB rejects writes at the engine
+    layer inside such a transaction — this is what makes the facade safe regardless
+    of what SQL the caller submits. The `bpd_run_sql` tool layers an application-
+    level keyword/AST scan on top as defense-in-depth.
+
+    Methods that read schema/metadata (describe(), detect_date_column()) delegate
+    to the underlying Warehouse directly — those are inherently read-only operations
+    on information_schema and PRAGMA, so there's no value in wrapping them in a
+    transaction.
     """
 
-    def __init__(self, source_db: Path, snapshot_db: Path | None = None) -> None:
-        self._source = source_db
-        self._snapshot = snapshot_db or source_db.with_suffix(source_db.suffix + ".ro")
-        self._lock = threading.Lock()
-        self._wh: Warehouse | None = None
-        self._last_source_mtime: float | None = None
+    def __init__(self, warehouse: Warehouse) -> None:
+        if warehouse.read_only:
+            # Belt-and-suspenders: the underlying Warehouse should be the writable
+            # one. Wrapping a read-only Warehouse would be silly.
+            raise RuntimeError(
+                "ReadOnlyView expects a writable Warehouse; got read_only=True"
+            )
+        self._wh = warehouse
 
     @property
-    def path(self) -> Path:
-        return self._snapshot
+    def read_only(self) -> bool:
+        return True
 
-    def _source_mtime(self) -> float | None:
-        try:
-            return self._source.stat().st_mtime
-        except FileNotFoundError:
-            return None
+    @property
+    def db_path(self) -> Path:
+        return self._wh.db_path
 
-    def get(self) -> Warehouse:
-        """Return a read-only Warehouse on a fresh-enough snapshot."""
-        with self._lock:
-            src_mtime = self._source_mtime()
-            stale = (
-                self._wh is None
-                or self._last_source_mtime is None
-                or (src_mtime is not None and src_mtime != self._last_source_mtime)
-            )
-            if stale:
-                if self._wh is not None:
-                    self._wh.close()
-                    self._wh = None
-                if src_mtime is None:
-                    # No source DB yet. Make an empty snapshot so reads still work.
-                    self._snapshot.parent.mkdir(parents=True, exist_ok=True)
-                    empty = duckdb.connect(str(self._snapshot))
-                    empty.execute(METADATA_DDL)
-                    empty.close()
-                else:
-                    # Copy source -> snapshot. Use shutil (atomic on POSIX via rename).
-                    self._snapshot.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = self._snapshot.with_suffix(self._snapshot.suffix + ".tmp")
-                    shutil.copy2(self._source, tmp)
-                    tmp.replace(self._snapshot)
-                self._wh = Warehouse(self._snapshot, read_only=True)
-                self._last_source_mtime = src_mtime
-                logger.info(
-                    "ro_snapshot_refreshed",
-                    source=str(self._source),
-                    snapshot=str(self._snapshot),
-                    mtime=src_mtime,
-                )
-            assert self._wh is not None
-            return self._wh
+    def describe(self) -> dict[str, Any]:
+        return self._wh.describe()
+
+    def detect_date_column(self, table: str) -> str | None:
+        return self._wh.detect_date_column(table)
+
+    def list_datasets(self) -> list[dict[str, Any]]:
+        return self._wh.list_datasets()
+
+    def disk_stats(self) -> dict[str, Any]:
+        return self._wh.disk_stats()
+
+    def execute_sql(self, sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
+        """Run `sql` inside an engine-level read-only transaction.
+
+        Each call gets a fresh cursor + txn so concurrent writes on other cursors
+        (e.g. the sync worker) are not blocked. The cursor's RO state is released
+        on the ROLLBACK; we never COMMIT (the txn is purely a guard).
+        """
+        with self._wh._lock:
+            cur = self._wh._conn.cursor()
+            cur.execute("BEGIN TRANSACTION READ ONLY")
+            try:
+                result = cur.execute(sql)
+                cols = [d[0] for d in result.description] if result.description else []
+                rows = result.fetchall() if cols else []
+            finally:
+                try:
+                    cur.execute("ROLLBACK")
+                except Exception:
+                    pass
+            return cols, rows
 
     def close(self) -> None:
-        with self._lock:
-            if self._wh is not None:
-                self._wh.close()
-                self._wh = None
+        # The underlying Warehouse owns the connection lifetime; the view is a
+        # weakly-owned facade. close() exists for API symmetry with the previous
+        # ReadOnlySnapshot but is a no-op.
+        pass

@@ -4,6 +4,9 @@
 !.env.example
 tokens.json
 
+# Build / lock files we don't manage in-tree
+uv.lock
+
 # Local data
 *.duckdb
 *.duckdb.wal
