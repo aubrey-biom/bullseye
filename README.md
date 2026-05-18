@@ -165,20 +165,39 @@ revised one. The tool picks the latest `last_update_d` ≤ cutoff per
 
 ### Adding a new dataset to the catalog (Patch #6.2)
 
-When you add a `FilePattern` entry to `parsers.PATTERNS`, the
-`primary_key_candidates` **must** include the real Target column names —
-check `column_roles.py` for that dataset's `date` and `location` priority
-lists, and put the first entry of each list first in the PK candidate. The
-`_pk_with_loc(*date_cols)` / `_pk_item(*date_cols)` helpers accept multiple
-date-column candidates so the catalog can list both the real name and any
-historical aliases.
+This is a **two-file edit** — get either side wrong and the upsert raises
+on the first re-load (or worse: pre-#6.2, silently duplicated rows).
 
-`Warehouse.upsert_dataframe` raises `primary_key_missing_in_df` on the first
-load if the catalog's PK columns don't appear in the parsed df. Silent
-DELETE-skip + duplicate INSERT was the failure mode that produced the
-sales_weekly 2.0× regression — the loud failure is intentional, so the next
-person adding a dataset hits the error immediately instead of accumulating
-duplicates on every re-load.
+**1. `src/bpd_mcp/column_roles.py`** — append the new dataset to
+`COLUMN_ROLES` with the real Target column names per role (`date`,
+`location`, `tcin`, plus any dataset-specific roles like `units` or
+`dollars`). Put the actual column Target ships **first** in each list;
+aliases follow as fallbacks. This is the source of truth that analytics
+tools resolve against at query time.
+
+**2. `src/bpd_mcp/parsers.py`** — add the `FilePattern` to `PATTERNS`.
+`primary_key_candidates` must list the real Target column names first,
+mirroring the priority order in `column_roles.py`. Use the
+`_pk_with_loc(*date_cols)` / `_pk_item(*date_cols)` helpers — they accept
+multiple date-column candidates and emit the cartesian product with
+`_LOC_COLS`. If the dataset has a non-`location_id` location column (e.g.
+`location_number` on `location_attr`), extend `_LOC_COLS` so every
+location-keyed dataset can match it.
+
+**Drift guard.** `tests/test_parsers.py::
+test_pk_audit_all_first_candidates_have_column_roles_or_canonical_cols`
+iterates every `PATTERNS` entry's first PK candidate and verifies each
+column is either canonical (`tcin` / `dpci` / `fiscal_week`) or matches
+the first entry of some role in `column_roles` for that dataset. If you
+add a dataset and forget to update both files in sync, this test fails
+with a precise pointer.
+
+**Loud-failure backstop.** `Warehouse.upsert_dataframe` raises
+`primary_key_missing_in_df` on the first load if the catalog's PK columns
+don't appear in the parsed df. Silent DELETE-skip + duplicate INSERT was
+the failure mode that produced the sales_weekly 2.0× regression — the
+loud failure is intentional, so the next person hits the error
+immediately instead of accumulating duplicates on every re-load.
 
 ---
 
