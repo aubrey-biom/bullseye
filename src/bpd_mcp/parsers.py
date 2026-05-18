@@ -400,13 +400,18 @@ def _attempt_strict(raw: bytes, delim: str) -> pl.DataFrame:
     happen to contain `"` (e.g. `6" Height` in a SKU name) used to be interpreted
     as quoted strings and broke tokenization. With quoting disabled, those
     characters are treated as literal data and the row parses cleanly.
+
+    The two-character literal `""` is Target's NULL placeholder in nullable
+    columns (e.g. `purchase_order_active_f`, `parent_tcin`). With quoting
+    disabled, polars no longer reduces it to an empty field, so we list it
+    explicitly in `null_values` to map it to NULL (Patch #6).
     """
     return pl.read_csv(
         io.BytesIO(raw),
         separator=delim,
         has_header=True,
         infer_schema_length=10000,
-        null_values=["", "NULL", "null"],
+        null_values=["", "NULL", "null", '""'],
         try_parse_dates=False,
         truncate_ragged_lines=True,
         ignore_errors=False,
@@ -429,7 +434,7 @@ def _attempt_polars_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, in
         separator=delim,
         has_header=True,
         infer_schema_length=10000,
-        null_values=["", "NULL", "null"],
+        null_values=["", "NULL", "null", '""'],
         try_parse_dates=False,
         truncate_ragged_lines=True,
         ignore_errors=True,

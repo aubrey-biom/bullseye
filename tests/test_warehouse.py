@@ -69,6 +69,31 @@ def test_idempotent_load(tmp_path: Path) -> None:
         wh.close()
 
 
+def test_upsert_into_existing_bool_column_with_nulls(tmp_path: Path) -> None:
+    """Patch #6 integration regression. Once parsers map `""` to NULL, the df
+    arrives at the warehouse as Boolean with None for missing rows. DuckDB must
+    accept that mix into an existing BOOLEAN column without ConversionException.
+    """
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        cols = {"tcin": "BIGINT", "purchase_order_active_f": "BOOLEAN"}
+        wh.ensure_data_table("orders_daily", cols)
+        df = pl.DataFrame(
+            {
+                "tcin": [100, 200, 300],
+                "purchase_order_active_f": [True, None, False],
+            }
+        )
+        rows = wh.upsert_dataframe("orders_daily", df, primary_key=("tcin",))
+        assert rows == 3
+        _, fetched = wh.execute_sql(
+            "SELECT tcin, purchase_order_active_f FROM orders_daily ORDER BY tcin"
+        )
+        assert fetched == [(100, True), (200, None), (300, False)]
+    finally:
+        wh.close()
+
+
 def test_schema_drift_detected(tmp_path: Path) -> None:
     wh = Warehouse(tmp_path / "bpd.duckdb")
     try:

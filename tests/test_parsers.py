@@ -550,6 +550,55 @@ def test_parse_strict_handles_unescaped_inch_mark(tmp_path: Path) -> None:
     assert any('6"' in n for n in names), f"inch mark dropped: {names}"
 
 
+def test_parse_strict_treats_empty_quoted_string_as_null_in_bool_column(
+    tmp_path: Path,
+) -> None:
+    """Patch #6 regression. Target ships nullable boolean columns with the
+    literal two-char placeholder `""` for NULL. After Patch #4 set
+    `quote_char=None`, polars stopped reducing `""` to an empty field, so the
+    column was inferred as String (mix of `true`/`false`/`""`) and DuckDB's
+    INSERT into an existing BOOLEAN column failed with ConversionException.
+    """
+    body = (
+        "TCIN\tPURCHASE_ORDER_ACTIVE_F\n"
+        "100\ttrue\n"
+        '200\t""\n'
+        "300\tfalse\n"
+    )
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_ORDERS_TCIN_LOC_04252026_KW.zip",
+        "data.txt",
+        body,
+    )
+    result = read_dataframe(p)
+    assert result.method == "strict"
+    assert result.df.schema["purchase_order_active_f"] == pl.Boolean
+    assert result.df["purchase_order_active_f"].to_list() == [True, None, False]
+
+
+def test_parse_strict_treats_empty_quoted_string_as_null_in_int_column(
+    tmp_path: Path,
+) -> None:
+    """Sibling of the BOOL case for int-valued nullable columns like
+    `parent_tcin`. Without this NULL mapping, polars infers String and the
+    INSERT into an existing BIGINT column fails."""
+    body = (
+        "TCIN\tPARENT_TCIN\n"
+        "100\t12345\n"
+        '200\t""\n'
+        "300\t67890\n"
+    )
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_ITEM_TCIN_04252026_KW.zip",
+        "data.txt",
+        body,
+    )
+    result = read_dataframe(p)
+    assert result.method == "strict"
+    assert result.df.schema["parent_tcin"] == pl.Int64
+    assert result.df["parent_tcin"].to_list() == [12345, None, 67890]
+
+
 def test_parse_strict_inch_mark_inventory_volume(tmp_path: Path) -> None:
     """Inventory has 1 row per SKU×location, so the bone SKU multiplied across
     100+ locations was responsible for the bulk of fallback-parsed rows. This

@@ -280,18 +280,6 @@ async def _process_one_file(
 
         columns = derive_duckdb_schema(df)
         primary_key = _pick_primary_key(parsed, df.columns)
-        prior_schema = warehouse.register_schema(dataset, columns, primary_key)
-        if prior_schema:
-            prior_cols = set(prior_schema)
-            new_cols = set(columns)
-            added = sorted(new_cols - prior_cols)
-            removed = sorted(prior_cols - new_cols)
-            logger.warning(
-                "schema_drift",
-                dataset=dataset,
-                added=added,
-                removed=removed,
-            )
 
         warehouse.ensure_data_table(dataset, columns)
         try:
@@ -325,6 +313,22 @@ async def _process_one_file(
                 status="failed",
                 bytes=bytes_written,
                 error=err_msg,
+            )
+
+        # Register schema only after a successful load, so a failed upsert
+        # doesn't leave the registry pointing at types we didn't actually
+        # persist (Patch #6).
+        prior_schema = warehouse.register_schema(dataset, columns, primary_key)
+        if prior_schema:
+            prior_cols = set(prior_schema)
+            new_cols = set(columns)
+            added = sorted(new_cols - prior_cols)
+            removed = sorted(prior_cols - new_cols)
+            logger.warning(
+                "schema_drift",
+                dataset=dataset,
+                added=added,
+                removed=removed,
             )
 
         # Successful load. If a fallback path was used, record the diagnostic message
