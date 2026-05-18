@@ -71,6 +71,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
     # ---------- inventory ----------
     "inventory_daily": {
         "date": [
+            "business_d",
             "report_date_dim",
             "inventory_date",
             "snapshot_date",
@@ -223,7 +224,13 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "po_status",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "location_number", "store_id", "store_nbr"],
+        # `receiving_location_id` is orders-specific (destination location for
+        # fulfillment) — distinct from the sales/inventory `location_id`. Per
+        # Patch #6.2.2, real Target orders files ship this column.
+        "location": [
+            "receiving_location_id", "location_id", "location_number",
+            "store_id", "store_nbr",
+        ],
     },
     "po_plan_daily": {
         "date": [

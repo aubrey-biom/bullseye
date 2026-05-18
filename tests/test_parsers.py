@@ -761,3 +761,104 @@ def test_pk_audit_all_first_candidates_have_column_roles_or_canonical_cols() -> 
                     f"PK should list {real_first!r} as a candidate first"
                 )
     assert not issues, "\n".join(["catalog/column_roles drift:", *issues])
+
+
+# ---------- Patch #6.2.2: orders_daily receiving_location_id + inventory_daily business_d ----------
+
+
+def test_pk_resolution_orders_daily_receiving_location_id() -> None:
+    """Patch #6.2.2. Real Target orders files ship `receiving_location_id`
+    (the fulfillment destination), not `location_id`. PK resolution must
+    select a candidate that uses it."""
+    from bpd_mcp.sync import _pick_primary_key
+
+    parsed = classify_filename("BV_139440_DAILY_ORDER_TCIN_LOC_05182026_KW.zip")
+    assert parsed is not None and parsed.pattern.dataset == "orders_daily"
+    df_cols = [
+        "tcin", "receiving_location_id", "purchase_order_id",
+        "order_status", "order_date", "open_units",
+    ]
+    pk = _pick_primary_key(parsed, df_cols)
+    assert pk == ("purchase_order_id", "tcin", "receiving_location_id"), (
+        f"expected receiving_location_id-keyed PK, got {pk}"
+    )
+
+
+def test_pk_resolution_inventory_daily_business_d() -> None:
+    """Patch #6.2.2. Real Target inventory files ship `business_d` as the
+    snapshot date column. The #6.2.1 preemptive fix used `report_date_dim` per
+    the (then-incomplete) column_roles list — this regression locks in the
+    real shape so any future renaming-back triggers a loud test failure."""
+    from bpd_mcp.sync import _pick_primary_key
+
+    parsed = classify_filename("BV_139440_DAILY_INV_TCIN_LOC_05182026_KW.zip")
+    assert parsed is not None and parsed.pattern.dataset == "inventory_daily"
+    df_cols = ["tcin", "location_id", "business_d", "on_hand_units"]
+    pk = _pick_primary_key(parsed, df_cols)
+    assert pk == ("tcin", "location_id", "business_d"), (
+        f"expected business_d-keyed PK, got {pk}"
+    )
+
+
+def test_end_to_end_orders_daily_real_shape_is_idempotent(tmp_path: Path) -> None:
+    """Patch #6.2.2 end-to-end. Re-loading the same real-shape orders file
+    twice must NOT duplicate rows. Uses the actual Target column shape
+    (`receiving_location_id` + `purchase_order_id`), not column_roles-derived
+    guesses, so this catches the exact bug the user reported."""
+    from bpd_mcp.sync import _pick_primary_key
+    from bpd_mcp.warehouse import Warehouse
+
+    body = (
+        "tcin\treceiving_location_id\tpurchase_order_id\torder_status\torder_date\topen_units\n"
+        "100\t1234\tPO-A001\topen\t2026-05-15\t50\n"
+        "200\t1234\tPO-A001\topen\t2026-05-15\t30\n"
+        "300\t5678\tPO-B002\tshipped\t2026-05-16\t0\n"
+    )
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_ORDER_TCIN_LOC_05182026_KW.zip",
+        "data.txt", body,
+    )
+    parsed = classify_filename(p.name)
+    r = read_dataframe(p)
+    pk = _pick_primary_key(parsed, r.df.columns)
+    cols = derive_duckdb_schema(r.df)
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.ensure_data_table("orders_daily", cols)
+        for _ in range(3):
+            wh.upsert_dataframe("orders_daily", r.df, primary_key=pk)
+        _, total = wh.execute_sql("SELECT COUNT(*) FROM orders_daily")
+        assert total[0][0] == 3, "three idempotent re-loads must leave 3 rows"
+    finally:
+        wh.close()
+
+
+def test_end_to_end_inventory_daily_real_shape_is_idempotent(tmp_path: Path) -> None:
+    """Patch #6.2.2 end-to-end. Same as orders_daily but for inventory_daily
+    with the real `business_d` date column."""
+    from bpd_mcp.sync import _pick_primary_key
+    from bpd_mcp.warehouse import Warehouse
+
+    body = (
+        "tcin\tlocation_id\tbusiness_d\ton_hand_units\n"
+        "100\t1234\t2026-05-18\t250\n"
+        "200\t5678\t2026-05-18\t100\n"
+        "300\t1234\t2026-05-18\t50\n"
+    )
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_INV_TCIN_LOC_05182026_KW.zip",
+        "data.txt", body,
+    )
+    parsed = classify_filename(p.name)
+    r = read_dataframe(p)
+    pk = _pick_primary_key(parsed, r.df.columns)
+    cols = derive_duckdb_schema(r.df)
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.ensure_data_table("inventory_daily", cols)
+        for _ in range(3):
+            wh.upsert_dataframe("inventory_daily", r.df, primary_key=pk)
+        _, total = wh.execute_sql("SELECT COUNT(*) FROM inventory_daily")
+        assert total[0][0] == 3, "three idempotent re-loads must leave 3 rows"
+    finally:
+        wh.close()

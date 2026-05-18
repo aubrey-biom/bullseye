@@ -167,9 +167,12 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"DAILY_INV_TCIN_LOC"),
         granularity="item × location × day",
         frequency="daily",
+        # `business_d` is the real Target column (Patch #6.2.2 — caught in
+        # production after #6.2.1's preemptive `report_date_dim` guess turned
+        # out to be wrong for this dataset).
         primary_key_candidates=_pk_with_loc(
-            "report_date_dim", "inventory_date", "snapshot_date",
-            "inv_date", "as_of_date",
+            "business_d", "report_date_dim", "inventory_date",
+            "snapshot_date", "inv_date", "as_of_date",
         ),
     ),
     FilePattern(
@@ -249,16 +252,22 @@ PATTERNS: tuple[FilePattern, ...] = (
         granularity="item × location × day",
         frequency="daily",
         primary_key_candidates=(
-            # Real Target column names (Patch #6.2.1 — confirmed against
-            # production files).
+            # Real Target shape (Patch #6.2.2 — orders uses
+            # `receiving_location_id`, the destination location for
+            # fulfillment, not the sales-side `location_id`).
+            ("purchase_order_id", "tcin", "receiving_location_id"),
+            ("purchase_order_number", "tcin", "receiving_location_id"),
+            # Patch #6.2.1 candidates kept for any file that ships
+            # `location_id` instead.
             ("purchase_order_id", "tcin", "location_id"),
             ("purchase_order_number", "tcin", "location_id"),
-            # Legacy guesses kept as fallbacks for older fixture shapes.
+            # Legacy PO column guesses (older fixture shapes).
+            ("po_number", "tcin", "receiving_location_id"),
             ("po_number", "tcin", "location_id"),
             ("po_nbr", "tcin", "location_id"),
             ("po_id", "tcin", "location_id"),
-            # Fallback: date × item × location (loses individual PO identity but
-            # is at least granular enough to be idempotent).
+            # Fallback: date × item × location (loses individual PO identity
+            # but is at least granular enough to be idempotent).
             *_pk_with_loc("order_date"),
             *_pk_with_loc("po_date"),
         ),
