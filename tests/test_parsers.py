@@ -644,6 +644,9 @@ def test_parse_strict_inch_mark_inventory_volume(tmp_path: Path) -> None:
         ("forecast_weekly",
          "BV_139440_DFE_WKLY_ITEM_LOC_FORECAST_05092026_KW.zip",
          "fiscal_week_begin_d"),
+        # Patch #6.2.1: caught in production as the upsert raise fired.
+        ("inventory_daily",
+         "BV_139440_DAILY_INV_TCIN_LOC_05092026_KW.zip", "report_date_dim"),
     ],
 )
 def test_pk_resolution_matches_real_target_date_column(
@@ -672,3 +675,89 @@ def test_pk_resolution_matches_real_target_date_column(
         f"{dataset}: PK {pk} has columns not in the df shape {df_cols}; "
         f"upsert_dataframe would raise primary_key_missing_in_df."
     )
+
+
+def test_pk_resolution_orders_daily_real_po_column() -> None:
+    """Patch #6.2.1. Target's orders file uses `purchase_order_id` for the
+    PO identifier — neither `po_number`/`po_nbr`/`po_id` (the legacy guesses)
+    nor any date column. PK resolution must find a PO-keyed candidate against
+    the real column shape.
+    """
+    from bpd_mcp.sync import _pick_primary_key
+
+    parsed = classify_filename("BV_139440_DAILY_ORDER_TCIN_LOC_05092026_KW.zip")
+    assert parsed is not None and parsed.pattern.dataset == "orders_daily"
+    df_cols = ["tcin", "location_id", "purchase_order_id", "order_status"]
+    pk = _pick_primary_key(parsed, df_cols)
+    assert pk == ("purchase_order_id", "tcin", "location_id"), (
+        f"expected the real PO-keyed candidate to win, got {pk}"
+    )
+    assert all(c in df_cols for c in pk)
+
+
+def test_pk_resolution_location_attr_real_column() -> None:
+    """Patch #6.2.1. `location_attr` ships `location_number` as the canonical
+    location identifier. `_LOC_COLS` must include it so the single-column PK
+    candidate `('location_number',)` is generated for this dataset.
+    """
+    from bpd_mcp.sync import _pick_primary_key
+
+    parsed = classify_filename("ALL_WKLY_LOC_ATTR_V0_0_05092026_KW.zip")
+    assert parsed is not None and parsed.pattern.dataset == "location_attr"
+    df_cols = ["location_number", "store_name", "city", "state"]
+    pk = _pick_primary_key(parsed, df_cols)
+    assert pk == ("location_number",), (
+        f"expected ('location_number',) PK, got {pk} — _LOC_COLS missing "
+        f"'location_number' would leave the upsert without a working PK and "
+        f"every re-load would raise primary_key_missing_in_df."
+    )
+
+
+def test_pk_audit_all_first_candidates_have_column_roles_or_canonical_cols() -> None:
+    """Meta-audit. For every PATTERNS entry, the FIRST primary_key_candidate's
+    columns should be either (a) canonical core columns (`tcin`, `dpci`,
+    `fiscal_week`), or (b) present in column_roles for that dataset under
+    some role, and that role's FIRST entry should match.
+
+    This is the audit that would have caught the orders_daily / location_attr /
+    inventory_daily class of bug before it shipped — drift between the catalog
+    PK and the column_roles registry's first-priority entries means the upsert
+    will raise on the first re-load of a real Target file.
+
+    Exemptions: orders_daily's `purchase_order_id` (no `po` role in
+    column_roles yet — fine, as long as the PK uses the real column name) and
+    location_attr's `location_number` (covered by _LOC_COLS, not column_roles
+    for that dataset specifically).
+    """
+    from bpd_mcp.column_roles import COLUMN_ROLES
+
+    CORE = {"tcin", "dpci", "fiscal_week"}
+    # Cols that are correct but not in column_roles (no role exists for them yet).
+    KNOWN_OK_NOT_IN_ROLES = {"purchase_order_id", "po_number"}
+
+    issues: list[str] = []
+    for p in PATTERNS:
+        roles = COLUMN_ROLES.get(p.dataset, {})
+        first_pk = p.primary_key_candidates[0]
+        for col in first_pk:
+            if col in CORE or col in KNOWN_OK_NOT_IN_ROLES:
+                continue
+            found_role = None
+            for role, candidates in roles.items():
+                if col in candidates:
+                    found_role = role
+                    break
+            if not found_role:
+                issues.append(
+                    f"{p.dataset}: PK col {col!r} not in column_roles "
+                    f"(catalog drift — column_roles needs updating, or PK is wrong)"
+                )
+                continue
+            real_first = roles[found_role][0]
+            if real_first != col:
+                issues.append(
+                    f"{p.dataset}: PK col {col!r} is in role {found_role!r} "
+                    f"but the first entry is {real_first!r} (real Target name); "
+                    f"PK should list {real_first!r} as a candidate first"
+                )
+    assert not issues, "\n".join(["catalog/column_roles drift:", *issues])
