@@ -69,6 +69,59 @@ def test_idempotent_load(tmp_path: Path) -> None:
         wh.close()
 
 
+def test_sales_weekly_idempotent_with_multi_channel_rows_per_pk(tmp_path: Path) -> None:
+    """sales_weekly carries multiple rows per (tcin, location_id, week_end_date)
+    split by channel/fulfillment. The upsert's primary_key is just (tcin,
+    location_id, week_end_date), so the DELETE removes the full set of rows for
+    that key and the INSERT re-adds whichever rows are in the new df. Re-loading
+    the SAME df twice must leave the row count unchanged regardless of how
+    many channel splits exist per natural key — and the full row content must
+    be preserved verbatim (Patch #6.1 regression guard for the 2.0× duplication
+    reported during sales_weekly validation).
+    """
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    pk = ("tcin", "location_id", "week_end_date")
+    # Two channel splits per (tcin, location_id, week_end_date): in-store and online.
+    df = pl.DataFrame(
+        {
+            "tcin": [100, 100, 200, 200],
+            "location_id": [1234, 1234, 1234, 1234],
+            "week_end_date": [
+                date(2026, 5, 9),
+                date(2026, 5, 9),
+                date(2026, 5, 9),
+                date(2026, 5, 9),
+            ],
+            "reporting_channel": ["store", "online", "store", "online"],
+            "units_sold": [10, 3, 5, 2],
+            "sales_dollars": [100.0, 30.0, 50.0, 20.0],
+        }
+    )
+    cols = derive_duckdb_schema(df)
+    try:
+        wh.register_schema("sales_weekly", cols, pk)
+        wh.ensure_data_table("sales_weekly", cols)
+        wh.upsert_dataframe("sales_weekly", df, primary_key=pk)
+        _, after_first = wh.execute_sql("SELECT COUNT(*) FROM sales_weekly")
+        assert after_first[0][0] == 4
+
+        # Re-load the SAME df. Row count must NOT double; channel splits intact.
+        wh.upsert_dataframe("sales_weekly", df, primary_key=pk)
+        _, after_second = wh.execute_sql("SELECT COUNT(*) FROM sales_weekly")
+        assert after_second[0][0] == 4, "re-loading the same df must not duplicate"
+        _, dollars = wh.execute_sql("SELECT SUM(sales_dollars) FROM sales_weekly")
+        assert dollars[0][0] == 200.0  # 100 + 30 + 50 + 20
+
+        # Sanity: no literal-row duplicates exist after re-load.
+        _, dup_check = wh.execute_sql(
+            "SELECT COUNT(*) - (SELECT COUNT(*) FROM (SELECT DISTINCT * FROM sales_weekly)) "
+            "FROM sales_weekly"
+        )
+        assert dup_check[0][0] == 0
+    finally:
+        wh.close()
+
+
 def test_upsert_into_existing_bool_column_with_nulls(tmp_path: Path) -> None:
     """Patch #6 integration regression. Once parsers map `""` to NULL, the df
     arrives at the warehouse as Boolean with None for missing rows. DuckDB must

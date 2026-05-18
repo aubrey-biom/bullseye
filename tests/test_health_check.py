@@ -1,6 +1,6 @@
 """Tests for the `bpd_health_check` tool (Patch #3).
 
-Each of the 14 checks gets a pass-path test and (where the check has a non-trivial
+Each of the 15 checks gets a pass-path test and (where the check has a non-trivial
 failure mode) a fail-path test driven by deliberately broken state.
 """
 
@@ -99,7 +99,7 @@ async def test_health_check_all_pass_on_healthy_install(tmp_path: Path) -> None:
     resp = await _run_checks(tmp_path=tmp_path)
     assert resp.ok is True
     by = _by_name(resp)
-    # All 14 checks present.
+    # All 15 checks present.
     expected_names = {
         "auth_token_valid",
         "auth_kiteworks_reachable",
@@ -111,6 +111,7 @@ async def test_health_check_all_pass_on_healthy_install(tmp_path: Path) -> None:
         "sync_ledger_consistent",
         "sync_no_orphan_raw_files",
         "datasets_have_data",
+        "warehouse_no_duplicate_rows",
         "disk_usage",
         "token_expiry_window",
         "config_validity",
@@ -131,6 +132,49 @@ async def test_health_check_all_pass_on_healthy_install(tmp_path: Path) -> None:
     assert by["config_validity"]["status"] == "pass"
     assert by["mcp_self_check"]["status"] == "pass"
     assert by["disk_usage"]["status"] == "pass"
+    assert by["warehouse_no_duplicate_rows"]["status"] == "pass"
+
+
+async def test_health_check_warehouse_no_duplicate_rows_warns_on_dup(
+    tmp_path: Path,
+) -> None:
+    """Patch #6.1 follow-up. If a data table has literal-row duplicates (every
+    column value identical), the check must warn with the dataset name and
+    duplicate count so the user can remediate via `bpd_refresh_dataset(full=True)`.
+    """
+    from datetime import date
+
+    import polars as pl
+
+    from bpd_mcp.parsers import derive_duckdb_schema
+
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    df = pl.DataFrame(
+        {
+            "tcin": [100, 100, 200],  # row 1 == row 0 by every column → dup
+            "location_id": [1234, 1234, 5678],
+            "week_end_date": [date(2026, 5, 9), date(2026, 5, 9), date(2026, 5, 9)],
+            "units_sold": [10, 10, 20],
+        }
+    )
+    cols = derive_duckdb_schema(df)
+    wh.register_schema("sales_weekly", cols, ("tcin", "location_id", "week_end_date"))
+    wh.ensure_data_table("sales_weekly", cols)
+    # Bypass upsert (which would dedup by PK) — insert directly to plant a dup.
+    wh._conn.register("incoming_df", df.to_arrow())  # type: ignore[attr-defined]
+    wh._conn.execute("INSERT INTO sales_weekly SELECT * FROM incoming_df")  # type: ignore[attr-defined]
+    wh._conn.unregister("incoming_df")  # type: ignore[attr-defined]
+
+    resp = await _run_checks(tmp_path=tmp_path, warehouse=wh)
+    wh.close()
+    by = _by_name(resp)
+    check = by["warehouse_no_duplicate_rows"]
+    assert check["status"] == "warn"
+    assert "sales_weekly" in check["detail"]
+    assert "1 of 3" in check["detail"]
+    assert "bpd_refresh_dataset" in check["detail"]
 
 
 # --------- individual failure modes ---------

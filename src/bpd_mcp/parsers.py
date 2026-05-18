@@ -464,7 +464,8 @@ def _attempt_pandas_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, in
         encoding_errors="replace",
         dtype=str,  # read everything as string; polars/_cast_known_columns handles types
         keep_default_na=False,
-        na_values=["", "NULL", "null"],
+        # `'""'` is Target's NULL placeholder; mirror _attempt_strict (Patch #6).
+        na_values=["", "NULL", "null", '""'],
     )
     total_lines = sum(1 for ln in raw.splitlines() if ln.strip())
     expected_rows = max(0, total_lines - 1)

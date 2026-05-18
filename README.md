@@ -137,7 +137,7 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | `bpd_auth_status`          | OAuth state, scope, expires_in_s, user email (via `/rest/users/me`).                       |
 | `bpd_cache_status`         | Disk usage, row counts. Reports two date ranges: `earliest/latest_data_date` (transactional datasets only — the business-data range) and `earliest/latest_data_date_including_dimensional` (covers `location_attr.last_remodel_date` etc.). Per-dataset breakdown includes the detected date column and dataset `kind`. |
 | `bpd_clear_cache`          | **Destructive.** Requires `confirm=true`. Otherwise returns a dry-run preview.            |
-| `bpd_health_check`         | 14-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
+| `bpd_health_check`         | 15-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
 | `bpd_export_query_to_csv`  | Run a read-only SQL query and write the result to `~/.bpd-mcp/exports/<filename>` (mode 0644). Useful for sharing data with team members who don't have MCP access. Same read-only safety as `bpd_run_sql`. |
 
 ---
@@ -349,7 +349,7 @@ pkill -f bpd-mcp && sleep 2
 rm -f ~/.bpd-mcp/bpd.duckdb.ro ~/.bpd-mcp/bpd.duckdb.ro.wal   # one-time, patch #3
 ./scripts/verify_install.sh                                   # local checks (8 steps)
 # Fully quit + reopen Claude Desktop
-# In Claude Desktop: call bpd_health_check                    # 14-check audit
+# In Claude Desktop: call bpd_health_check                    # 15-check audit
 # In Claude Desktop: call bpd_sync_new_files                  # ~99 loaded, 0-2 failed
 ```
 
