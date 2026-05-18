@@ -137,7 +137,7 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | `bpd_auth_status`          | OAuth state, scope, expires_in_s, user email (via `/rest/users/me`).                       |
 | `bpd_cache_status`         | Disk usage, row counts. Reports two date ranges: `earliest/latest_data_date` (transactional datasets only — the business-data range) and `earliest/latest_data_date_including_dimensional` (covers `location_attr.last_remodel_date` etc.). Per-dataset breakdown includes the detected date column and dataset `kind`. |
 | `bpd_clear_cache`          | **Destructive.** Requires `confirm=true`. Otherwise returns a dry-run preview.            |
-| `bpd_health_check`         | 14-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
+| `bpd_health_check`         | 15-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
 | `bpd_export_query_to_csv`  | Run a read-only SQL query and write the result to `~/.bpd-mcp/exports/<filename>` (mode 0644). Useful for sharing data with team members who don't have MCP access. Same read-only safety as `bpd_run_sql`. |
 
 ---
@@ -175,6 +175,7 @@ Worth knowing when writing custom SQL against the warehouse — bugs hide here:
 - **`forecast_weekly` ships dates as VARCHAR.** `fiscal_week_begin_d` is stored as text like `'2026-05-03'`. The analytics tools insert a `CAST(... AS DATE)` at query time automatically; manual SQL needs the same cast.
 - **`forecast_weekly` carries multiple snapshots per (tcin, location, week)** distinguished by `last_update_d`. Use `bpd_get_forecast_vs_actual`'s `as_of_date` (or `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY last_update_d DESC)`) to pick a single snapshot.
 - **Product names contain unescaped inch marks** (e.g. `6"` in the Bone SKU). The parser uses `quote_char=None` to handle this. If you ever write a custom CSV reader against the raw BPD files, do the same.
+- **`""` (two literal double-quotes) is the NULL placeholder in nullable typed columns** like `purchase_order_active_f` (BOOL) and `parent_tcin` (BIGINT). With `quote_char=None`, polars no longer reduces it to an empty field; the parser lists `'""'` explicitly in `null_values` so it maps to NULL. A custom reader needs the same mapping or the column will read as VARCHAR and break INSERT into the typed warehouse column.
 
 ---
 
@@ -348,7 +349,7 @@ pkill -f bpd-mcp && sleep 2
 rm -f ~/.bpd-mcp/bpd.duckdb.ro ~/.bpd-mcp/bpd.duckdb.ro.wal   # one-time, patch #3
 ./scripts/verify_install.sh                                   # local checks (8 steps)
 # Fully quit + reopen Claude Desktop
-# In Claude Desktop: call bpd_health_check                    # 14-check audit
+# In Claude Desktop: call bpd_health_check                    # 15-check audit
 # In Claude Desktop: call bpd_sync_new_files                  # ~99 loaded, 0-2 failed
 ```
 

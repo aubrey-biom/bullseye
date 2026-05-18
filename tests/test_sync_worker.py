@@ -141,6 +141,116 @@ async def test_sync_new_files_full_path(tmp_path: Path) -> None:
 
 
 @respx.mock
+async def test_sync_failed_load_preserves_prior_registry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Patch #6 contract. If `upsert_dataframe` raises, `register_schema` must
+    NOT run, so the registry keeps reflecting the last successful load instead
+    of the failed attempt's inferred types.
+    """
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    # Pre-seed warehouse with the prior "successful" schema (the types we want
+    # the registry to retain even after the failed load).
+    seeded = Warehouse(s.db_path)
+    seeded_cols = {
+        "tcin": "BIGINT",
+        "location_id": "BIGINT",
+        "sale_date": "DATE",
+        "units_sold": "BIGINT",
+        "sales_dollars": "DOUBLE",
+    }
+    try:
+        seeded.register_schema(
+            "sales_daily", seeded_cols, ("tcin", "location_id", "sale_date")
+        )
+        seeded.ensure_data_table("sales_daily", seeded_cols)
+    finally:
+        seeded.close()
+
+    # Force upsert_dataframe to raise so we exercise the failure path.
+    from bpd_mcp import warehouse as warehouse_mod
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("simulated upsert failure")
+
+    monkeypatch.setattr(warehouse_mod.Warehouse, "upsert_dataframe", _raise)
+
+    respx.post("https://securesharek.target.com/oauth/token").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "AT",
+                "refresh_token": "RT",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "*/*/*",
+            },
+        )
+    )
+    vendor_folder = {"id": "F1", "name": "999000", "type": "d"}
+    respx.get("https://securesharek.target.com/rest/folders/top").mock(
+        return_value=httpx.Response(
+            200, json={"data": [vendor_folder], "metadata": {"total": 1}}
+        )
+    )
+    file_id = "BAD"
+    file_name = "BV_999000_DAILY_SALES_TCIN_LOC_04212026_KW.zip"
+    respx.get("https://securesharek.target.com/rest/folders/F1/children").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": file_id,
+                    "name": file_name,
+                    "type": "f",
+                    "parentId": "F1",
+                    "size": 100,
+                    "fingerprint": "fp-bad",
+                }
+            ],
+        )
+    )
+    # An OK-shaped body. Failure comes from the monkeypatched upsert.
+    body = (
+        "TCIN|LOCATION ID|SALE DATE|UNITS SOLD|SALES DOLLARS|EXTRA_NEW_COL\n"
+        "100|1234|2026-04-21|5|10.0|abc\n"
+    )
+    respx.get(f"https://securesharek.target.com/rest/files/{file_id}/content").mock(
+        return_value=httpx.Response(200, content=_zip_bytes("x.txt", body))
+    )
+
+    from datetime import UTC, datetime, timedelta
+
+    bundle = TokenBundle(
+        access_token="AT",
+        refresh_token="RT",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    async with httpx.AsyncClient() as http:
+        auth = AuthManager(s, http, bundle=bundle)
+        client = KiteworksClient(s, auth, http)
+        wh = Warehouse(s.db_path)
+        try:
+            result = await sync_new_files(client, wh, s, triggered_by="t-bad")
+        finally:
+            wh.close()
+    assert result.files_failed == 1
+    assert result.files_loaded == 0
+
+    # Registry must still reflect the seeded schema (no `extra_new_col`),
+    # because register_schema was NOT called for the failed attempt.
+    wh2 = Warehouse(s.db_path)
+    try:
+        schema = wh2.get_schema("sales_daily")
+        assert schema is not None
+        assert "extra_new_col" not in schema["columns"]
+        assert set(schema["columns"]) == set(seeded_cols)
+    finally:
+        wh2.close()
+
+
+@respx.mock
 async def test_sync_is_idempotent(tmp_path: Path) -> None:
     """Re-running sync with same fingerprint must skip — row count unchanged."""
     s = _settings(tmp_path)
@@ -178,7 +288,11 @@ async def test_sync_is_idempotent(tmp_path: Path) -> None:
             ],
         )
     )
-    body = "TCIN|WEEK_END_DATE|GROSS_MARGIN\n1|2026-04-25|0.30\n2|2026-04-25|0.40\n"
+    body = (
+        "TCIN|LOCATION ID|WEEK_END_DATE|GROSS_MARGIN\n"
+        "1|1234|2026-04-25|0.30\n"
+        "2|1234|2026-04-25|0.40\n"
+    )
     zb = _zip_bytes("x.txt", body)
     respx.get(f"https://securesharek.target.com/rest/files/{file_id}/content").mock(
         return_value=httpx.Response(200, content=zb)

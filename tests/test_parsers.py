@@ -550,6 +550,55 @@ def test_parse_strict_handles_unescaped_inch_mark(tmp_path: Path) -> None:
     assert any('6"' in n for n in names), f"inch mark dropped: {names}"
 
 
+def test_parse_strict_treats_empty_quoted_string_as_null_in_bool_column(
+    tmp_path: Path,
+) -> None:
+    """Patch #6 regression. Target ships nullable boolean columns with the
+    literal two-char placeholder `""` for NULL. After Patch #4 set
+    `quote_char=None`, polars stopped reducing `""` to an empty field, so the
+    column was inferred as String (mix of `true`/`false`/`""`) and DuckDB's
+    INSERT into an existing BOOLEAN column failed with ConversionException.
+    """
+    body = (
+        "TCIN\tPURCHASE_ORDER_ACTIVE_F\n"
+        "100\ttrue\n"
+        '200\t""\n'
+        "300\tfalse\n"
+    )
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_ORDERS_TCIN_LOC_04252026_KW.zip",
+        "data.txt",
+        body,
+    )
+    result = read_dataframe(p)
+    assert result.method == "strict"
+    assert result.df.schema["purchase_order_active_f"] == pl.Boolean
+    assert result.df["purchase_order_active_f"].to_list() == [True, None, False]
+
+
+def test_parse_strict_treats_empty_quoted_string_as_null_in_int_column(
+    tmp_path: Path,
+) -> None:
+    """Sibling of the BOOL case for int-valued nullable columns like
+    `parent_tcin`. Without this NULL mapping, polars infers String and the
+    INSERT into an existing BIGINT column fails."""
+    body = (
+        "TCIN\tPARENT_TCIN\n"
+        "100\t12345\n"
+        '200\t""\n'
+        "300\t67890\n"
+    )
+    p = _make_zip(
+        tmp_path / "BV_139440_DAILY_ITEM_TCIN_04252026_KW.zip",
+        "data.txt",
+        body,
+    )
+    result = read_dataframe(p)
+    assert result.method == "strict"
+    assert result.df.schema["parent_tcin"] == pl.Int64
+    assert result.df["parent_tcin"].to_list() == [12345, None, 67890]
+
+
 def test_parse_strict_inch_mark_inventory_volume(tmp_path: Path) -> None:
     """Inventory has 1 row per SKU×location, so the bone SKU multiplied across
     100+ locations was responsible for the bulk of fallback-parsed rows. This
@@ -569,3 +618,57 @@ def test_parse_strict_inch_mark_inventory_volume(tmp_path: Path) -> None:
     assert result.method == "strict"
     assert result.df.height == 100
     assert result.skipped_rows == 0
+
+
+# ---------- Patch #6.2: PK resolution against real Target column names ----------
+
+
+@pytest.mark.parametrize(
+    ("dataset", "filename", "real_date_col"),
+    [
+        # Each entry: dataset → filename pattern + the date column Target actually
+        # ships in real production data (per column_roles.py priority list).
+        # Pre-Patch-6.2 the catalog hard-coded `week_end_date` / `sale_date` only;
+        # re-loading any file with these real names silently skipped DELETE and
+        # duplicated rows. This test parameterizes the regression guard.
+        ("sales_daily",
+         "BV_139440_DAILY_SALES_TCIN_LOC_05092026_KW.zip", "sales_date"),
+        ("sales_weekly",
+         "BV_139440_WEEKLY_SALES_TCIN_LOC_05092026_KW.zip", "sales_date"),
+        ("sales_weekly_item",
+         "BV_139440_WEEKLY_SALES_TCIN_05092026_KW.zip", "sales_date"),
+        ("inventory_weekly",
+         "BV_139440_WEEKLY_INV_TCIN_LOC_05092026_KW.zip", "report_date_dim"),
+        ("inventory_weekly_item",
+         "BV_139440_WEEKLY_INV_TCIN_05092026_KW.zip", "report_date_dim"),
+        ("forecast_weekly",
+         "BV_139440_DFE_WKLY_ITEM_LOC_FORECAST_05092026_KW.zip",
+         "fiscal_week_begin_d"),
+    ],
+)
+def test_pk_resolution_matches_real_target_date_column(
+    tmp_path: Path, dataset: str, filename: str, real_date_col: str,
+) -> None:
+    """For every dataset whose real Target date column is NOT `week_end_date`,
+    `_pick_primary_key` must find a matching candidate in the catalog (i.e. not
+    fall through to the broken fallback that hides this bug).
+    """
+    from bpd_mcp.sync import _pick_primary_key
+
+    parsed = classify_filename(filename)
+    assert parsed is not None and parsed.pattern.dataset == dataset
+    # Minimal column set matching what Target ships: tcin + (location_id if the
+    # filename includes `LOC`) + the real date column.
+    item_only = "_LOC_" not in filename.upper().replace("WKLY_", "")
+    df_cols = ["tcin", real_date_col] if item_only else ["tcin", "location_id", real_date_col]
+    pk = _pick_primary_key(parsed, df_cols)
+    assert real_date_col in pk, (
+        f"{dataset}: PK resolution chose {pk} which doesn't include the real "
+        f"date column {real_date_col!r} — re-loads of this dataset will skip "
+        f"DELETE and duplicate. Add {real_date_col!r} to the catalog's "
+        f"primary_key_candidates for {dataset}."
+    )
+    assert all(c in df_cols for c in pk), (
+        f"{dataset}: PK {pk} has columns not in the df shape {df_cols}; "
+        f"upsert_dataframe would raise primary_key_missing_in_df."
+    )

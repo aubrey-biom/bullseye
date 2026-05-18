@@ -69,6 +69,174 @@ def test_idempotent_load(tmp_path: Path) -> None:
         wh.close()
 
 
+def test_sales_weekly_idempotent_with_multi_channel_rows_per_pk(tmp_path: Path) -> None:
+    """sales_weekly carries multiple rows per (tcin, location_id, week_end_date)
+    split by channel/fulfillment. The upsert's primary_key is just (tcin,
+    location_id, week_end_date), so the DELETE removes the full set of rows for
+    that key and the INSERT re-adds whichever rows are in the new df. Re-loading
+    the SAME df twice must leave the row count unchanged regardless of how
+    many channel splits exist per natural key — and the full row content must
+    be preserved verbatim (Patch #6.1 regression guard for the 2.0× duplication
+    reported during sales_weekly validation).
+    """
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    pk = ("tcin", "location_id", "week_end_date")
+    # Two channel splits per (tcin, location_id, week_end_date): in-store and online.
+    df = pl.DataFrame(
+        {
+            "tcin": [100, 100, 200, 200],
+            "location_id": [1234, 1234, 1234, 1234],
+            "week_end_date": [
+                date(2026, 5, 9),
+                date(2026, 5, 9),
+                date(2026, 5, 9),
+                date(2026, 5, 9),
+            ],
+            "reporting_channel": ["store", "online", "store", "online"],
+            "units_sold": [10, 3, 5, 2],
+            "sales_dollars": [100.0, 30.0, 50.0, 20.0],
+        }
+    )
+    cols = derive_duckdb_schema(df)
+    try:
+        wh.register_schema("sales_weekly", cols, pk)
+        wh.ensure_data_table("sales_weekly", cols)
+        wh.upsert_dataframe("sales_weekly", df, primary_key=pk)
+        _, after_first = wh.execute_sql("SELECT COUNT(*) FROM sales_weekly")
+        assert after_first[0][0] == 4
+
+        # Re-load the SAME df. Row count must NOT double; channel splits intact.
+        wh.upsert_dataframe("sales_weekly", df, primary_key=pk)
+        _, after_second = wh.execute_sql("SELECT COUNT(*) FROM sales_weekly")
+        assert after_second[0][0] == 4, "re-loading the same df must not duplicate"
+        _, dollars = wh.execute_sql("SELECT SUM(sales_dollars) FROM sales_weekly")
+        assert dollars[0][0] == 200.0  # 100 + 30 + 50 + 20
+
+        # Sanity: no literal-row duplicates exist after re-load.
+        _, dup_check = wh.execute_sql(
+            "SELECT COUNT(*) - (SELECT COUNT(*) FROM (SELECT DISTINCT * FROM sales_weekly)) "
+            "FROM sales_weekly"
+        )
+        assert dup_check[0][0] == 0
+    finally:
+        wh.close()
+
+
+def test_sales_weekly_two_different_files_with_overlapping_rows_dedupe(
+    tmp_path: Path,
+) -> None:
+    """Patch #6.1 forensic guard. Address the post-merge audit question: if two
+    DIFFERENT files (different file_ids, potentially different metric values)
+    cover the same (tcin, location_id, week_end_date) tuples, the second load
+    must REPLACE the first's rows — not append. This is the scenario that a
+    file_id-keyed upsert would silently fail (each file gets its own row set,
+    no deletion across files); a natural-key-keyed upsert handles it correctly.
+
+    `test_sales_weekly_idempotent_with_multi_channel_rows_per_pk` only proves
+    same-df-twice. This proves two-different-dfs-with-overlap.
+    """
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    pk = ("tcin", "location_id", "week_end_date")
+    df_a = pl.DataFrame(
+        {
+            "tcin": [100, 100, 200],
+            "location_id": [1234, 1234, 1234],
+            "week_end_date": [date(2026, 5, 9), date(2026, 5, 9), date(2026, 5, 9)],
+            "reporting_channel": ["store", "online", "store"],
+            "units_sold": [10, 3, 5],
+            "sales_dollars": [100.0, 30.0, 50.0],
+        }
+    )
+    # df_b: SAME (tcin, location_id, week_end_date) tuples but updated metric values
+    # — exactly what a Kiteworks-repackaged file looks like.
+    df_b = pl.DataFrame(
+        {
+            "tcin": [100, 100, 200],
+            "location_id": [1234, 1234, 1234],
+            "week_end_date": [date(2026, 5, 9), date(2026, 5, 9), date(2026, 5, 9)],
+            "reporting_channel": ["store", "online", "store"],
+            "units_sold": [11, 4, 6],  # updated values
+            "sales_dollars": [110.0, 40.0, 60.0],
+        }
+    )
+    cols = derive_duckdb_schema(df_a)
+    try:
+        wh.register_schema("sales_weekly", cols, pk)
+        wh.ensure_data_table("sales_weekly", cols)
+        wh.upsert_dataframe("sales_weekly", df_a, primary_key=pk)
+        wh.upsert_dataframe("sales_weekly", df_b, primary_key=pk)
+
+        # Three rows total (df_a's are deleted before df_b's INSERT) — not six.
+        _, total = wh.execute_sql("SELECT COUNT(*) FROM sales_weekly")
+        assert total[0][0] == 3, (
+            "natural-key upsert must replace overlapping rows across files; "
+            "got duplication implying file_id-keyed semantics"
+        )
+        # Verify df_b's updated values won — not df_a's.
+        _, dollars = wh.execute_sql("SELECT SUM(sales_dollars) FROM sales_weekly")
+        assert dollars[0][0] == 210.0  # 110 + 40 + 60, NOT 180 (df_a)
+
+        # And no literal-row dups.
+        _, dup_check = wh.execute_sql(
+            "SELECT COUNT(*) - (SELECT COUNT(*) FROM (SELECT DISTINCT * FROM sales_weekly)) "
+            "FROM sales_weekly"
+        )
+        assert dup_check[0][0] == 0
+    finally:
+        wh.close()
+
+
+def test_upsert_into_existing_bool_column_with_nulls(tmp_path: Path) -> None:
+    """Patch #6 integration regression. Once parsers map `""` to NULL, the df
+    arrives at the warehouse as Boolean with None for missing rows. DuckDB must
+    accept that mix into an existing BOOLEAN column without ConversionException.
+    """
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        cols = {"tcin": "BIGINT", "purchase_order_active_f": "BOOLEAN"}
+        wh.ensure_data_table("orders_daily", cols)
+        df = pl.DataFrame(
+            {
+                "tcin": [100, 200, 300],
+                "purchase_order_active_f": [True, None, False],
+            }
+        )
+        rows = wh.upsert_dataframe("orders_daily", df, primary_key=("tcin",))
+        assert rows == 3
+        _, fetched = wh.execute_sql(
+            "SELECT tcin, purchase_order_active_f FROM orders_daily ORDER BY tcin"
+        )
+        assert fetched == [(100, True), (200, None), (300, False)]
+    finally:
+        wh.close()
+
+
+def test_upsert_raises_on_missing_primary_key_columns(tmp_path: Path) -> None:
+    """Patch #6.2 hard-fail contract. If any PK column is missing from the df,
+    upsert MUST raise instead of silently skipping DELETE and running INSERT
+    unconditionally. The old warn-and-skip behavior masked the sales_weekly
+    2.0× duplication bug.
+    """
+    import pytest
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        cols = {"tcin": "BIGINT", "location_id": "BIGINT", "units_sold": "BIGINT"}
+        wh.ensure_data_table("sales_daily", cols)
+        df = pl.DataFrame({"tcin": [1, 2], "units_sold": [10, 20]})  # NO location_id
+        with pytest.raises(RuntimeError, match="primary_key_missing_in_df"):
+            wh.upsert_dataframe(
+                "sales_daily",
+                df,
+                primary_key=("tcin", "location_id", "sales_date"),
+            )
+        # Table is untouched.
+        _, total = wh.execute_sql("SELECT COUNT(*) FROM sales_daily")
+        assert total[0][0] == 0
+    finally:
+        wh.close()
+
+
 def test_schema_drift_detected(tmp_path: Path) -> None:
     wh = Warehouse(tmp_path / "bpd.duckdb")
     try:

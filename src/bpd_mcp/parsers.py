@@ -100,12 +100,21 @@ def _bare(body: str) -> re.Pattern[str]:
 _LOC_COLS = ("location_id", "store_id", "loc_id", "store_nbr", "location_nbr")
 
 
-def _pk_with_loc(date_col: str) -> tuple[tuple[str, ...], ...]:
-    return tuple(("tcin", lc, date_col) for lc in _LOC_COLS)
+def _pk_with_loc(*date_cols: str) -> tuple[tuple[str, ...], ...]:
+    """PK candidates as a cartesian product: TCIN × LOC_COLS × date_cols.
+
+    `date_cols` are tried in the order given — `_pick_primary_key` picks the
+    first candidate whose columns all exist in the df. List the real Target
+    column name first; aliases are fallbacks for older fixture shapes (Patch
+    #6.2: prevents silent DELETE-skip when Target ships `sales_date` but the
+    catalog only knew about `week_end_date`).
+    """
+    return tuple(("tcin", lc, dc) for dc in date_cols for lc in _LOC_COLS)
 
 
-def _pk_item(date_col: str) -> tuple[tuple[str, ...], ...]:
-    return (("tcin", date_col),)
+def _pk_item(*date_cols: str) -> tuple[tuple[str, ...], ...]:
+    """Item-only PK candidates: TCIN × date_cols (no location dimension)."""
+    return tuple(("tcin", dc) for dc in date_cols)
 
 
 # --- Pattern catalog ------------------------------------------------------------------
@@ -121,21 +130,29 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"DAILY_SALES_TCIN_LOC"),
         granularity="item × location × day",
         frequency="daily",
-        primary_key_candidates=_pk_with_loc("sale_date"),
+        primary_key_candidates=_pk_with_loc(
+            "sales_date", "sale_date", "transaction_date"
+        ),
     ),
     FilePattern(
         dataset="sales_weekly",
         regex=_pat(r"WEEKLY_SALES_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc("week_end_date"),
+        primary_key_candidates=_pk_with_loc(
+            "sales_date", "week_end_date", "fiscal_week_end_d",
+            "fiscal_week_end_date", "sale_date",
+        ),
     ),
     FilePattern(
         dataset="sales_weekly_item",
         regex=_pat(r"WEEKLY_SALES_TCIN"),
         granularity="item × week (rolled up across locations)",
         frequency="weekly",
-        primary_key_candidates=_pk_item("week_end_date"),
+        primary_key_candidates=_pk_item(
+            "sales_date", "week_end_date", "fiscal_week_end_d",
+            "fiscal_week_end_date", "sale_date",
+        ),
     ),
 
     # ---------- inventory (item × location × day | week) ----------
@@ -155,14 +172,20 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"WEEKLY_INV_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc("week_end_date"),
+        primary_key_candidates=_pk_with_loc(
+            "report_date_dim", "week_end_date", "fiscal_week_end_d",
+            "inventory_date", "snapshot_date",
+        ),
     ),
     FilePattern(
         dataset="inventory_weekly_item",
         regex=_pat(r"WEEKLY_INV_TCIN"),
         granularity="item × week (rolled up across locations)",
         frequency="weekly",
-        primary_key_candidates=_pk_item("week_end_date"),
+        primary_key_candidates=_pk_item(
+            "report_date_dim", "week_end_date", "fiscal_week_end_d",
+            "inventory_date",
+        ),
     ),
 
     # ---------- gross margin ----------
@@ -276,7 +299,11 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"DFE_WKLY_ITEM_LOC_FORECAST"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc("week_end_date"),
+        primary_key_candidates=_pk_with_loc(
+            "fiscal_week_begin_d", "fiscal_week_begin_date",
+            "fiscal_week_end_d", "fiscal_week_end_date",
+            "week_start_date", "week_end_date", "forecast_week",
+        ),
     ),
 )
 
@@ -400,13 +427,18 @@ def _attempt_strict(raw: bytes, delim: str) -> pl.DataFrame:
     happen to contain `"` (e.g. `6" Height` in a SKU name) used to be interpreted
     as quoted strings and broke tokenization. With quoting disabled, those
     characters are treated as literal data and the row parses cleanly.
+
+    The two-character literal `""` is Target's NULL placeholder in nullable
+    columns (e.g. `purchase_order_active_f`, `parent_tcin`). With quoting
+    disabled, polars no longer reduces it to an empty field, so we list it
+    explicitly in `null_values` to map it to NULL (Patch #6).
     """
     return pl.read_csv(
         io.BytesIO(raw),
         separator=delim,
         has_header=True,
         infer_schema_length=10000,
-        null_values=["", "NULL", "null"],
+        null_values=["", "NULL", "null", '""'],
         try_parse_dates=False,
         truncate_ragged_lines=True,
         ignore_errors=False,
@@ -429,7 +461,7 @@ def _attempt_polars_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, in
         separator=delim,
         has_header=True,
         infer_schema_length=10000,
-        null_values=["", "NULL", "null"],
+        null_values=["", "NULL", "null", '""'],
         try_parse_dates=False,
         truncate_ragged_lines=True,
         ignore_errors=True,
@@ -459,7 +491,8 @@ def _attempt_pandas_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, in
         encoding_errors="replace",
         dtype=str,  # read everything as string; polars/_cast_known_columns handles types
         keep_default_na=False,
-        na_values=["", "NULL", "null"],
+        # `'""'` is Target's NULL placeholder; mirror _attempt_strict (Patch #6).
+        na_values=["", "NULL", "null", '""'],
     )
     total_lines = sum(1 for ln in raw.splitlines() if ln.strip())
     expected_rows = max(0, total_lines - 1)

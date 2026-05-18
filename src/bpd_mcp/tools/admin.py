@@ -28,7 +28,7 @@ from ..schemas import (
     HealthCheckResult,
     ToolResponse,
 )
-from ..warehouse import Warehouse
+from ..warehouse import Warehouse, quote_ident
 
 
 async def auth_status(
@@ -548,6 +548,56 @@ async def _datasets_have_data(warehouse: Warehouse, **_: Any) -> HealthCheckResu
 
 
 @_timed
+async def _warehouse_no_duplicate_rows(
+    warehouse: Warehouse, **_: Any
+) -> HealthCheckResult:
+    """Detect literal-row duplicates across data tables.
+
+    A healthy warehouse has zero rows where every column value is bitwise
+    identical to another row. Our `upsert_dataframe` is delete-then-insert
+    keyed on the dataset's primary_key, so re-loading a file should always
+    leave row counts unchanged. If this check warns, the data has either:
+    (a) been loaded by a path that bypassed upsert, (b) been duplicated by
+    a `bpd_refresh_dataset(full=False)` against a table whose primary_key
+    columns don't actually appear in the df (the warehouse logs
+    `primary_key_missing_in_df` in that case), or (c) been corrupted by an
+    external write. A full refresh (`bpd_refresh_dataset(<ds>, full=True)`)
+    is the standard remediation.
+    """
+    info = warehouse.describe()["tables"]
+    dup_tables: list[tuple[str, int, int]] = []
+    for pat in PATTERNS:
+        ds = pat.dataset
+        if ds not in info or info[ds]["row_count"] == 0:
+            continue
+        tbl = quote_ident(ds)
+        _, r = warehouse.execute_sql(
+            f"SELECT COUNT(*), "
+            f"(SELECT COUNT(*) FROM (SELECT DISTINCT * FROM {tbl})) "
+            f"FROM {tbl}"
+        )
+        total, distinct_count = r[0]
+        if total > distinct_count:
+            dup_tables.append((ds, total, total - distinct_count))
+    if not dup_tables:
+        return HealthCheckResult(
+            name="warehouse_no_duplicate_rows",
+            status="pass",
+            detail="no full-row duplicates across data tables",
+        )
+    parts = [f"{ds}: {dup} of {total}" for ds, total, dup in dup_tables]
+    return HealthCheckResult(
+        name="warehouse_no_duplicate_rows",
+        status="warn",
+        detail=(
+            "literal-row duplicates detected — "
+            + "; ".join(parts)
+            + " (remediation: bpd_refresh_dataset(<dataset>, full=True))"
+        ),
+    )
+
+
+@_timed
 async def _disk_usage(settings: Settings, **_: Any) -> HealthCheckResult:
     if not settings.data_dir.exists():
         return HealthCheckResult(
@@ -692,6 +742,7 @@ async def health_check(
     checks.append(await _sync_ledger_consistent(**common))
     checks.append(await _sync_no_orphan_raw_files(**common))
     checks.append(await _datasets_have_data(**common))
+    checks.append(await _warehouse_no_duplicate_rows(**common))
     checks.append(await _disk_usage(**common))
     checks.append(await _token_expiry_window(**common))
     checks.append(await _config_validity(**common))
