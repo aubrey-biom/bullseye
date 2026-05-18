@@ -33,7 +33,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "gross_sales_amt",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "store_id", "store_nbr", "loc_id"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr", "loc_id"],
     },
     "sales_weekly": {
         "date": [
@@ -54,7 +54,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "gross_sales_amt",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "store_id", "store_nbr", "loc_id"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr", "loc_id"],
     },
     "sales_weekly_item": {
         "date": [
@@ -87,7 +87,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "qty_on_hand",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "store_id", "store_nbr", "loc_id"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr", "loc_id"],
     },
     "inventory_weekly": {
         "date": [
@@ -105,7 +105,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "on_hand",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "store_id", "store_nbr", "loc_id"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr", "loc_id"],
     },
     "inventory_weekly_item": {
         "date": [
@@ -139,7 +139,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "gross_margin_amt",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "store_id", "store_nbr"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr"],
     },
     "gross_margin_item": {
         "date": [
@@ -179,7 +179,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "report_date_dim",
             "as_of_date",
         ],
-        "location": ["location_id", "store_id", "store_nbr", "loc_id"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr", "loc_id"],
     },
     # ---------- orders / PO plan / forecast ----------
     "orders_daily": {
@@ -223,7 +223,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "po_status",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "store_id", "store_nbr"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr"],
     },
     "po_plan_daily": {
         "date": [
@@ -294,7 +294,7 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "snapshot_d",
         ],
         "tcin": ["tcin", "item_id"],
-        "location": ["location_id", "store_id", "store_nbr"],
+        "location": ["location_id", "location_number", "store_id", "store_nbr"],
     },
 }
 

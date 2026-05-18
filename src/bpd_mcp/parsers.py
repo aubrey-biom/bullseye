@@ -97,7 +97,13 @@ def _bare(body: str) -> re.Pattern[str]:
 
 
 # Common location-id candidate columns Target's data uses, in priority order.
-_LOC_COLS = ("location_id", "store_id", "loc_id", "store_nbr", "location_nbr")
+# `location_number` was added in Patch #6.2.1 — it's the real column name in
+# `location_attr` and possibly other dimension-style files. `location_id` stays
+# first because every fact table (sales_*, inventory_*, etc.) ships that name.
+_LOC_COLS = (
+    "location_id", "location_number", "store_id", "loc_id",
+    "store_nbr", "location_nbr",
+)
 
 
 def _pk_with_loc(*date_cols: str) -> tuple[tuple[str, ...], ...]:
@@ -161,10 +167,9 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"DAILY_INV_TCIN_LOC"),
         granularity="item × location × day",
         frequency="daily",
-        primary_key_candidates=(
-            *_pk_with_loc("snapshot_date"),
-            *_pk_with_loc("inv_date"),
-            *_pk_with_loc("inventory_date"),
+        primary_key_candidates=_pk_with_loc(
+            "report_date_dim", "inventory_date", "snapshot_date",
+            "inv_date", "as_of_date",
         ),
     ),
     FilePattern(
@@ -244,7 +249,11 @@ PATTERNS: tuple[FilePattern, ...] = (
         granularity="item × location × day",
         frequency="daily",
         primary_key_candidates=(
-            # Most likely (per brief): order is keyed by PO + line.
+            # Real Target column names (Patch #6.2.1 — confirmed against
+            # production files).
+            ("purchase_order_id", "tcin", "location_id"),
+            ("purchase_order_number", "tcin", "location_id"),
+            # Legacy guesses kept as fallbacks for older fixture shapes.
             ("po_number", "tcin", "location_id"),
             ("po_nbr", "tcin", "location_id"),
             ("po_id", "tcin", "location_id"),
