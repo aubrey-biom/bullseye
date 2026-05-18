@@ -122,6 +122,70 @@ def test_sales_weekly_idempotent_with_multi_channel_rows_per_pk(tmp_path: Path) 
         wh.close()
 
 
+def test_sales_weekly_two_different_files_with_overlapping_rows_dedupe(
+    tmp_path: Path,
+) -> None:
+    """Patch #6.1 forensic guard. Address the post-merge audit question: if two
+    DIFFERENT files (different file_ids, potentially different metric values)
+    cover the same (tcin, location_id, week_end_date) tuples, the second load
+    must REPLACE the first's rows — not append. This is the scenario that a
+    file_id-keyed upsert would silently fail (each file gets its own row set,
+    no deletion across files); a natural-key-keyed upsert handles it correctly.
+
+    `test_sales_weekly_idempotent_with_multi_channel_rows_per_pk` only proves
+    same-df-twice. This proves two-different-dfs-with-overlap.
+    """
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    pk = ("tcin", "location_id", "week_end_date")
+    df_a = pl.DataFrame(
+        {
+            "tcin": [100, 100, 200],
+            "location_id": [1234, 1234, 1234],
+            "week_end_date": [date(2026, 5, 9), date(2026, 5, 9), date(2026, 5, 9)],
+            "reporting_channel": ["store", "online", "store"],
+            "units_sold": [10, 3, 5],
+            "sales_dollars": [100.0, 30.0, 50.0],
+        }
+    )
+    # df_b: SAME (tcin, location_id, week_end_date) tuples but updated metric values
+    # — exactly what a Kiteworks-repackaged file looks like.
+    df_b = pl.DataFrame(
+        {
+            "tcin": [100, 100, 200],
+            "location_id": [1234, 1234, 1234],
+            "week_end_date": [date(2026, 5, 9), date(2026, 5, 9), date(2026, 5, 9)],
+            "reporting_channel": ["store", "online", "store"],
+            "units_sold": [11, 4, 6],  # updated values
+            "sales_dollars": [110.0, 40.0, 60.0],
+        }
+    )
+    cols = derive_duckdb_schema(df_a)
+    try:
+        wh.register_schema("sales_weekly", cols, pk)
+        wh.ensure_data_table("sales_weekly", cols)
+        wh.upsert_dataframe("sales_weekly", df_a, primary_key=pk)
+        wh.upsert_dataframe("sales_weekly", df_b, primary_key=pk)
+
+        # Three rows total (df_a's are deleted before df_b's INSERT) — not six.
+        _, total = wh.execute_sql("SELECT COUNT(*) FROM sales_weekly")
+        assert total[0][0] == 3, (
+            "natural-key upsert must replace overlapping rows across files; "
+            "got duplication implying file_id-keyed semantics"
+        )
+        # Verify df_b's updated values won — not df_a's.
+        _, dollars = wh.execute_sql("SELECT SUM(sales_dollars) FROM sales_weekly")
+        assert dollars[0][0] == 210.0  # 110 + 40 + 60, NOT 180 (df_a)
+
+        # And no literal-row dups.
+        _, dup_check = wh.execute_sql(
+            "SELECT COUNT(*) - (SELECT COUNT(*) FROM (SELECT DISTINCT * FROM sales_weekly)) "
+            "FROM sales_weekly"
+        )
+        assert dup_check[0][0] == 0
+    finally:
+        wh.close()
+
+
 def test_upsert_into_existing_bool_column_with_nulls(tmp_path: Path) -> None:
     """Patch #6 integration regression. Once parsers map `""` to NULL, the df
     arrives at the warehouse as Boolean with None for missing rows. DuckDB must
