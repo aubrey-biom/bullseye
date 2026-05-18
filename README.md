@@ -163,6 +163,23 @@ cutoff. When omitted, the default is "the day before each forecast week begins"
 revised one. The tool picks the latest `last_update_d` ≤ cutoff per
 `(tcin, location, week)`.
 
+### Adding a new dataset to the catalog (Patch #6.2)
+
+When you add a `FilePattern` entry to `parsers.PATTERNS`, the
+`primary_key_candidates` **must** include the real Target column names —
+check `column_roles.py` for that dataset's `date` and `location` priority
+lists, and put the first entry of each list first in the PK candidate. The
+`_pk_with_loc(*date_cols)` / `_pk_item(*date_cols)` helpers accept multiple
+date-column candidates so the catalog can list both the real name and any
+historical aliases.
+
+`Warehouse.upsert_dataframe` raises `primary_key_missing_in_df` on the first
+load if the catalog's PK columns don't appear in the parsed df. Silent
+DELETE-skip + duplicate INSERT was the failure mode that produced the
+sales_weekly 2.0× regression — the loud failure is intentional, so the next
+person adding a dataset hits the error immediately instead of accumulating
+duplicates on every re-load.
+
 ---
 
 ## Target schema quirks
