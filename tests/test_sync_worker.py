@@ -288,7 +288,11 @@ async def test_sync_is_idempotent(tmp_path: Path) -> None:
             ],
         )
     )
-    body = "TCIN|WEEK_END_DATE|GROSS_MARGIN\n1|2026-04-25|0.30\n2|2026-04-25|0.40\n"
+    body = (
+        "TCIN|LOCATION ID|WEEK_END_DATE|GROSS_MARGIN\n"
+        "1|1234|2026-04-25|0.30\n"
+        "2|1234|2026-04-25|0.40\n"
+    )
     zb = _zip_bytes("x.txt", body)
     respx.get(f"https://securesharek.target.com/rest/files/{file_id}/content").mock(
         return_value=httpx.Response(200, content=zb)

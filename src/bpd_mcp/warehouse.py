@@ -237,20 +237,26 @@ class Warehouse:
                         select_exprs.append(f"NULL AS {quote_ident(col)}")
                 select_sql = ", ".join(select_exprs)
 
-                # Delete matching PKs first (idempotent re-load).
-                if all(c in df.columns for c in primary_key):
-                    pk_cols_sql = ", ".join(quote_ident(c) for c in primary_key)
-                    self._conn.execute(
-                        f"DELETE FROM {tbl} WHERE ({pk_cols_sql}) IN "
-                        f"(SELECT {pk_cols_sql} FROM incoming_df)"
+                # Delete matching PKs first (idempotent re-load). Missing PK
+                # columns is a hard error: silently skipping the DELETE would
+                # leave INSERT to run unconditionally, which causes silent
+                # duplication on every subsequent load (Patch #6.2 — this used
+                # to log a warning, which masked the sales_weekly 2.0× bug).
+                missing = [c for c in primary_key if c not in df.columns]
+                if missing:
+                    raise RuntimeError(
+                        f"primary_key_missing_in_df: dataset={dataset!r} "
+                        f"primary_key={primary_key} df_columns={df.columns} "
+                        f"missing={missing} — refusing to upsert because the "
+                        f"DELETE step cannot run; this would duplicate rows. "
+                        f"Fix: add a matching candidate to parsers.PATTERNS "
+                        f"primary_key_candidates for this dataset."
                     )
-                else:
-                    logger.warning(
-                        "primary_key_missing_in_df",
-                        dataset=dataset,
-                        primary_key=primary_key,
-                        df_columns=df.columns,
-                    )
+                pk_cols_sql = ", ".join(quote_ident(c) for c in primary_key)
+                self._conn.execute(
+                    f"DELETE FROM {tbl} WHERE ({pk_cols_sql}) IN "
+                    f"(SELECT {pk_cols_sql} FROM incoming_df)"
+                )
 
                 # Insert.
                 self._conn.execute(

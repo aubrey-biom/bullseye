@@ -100,12 +100,21 @@ def _bare(body: str) -> re.Pattern[str]:
 _LOC_COLS = ("location_id", "store_id", "loc_id", "store_nbr", "location_nbr")
 
 
-def _pk_with_loc(date_col: str) -> tuple[tuple[str, ...], ...]:
-    return tuple(("tcin", lc, date_col) for lc in _LOC_COLS)
+def _pk_with_loc(*date_cols: str) -> tuple[tuple[str, ...], ...]:
+    """PK candidates as a cartesian product: TCIN × LOC_COLS × date_cols.
+
+    `date_cols` are tried in the order given — `_pick_primary_key` picks the
+    first candidate whose columns all exist in the df. List the real Target
+    column name first; aliases are fallbacks for older fixture shapes (Patch
+    #6.2: prevents silent DELETE-skip when Target ships `sales_date` but the
+    catalog only knew about `week_end_date`).
+    """
+    return tuple(("tcin", lc, dc) for dc in date_cols for lc in _LOC_COLS)
 
 
-def _pk_item(date_col: str) -> tuple[tuple[str, ...], ...]:
-    return (("tcin", date_col),)
+def _pk_item(*date_cols: str) -> tuple[tuple[str, ...], ...]:
+    """Item-only PK candidates: TCIN × date_cols (no location dimension)."""
+    return tuple(("tcin", dc) for dc in date_cols)
 
 
 # --- Pattern catalog ------------------------------------------------------------------
@@ -121,21 +130,29 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"DAILY_SALES_TCIN_LOC"),
         granularity="item × location × day",
         frequency="daily",
-        primary_key_candidates=_pk_with_loc("sale_date"),
+        primary_key_candidates=_pk_with_loc(
+            "sales_date", "sale_date", "transaction_date"
+        ),
     ),
     FilePattern(
         dataset="sales_weekly",
         regex=_pat(r"WEEKLY_SALES_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc("week_end_date"),
+        primary_key_candidates=_pk_with_loc(
+            "sales_date", "week_end_date", "fiscal_week_end_d",
+            "fiscal_week_end_date", "sale_date",
+        ),
     ),
     FilePattern(
         dataset="sales_weekly_item",
         regex=_pat(r"WEEKLY_SALES_TCIN"),
         granularity="item × week (rolled up across locations)",
         frequency="weekly",
-        primary_key_candidates=_pk_item("week_end_date"),
+        primary_key_candidates=_pk_item(
+            "sales_date", "week_end_date", "fiscal_week_end_d",
+            "fiscal_week_end_date", "sale_date",
+        ),
     ),
 
     # ---------- inventory (item × location × day | week) ----------
@@ -155,14 +172,20 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"WEEKLY_INV_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc("week_end_date"),
+        primary_key_candidates=_pk_with_loc(
+            "report_date_dim", "week_end_date", "fiscal_week_end_d",
+            "inventory_date", "snapshot_date",
+        ),
     ),
     FilePattern(
         dataset="inventory_weekly_item",
         regex=_pat(r"WEEKLY_INV_TCIN"),
         granularity="item × week (rolled up across locations)",
         frequency="weekly",
-        primary_key_candidates=_pk_item("week_end_date"),
+        primary_key_candidates=_pk_item(
+            "report_date_dim", "week_end_date", "fiscal_week_end_d",
+            "inventory_date",
+        ),
     ),
 
     # ---------- gross margin ----------
@@ -276,7 +299,11 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"DFE_WKLY_ITEM_LOC_FORECAST"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc("week_end_date"),
+        primary_key_candidates=_pk_with_loc(
+            "fiscal_week_begin_d", "fiscal_week_begin_date",
+            "fiscal_week_end_d", "fiscal_week_end_date",
+            "week_start_date", "week_end_date", "forecast_week",
+        ),
     ),
 )
 

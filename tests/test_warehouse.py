@@ -211,6 +211,32 @@ def test_upsert_into_existing_bool_column_with_nulls(tmp_path: Path) -> None:
         wh.close()
 
 
+def test_upsert_raises_on_missing_primary_key_columns(tmp_path: Path) -> None:
+    """Patch #6.2 hard-fail contract. If any PK column is missing from the df,
+    upsert MUST raise instead of silently skipping DELETE and running INSERT
+    unconditionally. The old warn-and-skip behavior masked the sales_weekly
+    2.0× duplication bug.
+    """
+    import pytest
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        cols = {"tcin": "BIGINT", "location_id": "BIGINT", "units_sold": "BIGINT"}
+        wh.ensure_data_table("sales_daily", cols)
+        df = pl.DataFrame({"tcin": [1, 2], "units_sold": [10, 20]})  # NO location_id
+        with pytest.raises(RuntimeError, match="primary_key_missing_in_df"):
+            wh.upsert_dataframe(
+                "sales_daily",
+                df,
+                primary_key=("tcin", "location_id", "sales_date"),
+            )
+        # Table is untouched.
+        _, total = wh.execute_sql("SELECT COUNT(*) FROM sales_daily")
+        assert total[0][0] == 0
+    finally:
+        wh.close()
+
+
 def test_schema_drift_detected(tmp_path: Path) -> None:
     wh = Warehouse(tmp_path / "bpd.duckdb")
     try:
