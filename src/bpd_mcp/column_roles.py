@@ -125,9 +125,11 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
     },
     # ---------- gross margin ----------
     "gross_margin": {
+        # `fiscal_week_end_d` is the real Target column (Patch #7). `week_end_date`
+        # remains as a legacy alias.
         "date": [
-            "week_end_date",
             "fiscal_week_end_d",
+            "week_end_date",
             "fiscal_week_end_date",
             "report_date_dim",
         ],
@@ -141,16 +143,30 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         ],
         "tcin": ["tcin", "item_id"],
         "location": ["location_id", "location_number", "store_id", "store_nbr"],
+        # Origination-side location is distinct from `location` (the fulfillment
+        # location). For in-store purchases they match; for online orders fulfilled
+        # by a different store, they differ. Patch #7 — part of the natural PK.
+        "location_originated": ["location_id_originated"],
+        # Channel + fulfillment dimensions also part of the natural PK.
+        "channel_originated": ["channel_originated"],
+        "channel_fulfilled": ["channel_fulfilled"],
+        "fulfillment_type": ["fulfillment_type"],
+        "fulfillment_subtype": ["fulfillment_subtype"],
     },
     "gross_margin_item": {
         "date": [
-            "week_end_date",
             "fiscal_week_end_d",
+            "week_end_date",
             "fiscal_week_end_date",
             "report_date_dim",
         ],
         "margin": ["gross_margin", "gm", "gross_margin_pct", "margin_pct"],
         "tcin": ["tcin", "item_id"],
+        # Same channel/fulfillment dimensions as gross_margin (Patch #7).
+        "channel_originated": ["channel_originated"],
+        "channel_fulfilled": ["channel_fulfilled"],
+        "fulfillment_type": ["fulfillment_type"],
+        "fulfillment_subtype": ["fulfillment_subtype"],
     },
     # ---------- item / location attrs ----------
     "item_attr": {
@@ -233,13 +249,21 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         ],
     },
     "po_plan_daily": {
+        # `business_d` is the as-of date Target ships (Patch #7). The other
+        # entries are legacy aliases for fixture/historical compatibility.
         "date": [
+            "business_d",
             "plan_date",
             "expected_date",
             "po_date",
             "fiscal_week_begin_d",
             "report_date_dim",
         ],
+        # `order_d` is the day each planned PO is targeted at — distinct from
+        # `business_d` (the as-of snapshot). Both are part of the natural PK.
+        "order_date": ["order_d", "order_date"],
+        # Same orders-specific destination-location concept as orders_daily.
+        "receiving_location": ["receiving_location_id"],
         "units": [
             "planned_units",
             "planned_qty",

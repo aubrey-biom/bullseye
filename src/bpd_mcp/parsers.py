@@ -202,14 +202,40 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"WEEKLY_GM_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc("week_end_date"),
+        # Patch #7: natural key includes origination location and channel/
+        # fulfillment dimensions. Verified empirically: 8-col tuple yields
+        # COUNT(DISTINCT) == COUNT(*) on the live warehouse (197,013 = 197,013).
+        # A narrower 7-col key (without `location_id_originated`) would have
+        # caused silent data loss of 3,831 rows.
+        primary_key_candidates=(
+            (
+                "tcin", "location_id", "location_id_originated",
+                "fiscal_week_end_d",
+                "channel_originated", "channel_fulfilled",
+                "fulfillment_type", "fulfillment_subtype",
+            ),
+            # Legacy fallback for older fixture shapes that lack the wider
+            # channel/fulfillment columns.
+            *_pk_with_loc("fiscal_week_end_d"),
+            *_pk_with_loc("week_end_date"),
+        ),
     ),
     FilePattern(
         dataset="gross_margin_item",
         regex=_pat(r"WEEKLY_GM_TCIN"),
         granularity="item × week (rolled up across locations)",
         frequency="weekly",
-        primary_key_candidates=_pk_item("week_end_date"),
+        # Patch #7: 6-col natural key, verified empirically (617 = 617).
+        primary_key_candidates=(
+            (
+                "tcin", "fiscal_week_end_d",
+                "channel_originated", "channel_fulfilled",
+                "fulfillment_type", "fulfillment_subtype",
+            ),
+            # Legacy fallback for narrower fixture shapes.
+            *_pk_item("fiscal_week_end_d"),
+            *_pk_item("week_end_date"),
+        ),
     ),
 
     # ---------- item dimension ----------
@@ -278,9 +304,16 @@ PATTERNS: tuple[FilePattern, ...] = (
     FilePattern(
         dataset="po_plan_daily",
         regex=_pat(r"DLY_PO_PLAN_TCIN"),
-        granularity="item × day",
+        granularity="item × business-day × order-day × receiving-location",
         frequency="daily",
+        # Patch #7: 4-col natural key, verified empirically (869,580 = 869,580).
+        # The pre-#7 PK (tcin, plan_date) was three columns short and the
+        # plan_date column doesn't exist in real Target files — both bugs
+        # made the upsert raise primary_key_missing_in_df.
         primary_key_candidates=(
+            ("tcin", "business_d", "order_d", "receiving_location_id"),
+            # Legacy fallbacks for older fixture shapes.
+            ("tcin", "business_d", "order_d"),
             ("tcin", "plan_date"),
             ("tcin", "po_date"),
             ("tcin", "expected_date"),

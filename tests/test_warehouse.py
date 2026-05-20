@@ -437,3 +437,175 @@ def test_detect_date_column_returns_none_when_absent(tmp_path: Path) -> None:
         assert wh.detect_date_column("foo") is None
     finally:
         wh.close()
+
+
+# ---------- Patch #7: natural-key idempotency for po_plan_daily / gross_margin / gross_margin_item ----------
+
+
+def test_po_plan_daily_natural_key_idempotency(tmp_path: Path) -> None:
+    """Patch #7. Natural PK is (tcin, business_d, order_d, receiving_location_id).
+    Verified empirically against the live warehouse: COUNT(*) == COUNT(DISTINCT NK)
+    == 869,580. This test locks in the contract with a 4-row fixture covering
+    multiple business_d × order_d × receiving_location_id combinations for the
+    same tcin, plus a re-load + cross-file overlap check.
+    """
+    from datetime import date as _date
+
+    pk = ("tcin", "business_d", "order_d", "receiving_location_id")
+    df_a = pl.DataFrame(
+        {
+            "tcin": [100, 100, 100, 200],
+            "business_d": [
+                _date(2026, 5, 19), _date(2026, 5, 19),
+                _date(2026, 5, 20), _date(2026, 5, 19),
+            ],
+            "order_d": [
+                _date(2026, 5, 25), _date(2026, 5, 25),
+                _date(2026, 5, 25), _date(2026, 5, 26),
+            ],
+            # Same tcin/business_d/order_d but different receiving locations
+            # must NOT collapse (key includes location).
+            "receiving_location_id": [1234, 5678, 1234, 1234],
+            "planned_units": [50, 30, 40, 20],
+        }
+    )
+    cols = derive_duckdb_schema(df_a)
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.ensure_data_table("po_plan_daily", cols)
+        wh.upsert_dataframe("po_plan_daily", df_a, primary_key=pk)
+        # COUNT(*) == COUNT(DISTINCT NK) — the contract.
+        _, ck = wh.execute_sql(
+            "SELECT COUNT(*), COUNT(DISTINCT (tcin, business_d, order_d, "
+            "receiving_location_id)) FROM po_plan_daily"
+        )
+        assert ck[0][0] == ck[0][1] == 4
+
+        # Re-load with updated metric values for two of the NKs — count stays at 4.
+        df_b = df_a.with_columns(
+            (pl.col("planned_units") + 5).alias("planned_units")
+        )
+        wh.upsert_dataframe("po_plan_daily", df_b, primary_key=pk)
+        _, ck2 = wh.execute_sql(
+            "SELECT COUNT(*), SUM(planned_units) FROM po_plan_daily"
+        )
+        assert ck2[0][0] == 4
+        # df_b's updated values won: (50+5)+(30+5)+(40+5)+(20+5) = 160.
+        assert ck2[0][1] == 160
+    finally:
+        wh.close()
+
+
+def test_gross_margin_natural_key_idempotency(tmp_path: Path) -> None:
+    """Patch #7. Natural PK is 8 cols:
+    (tcin, location_id, location_id_originated, fiscal_week_end_d,
+     channel_originated, channel_fulfilled, fulfillment_type, fulfillment_subtype).
+    Verified empirically: 197,013 = 197,013. Critically, dropping
+    `location_id_originated` (the 7-col version) would silently lose 3,831 rows.
+    """
+    from datetime import date as _date
+
+    pk = (
+        "tcin", "location_id", "location_id_originated", "fiscal_week_end_d",
+        "channel_originated", "channel_fulfilled",
+        "fulfillment_type", "fulfillment_subtype",
+    )
+    # Same (tcin, location_id, fiscal_week_end_d) tuple split across
+    # channel/fulfillment combos AND across two origination locations —
+    # the row that distinguishes location_id != location_id_originated is the
+    # regression case for the 3,831-row data-loss scenario the user flagged.
+    df = pl.DataFrame(
+        {
+            "tcin": [100, 100, 100, 100, 100],
+            "location_id": [1234, 1234, 1234, 1234, 1234],
+            "location_id_originated": [1234, 1234, 1234, 1234, 5678],
+            "fiscal_week_end_d": [_date(2026, 5, 16)] * 5,
+            "channel_originated": ["store", "store", "online", "online", "online"],
+            "channel_fulfilled": ["store", "store", "online", "store", "store"],
+            "fulfillment_type": ["pickup", "ship", "ship", "pickup", "pickup"],
+            "fulfillment_subtype": ["std", "std", "exp", "std", "std"],
+            "gross_margin": [0.30, 0.31, 0.28, 0.29, 0.27],
+        }
+    )
+    cols = derive_duckdb_schema(df)
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.ensure_data_table("gross_margin", cols)
+        wh.upsert_dataframe("gross_margin", df, primary_key=pk)
+        # Contract: every row is uniquely identified by the 8-col NK.
+        _, ck = wh.execute_sql(
+            "SELECT COUNT(*), COUNT(DISTINCT (tcin, location_id, "
+            "location_id_originated, fiscal_week_end_d, channel_originated, "
+            "channel_fulfilled, fulfillment_type, fulfillment_subtype)) "
+            "FROM gross_margin"
+        )
+        assert ck[0][0] == ck[0][1] == 5
+
+        # Counter-test: a 7-col key (DROPPING location_id_originated) would
+        # collapse 5 rows into 4 — that's the 3,831-row data-loss scenario.
+        _, narrow = wh.execute_sql(
+            "SELECT COUNT(DISTINCT (tcin, location_id, fiscal_week_end_d, "
+            "channel_originated, channel_fulfilled, fulfillment_type, "
+            "fulfillment_subtype)) FROM gross_margin"
+        )
+        assert narrow[0][0] == 4, (
+            "fixture must demonstrate that the 7-col key is too narrow; "
+            "the row with location_id_originated=5678 collapses into the "
+            "1234-origin row, hiding 1 row of data"
+        )
+
+        # Re-load idempotency — count unchanged.
+        wh.upsert_dataframe("gross_margin", df, primary_key=pk)
+        _, ck2 = wh.execute_sql("SELECT COUNT(*) FROM gross_margin")
+        assert ck2[0][0] == 5
+    finally:
+        wh.close()
+
+
+def test_gross_margin_item_natural_key_idempotency(tmp_path: Path) -> None:
+    """Patch #7. Natural PK is 6 cols (no location dimensions — this is the
+    item rollup). Verified empirically: 617 = 617.
+    """
+    from datetime import date as _date
+
+    pk = (
+        "tcin", "fiscal_week_end_d",
+        "channel_originated", "channel_fulfilled",
+        "fulfillment_type", "fulfillment_subtype",
+    )
+    df = pl.DataFrame(
+        {
+            "tcin": [100, 100, 100, 100],
+            "fiscal_week_end_d": [_date(2026, 5, 16)] * 4,
+            "channel_originated": ["store", "store", "online", "online"],
+            "channel_fulfilled": ["store", "store", "online", "store"],
+            "fulfillment_type": ["pickup", "ship", "ship", "pickup"],
+            "fulfillment_subtype": ["std", "std", "exp", "std"],
+            "gross_margin": [0.30, 0.31, 0.28, 0.29],
+        }
+    )
+    cols = derive_duckdb_schema(df)
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.ensure_data_table("gross_margin_item", cols)
+        wh.upsert_dataframe("gross_margin_item", df, primary_key=pk)
+        _, ck = wh.execute_sql(
+            "SELECT COUNT(*), COUNT(DISTINCT (tcin, fiscal_week_end_d, "
+            "channel_originated, channel_fulfilled, fulfillment_type, "
+            "fulfillment_subtype)) FROM gross_margin_item"
+        )
+        assert ck[0][0] == ck[0][1] == 4
+
+        # Counter-test: 2-col (tcin, fiscal_week_end_d) would collapse to 1
+        # row — the pre-#7 broken state.
+        _, narrow = wh.execute_sql(
+            "SELECT COUNT(DISTINCT (tcin, fiscal_week_end_d)) "
+            "FROM gross_margin_item"
+        )
+        assert narrow[0][0] == 1
+
+        wh.upsert_dataframe("gross_margin_item", df, primary_key=pk)
+        _, ck2 = wh.execute_sql("SELECT COUNT(*) FROM gross_margin_item")
+        assert ck2[0][0] == 4
+    finally:
+        wh.close()
