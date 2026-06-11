@@ -394,6 +394,25 @@ token perms, tool count) without touching the network. `bpd_health_check` runs o
 the MCP is back up and adds the cross-cutting checks (auth, RO enforcement, sync
 ledger invariants, orphan files, etc.).
 
+## Source-of-truth tie-out (KMG POS report)
+
+`scripts/validate_kmg.py` validates the warehouse against the vendor's weekly
+KMG POS report — the external source of truth. It embeds the expected numbers
+from the JunW1'26 report (week ending 2026-06-06) and checks:
+
+1. Weekly unit + dollar totals for 12 fiscal weeks (w/e 3/21 → 6/6)
+2. Per-TCIN units and dollars for w/e 6/6 (25 SKUs)
+3. Channel-originated dollar split (store vs online+flex)
+4. Per-TCIN on-hand inventory at w/e 6/6
+
+```bash
+uv run python scripts/validate_kmg.py          # default: ~/.bpd-mcp/bpd.duckdb
+```
+
+Read-only; exit 0 = tie-out clean. Missing weeks (pre-subscription) SKIP
+rather than FAIL. When a newer KMG report arrives, update the EXPECTED_*
+tables at the top of the script — extraction provenance is documented inline.
+
 ---
 
 ## Evaluation suite
