@@ -180,9 +180,12 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"WEEKLY_INV_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
+        # Patch #7.1: real Target column is `business_d` (same fix as #6.2.2
+        # for inventory_daily, missed for the weekly sibling). Older aliases
+        # kept as fallbacks for fixtures + historical files.
         primary_key_candidates=_pk_with_loc(
-            "report_date_dim", "week_end_date", "fiscal_week_end_d",
-            "inventory_date", "snapshot_date",
+            "business_d", "report_date_dim", "week_end_date",
+            "fiscal_week_end_d", "inventory_date", "snapshot_date",
         ),
     ),
     FilePattern(
@@ -190,9 +193,10 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"WEEKLY_INV_TCIN"),
         granularity="item × week (rolled up across locations)",
         frequency="weekly",
+        # Patch #7.1: same `business_d` fix as the locational sibling.
         primary_key_candidates=_pk_item(
-            "report_date_dim", "week_end_date", "fiscal_week_end_d",
-            "inventory_date",
+            "business_d", "report_date_dim", "week_end_date",
+            "fiscal_week_end_d", "inventory_date",
         ),
     ),
 
@@ -326,15 +330,22 @@ PATTERNS: tuple[FilePattern, ...] = (
         # adds when the planning grain is distribution center rather than store —
         # the trailing `(?:_[A-Z_]+)?` accepts any extra uppercase/underscore token.
         regex=_pat(r"BI_WEEKLY_PO_PLANNING(?:_[A-Z_]+)?"),
-        granularity="item × bi-weekly period (DC- or store-grain)",
+        granularity="item × business-day × order-day × receiving-location",
         frequency="bi-weekly",
+        # Patch #7.1: real Target shape mirrors po_plan_daily exactly —
+        # `(tcin, business_d, order_d, receiving_location_id)` is the natural
+        # key (the file's column list is a strict superset of po_plan_daily's,
+        # plus four cost/inventory metric columns). The bi-weekly cadence is
+        # a filename-level distinction, not a row-grain one.
         primary_key_candidates=(
-            # If a DC dimension is present, key on it.
+            ("tcin", "business_d", "order_d", "receiving_location_id"),
+            # Tighter fallback if receiving_location_id is absent.
+            ("tcin", "business_d", "order_d"),
+            # Legacy DC/period-keyed candidates kept for older fixture shapes.
             ("tcin", "dc_id", "period_start_date"),
             ("tcin", "dc_number", "period_start_date"),
             ("tcin", "dc_id", "period_end_date"),
             ("tcin", "dc_number", "period_end_date"),
-            # Otherwise fall back to item-period key.
             ("tcin", "period_start_date"),
             ("tcin", "period_end_date"),
             ("tcin", "week_end_date"),
