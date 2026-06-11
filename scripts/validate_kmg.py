@@ -114,8 +114,15 @@ DATE_CANDS = ["sales_date", "week_end_date", "fiscal_week_end_d", "sale_date"]
 UNIT_CANDS = ["sale_quantity", "units_sold", "units", "qty", "sales_units"]
 DOLLAR_CANDS = ["sale_amount", "sales_dollars", "sales_amt", "dollars", "revenue"]
 CHANNEL_CANDS = ["channel_originated", "origination_channel", "reporting_channel"]
-INV_DATE_CANDS = ["report_date_dim", "week_end_date", "fiscal_week_end_d", "business_d"]
-ONHAND_CANDS = ["on_hand_units", "on_hand_qty", "inventory_quantity", "inv_units", "on_hand"]
+# Real Target inventory_weekly date column is `business_d` (Patch #7.1 — was
+# already in column_roles for inventory_daily; sibling fix applied here too).
+INV_DATE_CANDS = ["business_d", "report_date_dim", "week_end_date", "fiscal_week_end_d"]
+# Real on-hand column is `ending_on_hand_q` (the `_q` suffix is "quantity",
+# `_a` is "amount/$"). Older aliases kept for fixtures that may not match.
+ONHAND_CANDS = [
+    "ending_on_hand_q", "beginning_on_hand_q",
+    "on_hand_units", "on_hand_qty", "inventory_quantity", "inv_units", "on_hand",
+]
 
 
 class Tally:

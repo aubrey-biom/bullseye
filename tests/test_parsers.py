@@ -862,3 +862,45 @@ def test_end_to_end_inventory_daily_real_shape_is_idempotent(tmp_path: Path) -> 
         assert total[0][0] == 3, "three idempotent re-loads must leave 3 rows"
     finally:
         wh.close()
+
+
+# ---------- Patch #7.1: inventory_weekly business_d + po_plan_biweekly real shape ----------
+
+
+def test_pk_resolution_inventory_weekly_business_d() -> None:
+    """Patch #7.1. Sibling to the inventory_daily fix from #6.2.2: real Target
+    column for inventory_weekly is also `business_d`, not `report_date_dim`.
+    Confirmed against production via the failing-load error message on the
+    w/e 5/30 and w/e 6/06 files.
+    """
+    from bpd_mcp.sync import _pick_primary_key
+
+    parsed = classify_filename("BV_139440_WEEKLY_INV_TCIN_LOC_06062026_KW.zip")
+    assert parsed is not None and parsed.pattern.dataset == "inventory_weekly"
+    # Real columns observed on 6/06 file (subset).
+    df_cols = ["tcin", "location_id", "business_d", "ending_on_hand_q"]
+    pk = _pick_primary_key(parsed, df_cols)
+    assert pk == ("tcin", "location_id", "business_d"), (
+        f"expected business_d-keyed PK, got {pk}"
+    )
+
+
+def test_pk_resolution_po_plan_biweekly_real_shape() -> None:
+    """Patch #7.1. Real po_plan_biweekly shape is identical to po_plan_daily's
+    natural key — (tcin, business_d, order_d, receiving_location_id) — not the
+    speculative (tcin, dc_id, period_start_date) the catalog had.
+    """
+    from bpd_mcp.sync import _pick_primary_key
+
+    parsed = classify_filename(
+        "BV_139440_BI_WEEKLY_PO_PLANNING_ITEM_DC_06102026_KW.zip"
+    )
+    assert parsed is not None and parsed.pattern.dataset == "po_plan_biweekly"
+    df_cols = [
+        "business_d", "vendor_id", "tcin", "order_d", "receiving_location_id",
+        "ordered_q", "total_order_cost_a",
+    ]
+    pk = _pick_primary_key(parsed, df_cols)
+    assert pk == ("tcin", "business_d", "order_d", "receiving_location_id"), (
+        f"expected po_plan_daily-mirror PK, got {pk}"
+    )

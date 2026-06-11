@@ -91,14 +91,22 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "location": ["location_id", "location_number", "store_id", "store_nbr", "loc_id"],
     },
     "inventory_weekly": {
+        # Patch #7.1: real Target column is `business_d` (sibling fix to the
+        # inventory_daily change in #6.2.2).
         "date": [
+            "business_d",
             "report_date_dim",
             "week_end_date",
             "fiscal_week_end_d",
             "inventory_date",
             "snapshot_date",
         ],
+        # Real Target on-hand columns are `beginning_on_hand_q` and
+        # `ending_on_hand_q` (the `_q` suffix is "quantity", `_a` is "amount/$").
+        # Older aliases kept for fixture compatibility.
         "on_hand": [
+            "ending_on_hand_q",
+            "beginning_on_hand_q",
             "on_hand_units",
             "on_hand_qty",
             "inventory_quantity",
@@ -109,13 +117,17 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "location": ["location_id", "location_number", "store_id", "store_nbr", "loc_id"],
     },
     "inventory_weekly_item": {
+        # Patch #7.1: same `business_d` fix as the locational sibling.
         "date": [
+            "business_d",
             "report_date_dim",
             "week_end_date",
             "fiscal_week_end_d",
             "inventory_date",
         ],
         "on_hand": [
+            "ending_on_hand_q",
+            "beginning_on_hand_q",
             "on_hand_units",
             "on_hand_qty",
             "inventory_quantity",
@@ -277,14 +289,22 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "tcin": ["tcin", "item_id"],
     },
     "po_plan_biweekly": {
+        # Patch #7.1: real Target shape is the same as po_plan_daily —
+        # `business_d` is the as-of date, `order_d` is per-row, and the
+        # natural-key location dimension is `receiving_location_id` (not
+        # `dc_id`). The legacy DC/period roles are kept for older fixtures.
         "date": [
+            "business_d",
             "period_start_date",
             "period_end_date",
             "fiscal_week_begin_d",
             "plan_date",
             "report_date_dim",
         ],
+        "order_date": ["order_d", "order_date"],
+        "receiving_location": ["receiving_location_id"],
         "units": [
+            "ordered_q",
             "planned_units",
             "planned_qty",
             "planned_quantity",
