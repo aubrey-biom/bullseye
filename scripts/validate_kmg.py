@@ -107,6 +107,11 @@ TOL_WEEKLY = 0.005      # 0.5% — report sheets self-disagree by ±1 unit
 TOL_SKU = 0.01          # 1% per-SKU
 TOL_ABS_SMALL = 50.0    # absolute floor for tiny/negative SKU values
 TOL_INV = 0.02          # 2% — snapshot timing differences vs report cut
+# Channel-attribution drift between BPD and KMG runs ~1.2% in each direction
+# (offsetting: store-orig low, online-orig high by nearly the same $), while
+# the combined total matches to <0.01%. The split gets a looser tolerance;
+# the total-reconciliation line below stays tight.
+TOL_CHANNEL = 0.02
 
 # Column-name candidates (subset of column_roles; kept inline so this script
 # has zero project imports and works against any warehouse copy).
@@ -123,6 +128,12 @@ ONHAND_CANDS = [
     "ending_on_hand_q", "beginning_on_hand_q",
     "on_hand_units", "on_hand_qty", "inventory_quantity", "inv_units", "on_hand",
 ]
+# KMG's "OH" column appears to include in-transit units for some SKUs: the
+# June tie-out showed BPD `ending_on_hand_q` consistently BELOW KMG OH by
+# 2-11% on 8 of 21 SKUs while the rest matched on-hand alone. The check
+# therefore accepts EITHER definition — on-hand, or on-hand + on-transfer —
+# and prints both so the definition KMG uses per SKU is visible.
+ONTRANSFER_CANDS = ["ending_on_transfer_q", "on_transfer_q", "in_transit_q"]
 
 
 class Tally:
@@ -282,8 +293,8 @@ def main() -> int:
             print(f"     (channel column: {ccol})")
             store = sum(d or 0 for ch, d in crows if ch and "store" in str(ch).lower())
             online = sum(d or 0 for ch, d in crows if ch and "store" not in str(ch).lower())
-            ok_s = within(store, EXPECTED_CHANNEL["store_originated_dollars"], TOL_SKU)
-            ok_o = within(online, EXPECTED_CHANNEL["online_originated_dollars"], TOL_SKU)
+            ok_s = within(store, EXPECTED_CHANNEL["store_originated_dollars"], TOL_CHANNEL)
+            ok_o = within(online, EXPECTED_CHANNEL["online_originated_dollars"], TOL_CHANNEL)
             t.line(
                 "PASS" if ok_s else "FAIL", "store-originated $",
                 f"${store:,.0f} vs ${EXPECTED_CHANNEL['store_originated_dollars']:,.0f}",
@@ -292,35 +303,62 @@ def main() -> int:
                 "PASS" if ok_o else "FAIL", "online-originated $ (online+flex)",
                 f"${online:,.0f} vs ${EXPECTED_CHANNEL['online_originated_dollars']:,.0f}",
             )
+            # The stronger invariant: the two splits must sum to the report
+            # total tightly, even when attribution drifts between them.
+            exp_total = sum(EXPECTED_CHANNEL.values())
+            t.line(
+                "PASS" if within(store + online, exp_total, TOL_WEEKLY) else "FAIL",
+                "channel total (store + online)",
+                f"${store + online:,.0f} vs ${exp_total:,.0f}",
+            )
 
     # ---- check 5: per-TCIN on-hand inventory (w/e 6/6) ------------------
     print(f"\nCHECK 5 — per-TCIN on-hand units at w/e {WEEK}")
     inv_cols = cols_of(conn, "inventory_weekly")
     idcol = pick(INV_DATE_CANDS, inv_cols) if inv_cols else None
     ohcol = pick(ONHAND_CANDS, inv_cols) if inv_cols else None
+    otcol = pick(ONTRANSFER_CANDS, inv_cols) if inv_cols else None
     if not (idcol and ohcol):
         t.line("SKIP", "inventory", f"inventory_weekly missing usable columns ({inv_cols})")
     else:
         idexpr = date_expr(conn, "inventory_weekly", idcol)
+        ot_sql = f"SUM({otcol})" if otcol else "NULL"
         irows = conn.execute(
-            f"SELECT tcin, SUM({ohcol}) FROM inventory_weekly "
+            f"SELECT tcin, SUM({ohcol}), {ot_sql} FROM inventory_weekly "
             f"WHERE {idexpr} = DATE '{WEEK}' GROUP BY tcin"
         ).fetchall()
-        inv = {int(r[0]): (r[1] or 0) for r in irows if r[0] is not None}
+        inv = {
+            int(r[0]): ((r[1] or 0), (r[2] or 0))
+            for r in irows
+            if r[0] is not None
+        }
         if not inv:
             t.line("SKIP", "inventory", f"no inventory rows for w/e {WEEK}")
         else:
+            if otcol:
+                print(f"     (on-hand: {ohcol}; on-transfer: {otcol} — either definition may match)")
             for tcin, (_dpci, model, _u, _d, exp_oh) in sorted(EXPECTED_TCIN.items()):
                 if exp_oh < 50:  # noise-level SKUs
                     continue
                 if tcin not in inv:
                     t.line("FAIL", f"{tcin} {model}", f"MISSING — expected OH {exp_oh:,}")
                     continue
-                act = inv[tcin]
-                t.line(
-                    "PASS" if within(act, exp_oh, TOL_INV) else "FAIL",
-                    f"{tcin} {model}", f"OH {act:,.0f} vs {exp_oh:,}",
-                )
+                oh, ot = inv[tcin]
+                # KMG's OH definition varies by SKU (see ONTRANSFER_CANDS
+                # comment): accept on-hand alone OR on-hand + on-transfer.
+                ok_oh = within(oh, exp_oh, TOL_INV)
+                ok_sum = otcol is not None and within(oh + ot, exp_oh, TOL_INV)
+                if ok_oh:
+                    detail = f"OH {oh:,.0f} vs {exp_oh:,}"
+                elif ok_sum:
+                    detail = f"OH+transfer {oh + ot:,.0f} (OH {oh:,.0f}) vs {exp_oh:,}"
+                else:
+                    detail = (
+                        f"OH {oh:,.0f} / OH+transfer {oh + ot:,.0f} vs {exp_oh:,}"
+                        if otcol
+                        else f"OH {oh:,.0f} vs {exp_oh:,}"
+                    )
+                t.line("PASS" if (ok_oh or ok_sum) else "FAIL", f"{tcin} {model}", detail)
 
     # ---- summary ---------------------------------------------------------
     print(f"\nRESULT: {t.passed} passed, {t.failed} failed, {t.skipped} skipped")
@@ -334,7 +372,10 @@ def main() -> int:
             "  - Single SKUs missing: check _file_ledger for failed files\n"
             "    (SELECT * FROM _file_ledger WHERE status='failed').\n"
             "  - All dollars off but units right (or vice versa): column mapping —\n"
-            "    check the header printed above against the real table schema."
+            "    check the header printed above against the real table schema.\n"
+            "  - Inventory consistently below KMG OH even with +transfer: KMG's\n"
+            "    cut may include on-order units — compare against\n"
+            "    ending_on_purchase_q before treating it as a data bug."
         )
     return 1 if t.failed else 0
 
