@@ -904,3 +904,83 @@ def test_pk_resolution_po_plan_biweekly_real_shape() -> None:
     assert pk == ("tcin", "business_d", "order_d", "receiving_location_id"), (
         f"expected po_plan_daily-mirror PK, got {pk}"
     )
+
+
+# ---------- Patch #8: HISTORY one-off backfill + canonical column-name shim ----------
+
+
+@pytest.mark.parametrize(
+    ("name", "dataset", "expected_date"),
+    [
+        (
+            "BV_139440_HISTORY_SALES_WEEKLY_01032026_KW.zip",
+            "sales_weekly",
+            date(2026, 1, 3),
+        ),
+        (
+            "BV_139440_HISTORY_INV_WEEKLY_01112025_KW.zip",
+            "inventory_weekly",
+            date(2025, 1, 11),
+        ),
+        (
+            "BV_139440_HISTORY_GM_WEEKLY_12272025_KW.zip",
+            "gross_margin",
+            date(2025, 12, 27),
+        ),
+    ],
+)
+def test_classify_history_backfill_files(
+    name: str, dataset: str, expected_date: date
+) -> None:
+    """The 207 HISTORY_{SALES,INV,GM}_WEEKLY backfill files route into the
+    existing weekly tables. Retire these patterns after the backfill lands."""
+    parsed = classify_filename(name)
+    assert parsed is not None, f"failed to classify {name}"
+    assert parsed.pattern.dataset == dataset
+    assert parsed.file_date == expected_date
+
+
+def test_multi_pattern_datasets_share_pk_and_scope() -> None:
+    """Generalized drift guard (adversarial review): whenever two patterns map
+    to the same dataset (e.g. HISTORY backfill twins), they must share the
+    SAME primary_key_candidates object and the same replace_scope — divergence
+    would reintroduce the PK-mismatch bug class in one of the twins."""
+    from collections import defaultdict
+
+    by_dataset: dict[str, list] = defaultdict(list)
+    for p in PATTERNS:
+        by_dataset[p.dataset].append(p)
+    multi = {ds: ps for ds, ps in by_dataset.items() if len(ps) > 1}
+    # The HISTORY twins are the known multi-pattern datasets today.
+    assert set(multi) == {"sales_weekly", "inventory_weekly", "gross_margin"}
+    for ds, ps in multi.items():
+        first = ps[0]
+        for other in ps[1:]:
+            assert other.primary_key_candidates is first.primary_key_candidates, ds
+            assert other.replace_scope == first.replace_scope, ds
+
+
+def test_apply_canonical_renames_maps_history_variants() -> None:
+    from bpd_mcp.parsers import apply_canonical_renames
+
+    df = pl.DataFrame({"week_end_d": ["2025-01-11"], "tcin": [1], "ending_on_hand_q": [5]})
+    out = apply_canonical_renames("inventory_weekly", df)
+    assert "business_d" in out.columns and "week_end_d" not in out.columns
+
+    df = pl.DataFrame({"fiscal_week_end_date": ["2025-01-11"], "tcin": [1]})
+    out = apply_canonical_renames("gross_margin", df)
+    assert "fiscal_week_end_d" in out.columns and "fiscal_week_end_date" not in out.columns
+
+
+def test_apply_canonical_renames_never_clobbers_and_noops() -> None:
+    from bpd_mcp.parsers import apply_canonical_renames
+
+    # Both variant and canonical present: no rename (would clobber).
+    df = pl.DataFrame({"week_end_d": ["a"], "business_d": ["b"], "tcin": [1]})
+    out = apply_canonical_renames("inventory_weekly", df)
+    assert out.columns == df.columns
+
+    # Dataset with no entry: identity.
+    df = pl.DataFrame({"week_end_d": ["a"], "tcin": [1]})
+    out = apply_canonical_renames("sales_daily", df)
+    assert out.columns == df.columns

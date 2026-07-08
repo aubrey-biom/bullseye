@@ -191,13 +191,34 @@ class Warehouse:
         return {"columns": json.loads(row[0]), "primary_key": row[1]}
 
     def ensure_data_table(self, dataset: Dataset, columns: dict[str, str]) -> None:
-        """Create the data table if it doesn't exist, using the discovered schema."""
+        """Create the data table if it doesn't exist; widen it if new columns appear.
+
+        Widening (Patch #8): when an incoming file carries columns the existing
+        table lacks (e.g. a different feed generation such as the HISTORY
+        backfill), ALTER TABLE ADD COLUMN so the values land instead of being
+        dropped. Existing rows get NULL for the new columns. This also removes
+        the fresh-rebuild race where whichever generation's file happened to
+        CREATE the table decided which columns survived.
+        """
         if self._read_only:
             raise RuntimeError("read-only warehouse cannot create tables")
         tbl = quote_ident(dataset)
         cols_ddl = ", ".join(f"{quote_ident(name)} {dtype}" for name, dtype in columns.items())
         with self._lock:
             self._conn.execute(f"CREATE TABLE IF NOT EXISTS {tbl} ({cols_ddl})")
+            existing = {
+                r[1]
+                for r in self._conn.execute(f"PRAGMA table_info('{dataset}')").fetchall()
+            }
+            added = []
+            for name, dtype in columns.items():
+                if name not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {tbl} ADD COLUMN {quote_ident(name)} {dtype}"
+                    )
+                    added.append(name)
+            if added:
+                logger.info("table_widened", dataset=dataset, added=added)
 
     # ---------- load ----------
 
@@ -207,8 +228,22 @@ class Warehouse:
         df: pl.DataFrame,
         *,
         primary_key: tuple[str, ...],
+        replace_scope: tuple[str, ...] | None = None,
     ) -> int:
-        """Idempotent load: delete-then-insert keyed on primary_key.
+        """Idempotent load: delete-then-insert, wrapped in one transaction.
+
+        Deletion scope (Patch #8): when `replace_scope` is given and its
+        columns are present, ALL existing rows whose scope values (e.g. the
+        week-end date) appear in the incoming file are deleted — the file is
+        treated as the complete extract of its period, so stale rows from a
+        different feed generation can't survive alongside it. Otherwise the
+        delete is per natural key (`primary_key`).
+
+        Atomicity (Patch #8): DELETE and INSERT run inside a single
+        transaction. Without it, an INSERT failure after a committed DELETE
+        silently destroys previously-loaded rows — worse, the ledger still
+        marks the file that supplied them as 'loaded', so no re-sync ever
+        restores them.
 
         Returns row count. Implemented via DuckDB SQL (no Python iteration).
         """
@@ -220,48 +255,115 @@ class Warehouse:
             self._conn.register("incoming_df", df_arrow)
             try:
                 # Align columns to existing table; missing ones come in as NULL.
-                table_cols = [
-                    r[1]
-                    for r in self._conn.execute(
-                        f"PRAGMA table_info('{dataset}')"
-                    ).fetchall()
-                ]
+                pragma_rows = self._conn.execute(
+                    f"PRAGMA table_info('{dataset}')"
+                ).fetchall()
+                table_cols = [r[1] for r in pragma_rows]
+                # Column type per the TABLE — incoming values are cast to it
+                # (Patch #8). Different feed generations type the same logical
+                # column differently (e.g. the HISTORY backfill's
+                # `fiscal_week_end_date` parses as DATE while the warehouse
+                # column is VARCHAR); without the cast, the natural-key DELETE
+                # below fails with a binder error on the type mismatch.
+                table_types = {r[1]: r[2] for r in pragma_rows}
                 if not table_cols:
                     # First load: schema was just created by ensure_data_table.
                     table_cols = df.columns
+
+                def _aligned(col: str) -> str:
+                    ident = quote_ident(col)
+                    ttype = table_types.get(col)
+                    return f"CAST({ident} AS {ttype})" if ttype else ident
+
                 select_exprs = []
                 for col in table_cols:
                     if col in df.columns:
-                        select_exprs.append(quote_ident(col))
+                        select_exprs.append(f"{_aligned(col)} AS {quote_ident(col)}")
                     else:
                         select_exprs.append(f"NULL AS {quote_ident(col)}")
                 select_sql = ", ".join(select_exprs)
 
-                # Delete matching PKs first (idempotent re-load). Missing PK
-                # columns is a hard error: silently skipping the DELETE would
-                # leave INSERT to run unconditionally, which causes silent
-                # duplication on every subsequent load (Patch #6.2 — this used
-                # to log a warning, which masked the sales_weekly 2.0× bug).
-                missing = [c for c in primary_key if c not in df.columns]
-                if missing:
-                    raise RuntimeError(
-                        f"primary_key_missing_in_df: dataset={dataset!r} "
-                        f"primary_key={primary_key} df_columns={df.columns} "
-                        f"missing={missing} — refusing to upsert because the "
-                        f"DELETE step cannot run; this would duplicate rows. "
-                        f"Fix: add a matching candidate to parsers.PATTERNS "
-                        f"primary_key_candidates for this dataset."
+                # Observability (Patch #8): incoming columns absent from the
+                # table are dropped by the alignment above. That's the right
+                # merge behavior (e.g. HISTORY backfill files carry extra
+                # metric columns), but it must never be silent.
+                dropped = [c for c in df.columns if c not in table_cols]
+                if dropped:
+                    logger.warning(
+                        "columns_dropped_on_upsert",
+                        dataset=dataset,
+                        dropped=dropped,
                     )
-                pk_cols_sql = ", ".join(quote_ident(c) for c in primary_key)
-                self._conn.execute(
-                    f"DELETE FROM {tbl} WHERE ({pk_cols_sql}) IN "
-                    f"(SELECT {pk_cols_sql} FROM incoming_df)"
-                )
 
-                # Insert.
-                self._conn.execute(
-                    f"INSERT INTO {tbl} SELECT {select_sql} FROM incoming_df"
+                # Pick the deletion scope: period-scoped when configured and
+                # available, else per natural key. Missing PK columns is a
+                # hard error: silently skipping the DELETE would leave INSERT
+                # to run unconditionally, which causes silent duplication on
+                # every subsequent load (Patch #6.2 — this used to log a
+                # warning, which masked the sales_weekly 2.0× bug).
+                use_scope = bool(replace_scope) and all(
+                    c in df.columns for c in replace_scope
                 )
+                if replace_scope and not use_scope:
+                    logger.warning(
+                        "replace_scope_unavailable",
+                        dataset=dataset,
+                        replace_scope=replace_scope,
+                        df_columns=df.columns,
+                    )
+                if use_scope:
+                    # A NULL scope value (e.g. an unparseable week-end date)
+                    # can never be matched by a future DELETE — loading it
+                    # would duplicate on every re-load. Fail loudly instead.
+                    null_pred = " OR ".join(
+                        f"{quote_ident(c)} IS NULL" for c in replace_scope
+                    )
+                    (null_ct,) = self._conn.execute(
+                        f"SELECT COUNT(*) FROM incoming_df WHERE {null_pred}"
+                    ).fetchone()
+                    if null_ct:
+                        raise RuntimeError(
+                            f"null_replace_scope_values: dataset={dataset!r} "
+                            f"replace_scope={replace_scope} null_rows={null_ct} "
+                            f"— refusing to load rows whose period columns are "
+                            f"NULL; they could never be replaced idempotently."
+                        )
+                    del_cols_sql = ", ".join(quote_ident(c) for c in replace_scope)
+                    del_src_sql = ", ".join(_aligned(c) for c in replace_scope)
+                else:
+                    missing = [c for c in primary_key if c not in df.columns]
+                    if missing:
+                        raise RuntimeError(
+                            f"primary_key_missing_in_df: dataset={dataset!r} "
+                            f"primary_key={primary_key} df_columns={df.columns} "
+                            f"missing={missing} — refusing to upsert because the "
+                            f"DELETE step cannot run; this would duplicate rows. "
+                            f"Fix: add a matching candidate to parsers.PATTERNS "
+                            f"primary_key_candidates for this dataset."
+                        )
+                    del_cols_sql = ", ".join(quote_ident(c) for c in primary_key)
+                    # Incoming values are cast to the table's column types so
+                    # the tuple comparison binds across feed-generation type
+                    # differences (see table_types above).
+                    del_src_sql = ", ".join(_aligned(c) for c in primary_key)
+
+                # Atomic delete-then-insert (Patch #8): if the INSERT fails
+                # (e.g. an uncastable value in one of the incoming columns),
+                # ROLLBACK restores the deleted rows instead of leaving the
+                # table silently missing data.
+                self._conn.execute("BEGIN TRANSACTION")
+                try:
+                    self._conn.execute(
+                        f"DELETE FROM {tbl} WHERE ({del_cols_sql}) IN "
+                        f"(SELECT DISTINCT {del_src_sql} FROM incoming_df)"
+                    )
+                    self._conn.execute(
+                        f"INSERT INTO {tbl} SELECT {select_sql} FROM incoming_df"
+                    )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
                 row_count = self._conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
             finally:
                 self._conn.unregister("incoming_df")
@@ -495,7 +597,11 @@ class Warehouse:
                     "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
                 ).fetchall()
             }
-            datasets = [p.dataset for p in PATTERNS if p.dataset in tables]
+            # dict.fromkeys: dedupe while preserving catalog order — multiple
+            # patterns may map to one dataset (e.g. the HISTORY backfill).
+            datasets = [
+                d for d in dict.fromkeys(p.dataset for p in PATTERNS) if d in tables
+            ]
             results: list[dict[str, Any]] = []
             for ds in datasets:
                 date_col = self.detect_date_column(ds)

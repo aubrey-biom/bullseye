@@ -516,15 +516,15 @@ async def _datasets_have_data(warehouse: Warehouse, **_: Any) -> HealthCheckResu
     info = warehouse.describe()["tables"]
     populated = 0
     empty = []
-    for pat in PATTERNS:
-        ds = pat.dataset
+    # Dedupe: multiple patterns may map to one dataset (HISTORY backfill).
+    for ds in dict.fromkeys(p.dataset for p in PATTERNS):
         if ds not in info:
             continue
         if info[ds]["row_count"] > 0:
             populated += 1
         else:
             empty.append(ds)
-    total_known = sum(1 for p in PATTERNS if p.dataset in info)
+    total_known = sum(1 for d in dict.fromkeys(p.dataset for p in PATTERNS) if d in info)
     if total_known == 0:
         return HealthCheckResult(
             name="datasets_have_data",
@@ -566,8 +566,8 @@ async def _warehouse_no_duplicate_rows(
     """
     info = warehouse.describe()["tables"]
     dup_tables: list[tuple[str, int, int]] = []
-    for pat in PATTERNS:
-        ds = pat.dataset
+    # Dedupe: multiple patterns may map to one dataset (HISTORY backfill).
+    for ds in dict.fromkeys(p.dataset for p in PATTERNS):
         if ds not in info or info[ds]["row_count"] == 0:
             continue
         tbl = quote_ident(ds)
