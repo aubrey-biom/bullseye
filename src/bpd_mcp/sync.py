@@ -232,7 +232,9 @@ async def _process_one_file(
         # Parse + load.
         loop = asyncio.get_running_loop()
         try:
-            parse_result = await loop.run_in_executor(None, read_dataframe, zip_path)
+            parse_result = await loop.run_in_executor(
+                None, read_dataframe, zip_path, dataset
+            )
         except ParseError as e:
             err_msg = f"{type(e).__name__}: {e}"
             logger.warning(
@@ -278,12 +280,21 @@ async def _process_one_file(
                 primary_error=parse_result.primary_error,
             )
 
+        # Canonical column-name renames are applied INSIDE read_dataframe
+        # (before type-hint casts — see parsers._finalize, Patch #8), so `df`
+        # already carries canonical names here.
+
         columns = derive_duckdb_schema(df)
         primary_key = _pick_primary_key(parsed, df.columns)
 
         warehouse.ensure_data_table(dataset, columns)
         try:
-            rows = warehouse.upsert_dataframe(dataset, df, primary_key=primary_key)
+            rows = warehouse.upsert_dataframe(
+                dataset,
+                df,
+                primary_key=primary_key,
+                replace_scope=parsed.pattern.replace_scope,
+            )
         except Exception as e:
             err_msg = f"load: {type(e).__name__}: {e}"
             logger.warning(

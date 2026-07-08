@@ -76,6 +76,15 @@ class FilePattern:
     # Natural primary key candidates, in priority order. We normalize header → snake_case
     # then pick the first set that fully matches the discovered columns.
     primary_key_candidates: tuple[tuple[str, ...], ...]
+    # Patch #8: when set, upsert deletes ALL existing rows whose replace_scope
+    # values (canonical column names, e.g. the week-end date) appear in the
+    # incoming file, instead of deleting per natural key. Use for datasets
+    # where a file is the COMPLETE extract of its period: per-key deletion
+    # would otherwise leave stale rows behind whenever two feed generations
+    # (e.g. the HISTORY backfill vs the regular weekly) disagree on which
+    # natural keys exist in a week — producing mixed-generation rows whose
+    # totals match neither source.
+    replace_scope: tuple[str, ...] | None = None
 
 
 # --- Filename building blocks ---------------------------------------------------------
@@ -123,6 +132,73 @@ def _pk_item(*date_cols: str) -> tuple[tuple[str, ...], ...]:
     return tuple(("tcin", dc) for dc in date_cols)
 
 
+# --- Shared PK candidate sets (Patch #8) ----------------------------------------------
+# Hoisted so the HISTORY backfill patterns reuse EXACTLY the same natural keys as
+# their regular weekly siblings — a divergence here would reintroduce the
+# PK-mismatch bug class the meta-audit guards against.
+
+_SALES_WEEKLY_PK = _pk_with_loc(
+    "sales_date", "week_end_date", "fiscal_week_end_d",
+    "fiscal_week_end_date", "sale_date",
+)
+_INV_WEEKLY_PK = _pk_with_loc(
+    "business_d", "report_date_dim", "week_end_date",
+    "fiscal_week_end_d", "inventory_date", "snapshot_date",
+)
+# Patch #7: 8-col natural key, verified empirically against the live warehouse
+# (COUNT(DISTINCT) == COUNT(*) == 197,013). `location_id_originated` is
+# essential — the 7-col variant silently loses rows.
+_GM_PK = (
+    (
+        "tcin", "location_id", "location_id_originated",
+        "fiscal_week_end_d",
+        "channel_originated", "channel_fulfilled",
+        "fulfillment_type", "fulfillment_subtype",
+    ),
+    # Legacy fallback for older fixture shapes that lack the wider
+    # channel/fulfillment columns.
+    *_pk_with_loc("fiscal_week_end_d"),
+    *_pk_with_loc("week_end_date"),
+)
+
+
+# --- Canonical column-name shim (Patch #8 — first slice of the planned #6.3) ----------
+# Target ships the SAME logical column under different names across feed
+# generations (six production incidents and counting). This map normalizes
+# known variants to the canonical name the warehouse table uses, applied by
+# sync right after parsing (see `apply_canonical_renames`). A rename only
+# fires when the variant is present AND the canonical name is absent, so it
+# can never clobber real data.
+#
+# The HISTORY one-off backfill files are the immediate motivation:
+#   HISTORY_INV_WEEKLY ships `week_end_d`          (current feed: `business_d`)
+#   HISTORY_GM_WEEKLY  ships `fiscal_week_end_date` (current feed: `fiscal_week_end_d`)
+CANONICAL_RENAMES: dict[str, dict[str, str]] = {
+    "inventory_weekly": {"week_end_d": "business_d"},
+    "gross_margin": {"fiscal_week_end_date": "fiscal_week_end_d"},
+    "gross_margin_item": {"fiscal_week_end_date": "fiscal_week_end_d"},
+}
+
+
+def apply_canonical_renames(dataset: str, df: pl.DataFrame) -> pl.DataFrame:
+    """Rename known column-name variants to their canonical form for `dataset`.
+
+    No-op for datasets without an entry. A variant is only renamed when the
+    canonical column is NOT already present (no clobbering)."""
+    renames = CANONICAL_RENAMES.get(dataset)
+    if not renames:
+        return df
+    mapping = {
+        src: dst
+        for src, dst in renames.items()
+        if src in df.columns and dst not in df.columns
+    }
+    if mapping:
+        logger.info("canonical_renames_applied", dataset=dataset, renames=mapping)
+        df = df.rename(mapping)
+    return df
+
+
 # --- Pattern catalog ------------------------------------------------------------------
 #
 # Order: more-specific patterns FIRST so they win on first match. Regex anchoring at
@@ -145,10 +221,8 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"WEEKLY_SALES_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
-        primary_key_candidates=_pk_with_loc(
-            "sales_date", "week_end_date", "fiscal_week_end_d",
-            "fiscal_week_end_date", "sale_date",
-        ),
+        primary_key_candidates=_SALES_WEEKLY_PK,
+        replace_scope=("sales_date",),
     ),
     FilePattern(
         dataset="sales_weekly_item",
@@ -159,6 +233,7 @@ PATTERNS: tuple[FilePattern, ...] = (
             "sales_date", "week_end_date", "fiscal_week_end_d",
             "fiscal_week_end_date", "sale_date",
         ),
+        replace_scope=("sales_date",),
     ),
 
     # ---------- inventory (item × location × day | week) ----------
@@ -183,10 +258,8 @@ PATTERNS: tuple[FilePattern, ...] = (
         # Patch #7.1: real Target column is `business_d` (same fix as #6.2.2
         # for inventory_daily, missed for the weekly sibling). Older aliases
         # kept as fallbacks for fixtures + historical files.
-        primary_key_candidates=_pk_with_loc(
-            "business_d", "report_date_dim", "week_end_date",
-            "fiscal_week_end_d", "inventory_date", "snapshot_date",
-        ),
+        primary_key_candidates=_INV_WEEKLY_PK,
+        replace_scope=("business_d",),
     ),
     FilePattern(
         dataset="inventory_weekly_item",
@@ -198,6 +271,7 @@ PATTERNS: tuple[FilePattern, ...] = (
             "business_d", "report_date_dim", "week_end_date",
             "fiscal_week_end_d", "inventory_date",
         ),
+        replace_scope=("business_d",),
     ),
 
     # ---------- gross margin ----------
@@ -206,23 +280,9 @@ PATTERNS: tuple[FilePattern, ...] = (
         regex=_pat(r"WEEKLY_GM_TCIN_LOC"),
         granularity="item × location × week",
         frequency="weekly",
-        # Patch #7: natural key includes origination location and channel/
-        # fulfillment dimensions. Verified empirically: 8-col tuple yields
-        # COUNT(DISTINCT) == COUNT(*) on the live warehouse (197,013 = 197,013).
-        # A narrower 7-col key (without `location_id_originated`) would have
-        # caused silent data loss of 3,831 rows.
-        primary_key_candidates=(
-            (
-                "tcin", "location_id", "location_id_originated",
-                "fiscal_week_end_d",
-                "channel_originated", "channel_fulfilled",
-                "fulfillment_type", "fulfillment_subtype",
-            ),
-            # Legacy fallback for older fixture shapes that lack the wider
-            # channel/fulfillment columns.
-            *_pk_with_loc("fiscal_week_end_d"),
-            *_pk_with_loc("week_end_date"),
-        ),
+        # See _GM_PK — 8-col natural key verified empirically in Patch #7.
+        primary_key_candidates=_GM_PK,
+        replace_scope=("fiscal_week_end_d",),
     ),
     FilePattern(
         dataset="gross_margin_item",
@@ -240,6 +300,7 @@ PATTERNS: tuple[FilePattern, ...] = (
             *_pk_item("fiscal_week_end_d"),
             *_pk_item("week_end_date"),
         ),
+        replace_scope=("fiscal_week_end_d",),
     ),
 
     # ---------- item dimension ----------
@@ -367,6 +428,40 @@ PATTERNS: tuple[FilePattern, ...] = (
             "week_start_date", "week_end_date", "forecast_week",
         ),
     ),
+
+    # ---------- HISTORY one-off backfill — retire after May 2026 ----------
+    # Target dropped 207 HISTORY_{SALES,INV,GM}_WEEKLY files (Jan 2025 → May
+    # 2026) into the folder on 2026-05-18 as a one-time historical backfill.
+    # They route into the EXISTING weekly tables and reuse the siblings' exact
+    # natural keys, so re-loads and overlaps with regular weekly files merge
+    # idempotently. Header variants unique to the HISTORY generation
+    # (`week_end_d`, `fiscal_week_end_date`) are normalized to the canonical
+    # names via CANONICAL_RENAMES before load. Once the backfill has been
+    # ingested and validated, these three patterns can be deleted.
+    FilePattern(
+        dataset="sales_weekly",
+        regex=_pat(r"HISTORY_SALES_WEEKLY"),
+        granularity="item × location × week (historical backfill)",
+        frequency="one-off",
+        primary_key_candidates=_SALES_WEEKLY_PK,
+        replace_scope=("sales_date",),
+    ),
+    FilePattern(
+        dataset="inventory_weekly",
+        regex=_pat(r"HISTORY_INV_WEEKLY"),
+        granularity="item × location × week (historical backfill)",
+        frequency="one-off",
+        primary_key_candidates=_INV_WEEKLY_PK,
+        replace_scope=("business_d",),
+    ),
+    FilePattern(
+        dataset="gross_margin",
+        regex=_pat(r"HISTORY_GM_WEEKLY"),
+        granularity="item × location × week (historical backfill)",
+        frequency="one-off",
+        primary_key_candidates=_GM_PK,
+        replace_scope=("fiscal_week_end_d",),
+    ),
 )
 
 
@@ -473,10 +568,21 @@ class ParseResult:
     primary_error: str | None = None
 
 
-def _finalize(df: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
-    """Normalize column names and apply type-hint casts. Shared by all attempts."""
+def _finalize(df: pl.DataFrame, dataset: str | None = None) -> tuple[pl.DataFrame, list[str]]:
+    """Normalize column names, apply canonical renames, then type-hint casts.
+
+    Order matters (Patch #8): canonical renames MUST run before
+    `_cast_known_columns` so a renamed variant takes the exact same cast path
+    as the canonical column it maps to. If renames ran after casting, e.g.
+    `fiscal_week_end_date` (HISTORY GM) would be Date-cast while the current
+    feed's `fiscal_week_end_d` never is — producing a DATE-vs-VARCHAR split of
+    the SAME logical column across feed generations, which breaks natural-key
+    matching in the warehouse.
+    """
     original = list(df.columns)
     df = df.rename({c: _normalize_column_name(c) for c in df.columns})
+    if dataset is not None:
+        df = apply_canonical_renames(dataset, df)
     df = _cast_known_columns(df)
     return df, original
 
@@ -563,7 +669,7 @@ def _attempt_pandas_permissive(raw: bytes, delim: str) -> tuple[pl.DataFrame, in
     return df_pl, skipped
 
 
-def read_dataframe(zip_path: Path) -> ParseResult:
+def read_dataframe(zip_path: Path, dataset: str | None = None) -> ParseResult:
     """Parse a BPD zip into a Polars DataFrame with a graceful fallback chain.
 
     Target ships malformed files occasionally (extra delimiters mid-row, embedded
@@ -579,7 +685,7 @@ def read_dataframe(zip_path: Path) -> ParseResult:
     # Attempt 1: strict.
     try:
         df = _attempt_strict(raw, delim)
-        df, original = _finalize(df)
+        df, original = _finalize(df, dataset)
         return ParseResult(
             df=df, original_columns=original, delimiter=delim, method="strict"
         )
@@ -596,7 +702,7 @@ def read_dataframe(zip_path: Path) -> ParseResult:
     # Attempt 2: polars permissive (ignore_errors).
     try:
         df, skipped = _attempt_polars_permissive(raw, delim)
-        df, original = _finalize(df)
+        df, original = _finalize(df, dataset)
         logger.warning(
             "parse_fallback_polars_permissive",
             file=zip_path.name,
@@ -624,7 +730,7 @@ def read_dataframe(zip_path: Path) -> ParseResult:
     # Attempt 3: pandas python engine with on_bad_lines='skip'.
     try:
         df, skipped = _attempt_pandas_permissive(raw, delim)
-        df, original = _finalize(df)
+        df, original = _finalize(df, dataset)
         logger.warning(
             "parse_fallback_pandas_permissive",
             file=zip_path.name,

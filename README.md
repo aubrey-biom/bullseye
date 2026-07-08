@@ -199,6 +199,35 @@ the failure mode that produced the sales_weekly 2.0× regression — the
 loud failure is intentional, so the next person hits the error
 immediately instead of accumulating duplicates on every re-load.
 
+**Canonical column-name shim (Patch #8).** When Target ships the SAME
+logical column under a new name (seven incidents so far), add an entry to
+`parsers.CANONICAL_RENAMES` instead of widening PK candidates: the parser
+renames the variant to the canonical name BEFORE the type-hint casts (see
+`_finalize`), so a renamed column takes the exact same type path as the
+canonical column and the file merges into the existing table with the
+existing key. Renames never clobber — they only fire when the canonical
+column is absent. `upsert_dataframe` additionally casts incoming values to
+the table's column types, runs DELETE+INSERT in ONE transaction (a failed
+INSERT rolls back its DELETE), and `ensure_data_table` widens tables via
+ALTER ADD COLUMN when a generation carries extra columns.
+
+### HISTORY backfill (one-off — retire after ingested)
+
+Target dropped 207 `HISTORY_{SALES,INV,GM}_WEEKLY` files (Jan 2025 → May
+2026) as a one-time backfill. Three catalog patterns route them into the
+existing `sales_weekly` / `inventory_weekly` / `gross_margin` tables with
+the siblings' exact natural keys; `week_end_d` → `business_d` and
+`fiscal_week_end_date` → `fiscal_week_end_d` are normalized via the shim.
+Weekly datasets use `replace_scope` (week-scoped deletion): a file is the
+complete extract of its week, so loading it replaces the ENTIRE week —
+overlapping weeks can't become a mix of two feed generations, and re-syncs
+stay idempotent. If a regular file and a HISTORY file cover the same week,
+the last one loaded wins wholesale (both are self-consistent extracts).
+After the backfill is ingested and validated, delete the three `HISTORY_`
+patterns from `parsers.PATTERNS`. There is no item-grain GM history —
+`gross_margin_item` can be derived from `gross_margin` by aggregating
+across `location_id`/`location_id_originated`.
+
 ---
 
 ## Target schema quirks
