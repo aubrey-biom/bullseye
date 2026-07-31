@@ -180,8 +180,8 @@ async def clear_cache(
 
 # Expected count of registered MCP tools after this patch lands.
 # Lineage: 16 base + 3 S&OP analytics (patch #2) + bpd_health_check (patch #3) +
-# bpd_export_query_to_csv (patch #4) = 21.
-EXPECTED_TOOL_COUNT = 21
+# bpd_export_query_to_csv (patch #4) + bpd_reingest_local (patch #9) = 22.
+EXPECTED_TOOL_COUNT = 22
 
 # Columns the patched ledger must have. Used by `warehouse_schema_current`.
 EXPECTED_LEDGER_COLUMNS = (

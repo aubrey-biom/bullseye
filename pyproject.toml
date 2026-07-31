@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Biom" }]
 dependencies = [
-    "mcp>=1.0.0",
+    # mcp 2.0 removed the `mcp.server.fastmcp` module this server is built on.
+    # Stay on the 1.x line until we deliberately migrate.
+    "mcp>=1.0.0,<2",
     "httpx[http2]>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",

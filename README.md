@@ -74,13 +74,16 @@ the project root. See `.env.example` for the full list. The non-obvious knobs:
 | `BPD_DATA_DIR`               | `~/.bpd-mcp`                        | Root for raw zips, the DuckDB warehouse, tokens, and logs.            |
 | `BPD_AUTO_SYNC_ON_START`     | `false`                             | If true, sync new files when the MCP starts.                          |
 | `BPD_MAX_PARALLEL_DOWNLOADS` | `4`                                 | Concurrency cap for the sync worker.                                  |
+| `BPD_AUTO_BACKUP`            | `true`                              | Timestamped warehouse backup before every sync/reingest (Patch #9).   |
+| `BPD_BACKUP_KEEP`            | `5`                                 | How many backups to retain in `backups/` (oldest pruned).             |
 
 The data dir layout is:
 
 ```
 ~/.bpd-mcp/
-├── raw/                  # downloaded .zip files (LRU-capped at 5 GB)
+├── raw/                  # downloaded .zip files (LRU-capped at 5 GB; un-ingested zips are never evicted)
 ├── extracted/            # transient unzip workspace
+├── backups/              # timestamped bpd-<stamp>-<reason>.duckdb copies (Patch #9)
 ├── bpd.duckdb            # the warehouse
 ├── bpd.duckdb.ro         # read-only snapshot for `bpd_run_sql` (auto-managed)
 ├── tokens.json           # 0600 perms enforced
@@ -107,8 +110,9 @@ accepts a `response_format` of `markdown` (default) or `json`.
 
 | Tool                  | Purpose                                                                       |
 | --------------------- | ----------------------------------------------------------------------------- |
-| `bpd_sync_new_files`  | Discover new BPD zips → download → parse → load. Idempotent. Supports `dry_run`. |
-| `bpd_refresh_dataset` | Re-load a single dataset; `full=true` clears+rebuilds.                        |
+| `bpd_sync_new_files`  | Discover new BPD zips → download → parse → load. Idempotent. Supports `dry_run`. Takes a pre-sync backup. |
+| `bpd_refresh_dataset` | Re-load a single dataset. `full=true` is **destructive** (see [Backups & recovery](#backups-destructive-op-guardrails--recovery-patch-9)): requires `confirm_destructive` with the exact phrase, takes a mandatory pre-delete backup, and refuses outright when it would lose history Kiteworks can't re-serve. |
+| `bpd_reingest_local`  | **Recovery tool (Patch #9).** Load zips already in `raw/` through the normal pipeline — no downloads, nothing deleted. Skips already-loaded files; supports `dry_run` and a `datasets` filter. Idempotent. |
 | `bpd_list_datasets`   | Row count, min/max data date, file count, last-loaded time per dataset.       |
 
 ### Query
@@ -319,7 +323,9 @@ The sync worker:
 NULL — Target uses it in their data model and silently coercing would lose meaning.
 
 Schema drift (new columns) is logged with the diff. The data table is not auto-altered
-in v1; you can re-run `bpd_refresh_dataset` with `full=true` if a real column was added.
+in v1; a `bpd_refresh_dataset` with `full=true` picks up a genuinely new column — but
+read the guardrails section first: full refreshes delete local history and Kiteworks
+can only re-serve ~2 weeks of it.
 
 ### Parse resilience (May 2026 patch)
 
@@ -347,6 +353,60 @@ The `bpd_cache_status` tool reports overall earliest/latest data dates *and*
 a per-dataset breakdown showing the detected date column and date range per
 table. Date columns are discovered by type (DATE/TIMESTAMP) first, then by
 name heuristic (`*_date`), then by a per-dataset fallback registry.
+
+---
+
+## Backups, destructive-op guardrails & recovery (Patch #9)
+
+Kiteworks retains only **~2 weeks** of files. That makes the local warehouse and
+the `raw/` zip archive the *only* copies of older history — a lesson learned the
+hard way when a `full=true` refresh in July 2026 wiped a validated 17-month
+sales backfill that Target could no longer re-serve. Patch #9 adds three layers
+of protection:
+
+**1. Automatic backups.** Before any operation that writes the warehouse
+(`bpd_sync_new_files`, `bpd_reingest_local`), a consistent timestamped copy is
+saved to `~/.bpd-mcp/backups/bpd-<stamp>-<reason>.duckdb` (CHECKPOINT first, so
+the copy includes everything in the WAL). Retention is `BPD_BACKUP_KEEP`
+(default 5, oldest pruned); routine backups can be disabled with
+`BPD_AUTO_BACKUP=false`. The backup taken before a full refresh's delete is
+**mandatory** and ignores that toggle.
+
+**2. Destructive-refresh guardrails.** `bpd_refresh_dataset(full=true)`:
+
+* requires `confirm_destructive="I understand this deletes local history"` —
+  anything else returns a preview of exactly what would be deleted (file count
+  + date span) and does nothing;
+* **refuses outright** (`REFRESH_WOULD_LOSE_HISTORY`) when the dataset's local
+  history starts earlier than the oldest file Kiteworks currently serves —
+  i.e. when the deleted rows could never be re-downloaded;
+* takes the mandatory backup before the first `DELETE`.
+
+**3. Raw-archive protection.** The 5 GB LRU cap on `raw/` never evicts a zip
+that has no `status='loaded'` ledger row — an un-ingested zip may be the only
+copy of its data anywhere. It is skipped (with a warning) even if that leaves
+the directory over the cap; ingest it with `bpd_reingest_local` to make it
+evictable.
+
+### Recovery runbook
+
+If warehouse data is lost (or after restoring an older `bpd.duckdb`):
+
+```text
+1. bpd_reingest_local(dry_run=true)      # preview: which raw/ zips would load
+2. bpd_reingest_local()                   # load them — no downloads, nothing deleted
+3. bpd_sync_new_files()                   # catch up on anything Kiteworks still serves
+4. python scripts/validate_kmg.py         # tie the rebuilt warehouse back to the KMG report
+```
+
+`bpd_reingest_local` runs each zip through the exact same
+parse→rename→upsert pipeline as a live sync (same replace-scope semantics,
+same ledger bookkeeping — ledger rows get `file_id = local:<file_name>`), loads
+files in ascending file-date order so period-replace datasets converge to the
+same state a live sync would have produced, and skips files already recorded
+as loaded. To restore a backup wholesale: stop the MCP, copy the chosen
+`backups/bpd-*.duckdb` over `~/.bpd-mcp/bpd.duckdb`, restart, then run the
+runbook above to catch up.
 
 ---
 
@@ -401,6 +461,7 @@ Coverage requirements (§13):
 * `tests/test_health_check.py` — every health check has pass + fail tests.
 * `tests/test_audit_drift_guards.py` — pin parallel sources of truth (PATTERNS ↔ KnownDataset, EXPECTED_LEDGER_COLUMNS ↔ DDL, EXPECTED_TOOL_COUNT ↔ registered tools).
 * `tests/test_tools_query.py` — sales_summary math + markdown/json toggle.
+* `tests/test_recovery_safety.py` — Patch #9: backups + retention, confirm-phrase gate, would-lose-history refusal, full-refresh happy path, local reingest (recovery, idempotency, ordering), raw-dir eviction protection.
 
 ---
 
