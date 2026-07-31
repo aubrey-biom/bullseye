@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     bpd_http_timeout: float = 60.0
     bpd_max_parallel_downloads: int = 4
     bpd_raw_dir_max_bytes: int = 5 * 1024 * 1024 * 1024  # 5 GiB
+    # Patch #9: automatic warehouse backups before syncs/refreshes.
+    bpd_auto_backup: bool = True
+    bpd_backup_keep: int = 5  # timestamped copies retained in backups_dir
 
     # ---------- normalized accessors ----------
 
@@ -81,6 +84,10 @@ class Settings(BaseSettings):
     def log_dir(self) -> Path:
         return self.data_dir / "logs"
 
+    @property
+    def backups_dir(self) -> Path:
+        return self.data_dir / "backups"
+
     @field_validator("kiteworks_base_url")
     @classmethod
     def _check_host(cls, v: str) -> str:
@@ -89,7 +96,7 @@ class Settings(BaseSettings):
         return v.rstrip("/")
 
     def ensure_dirs(self) -> None:
-        for d in (self.data_dir, self.raw_dir, self.extract_dir, self.log_dir):
+        for d in (self.data_dir, self.raw_dir, self.extract_dir, self.log_dir, self.backups_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 

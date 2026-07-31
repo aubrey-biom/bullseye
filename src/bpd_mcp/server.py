@@ -44,6 +44,7 @@ from .schemas import (
     ListTopFoldersInput,
     OpenOrdersInput,
     RefreshDatasetInput,
+    ReingestLocalInput,
     ResponseFormat,
     RunSqlInput,
     SalesSummaryInput,
@@ -319,11 +320,16 @@ async def bpd_sync_new_files(
     name="bpd_refresh_dataset",
     description=(
         "Re-load a single dataset. `full=true` clears the existing table and ledger for "
-        "that dataset first and re-downloads everything Target has for it."
+        "that dataset first and re-downloads what Kiteworks still serves. DESTRUCTIVE: "
+        "Kiteworks retains only ~2 weeks of files, so full=true permanently discards "
+        "local history older than that. It requires confirm_destructive with the exact "
+        "phrase 'I understand this deletes local history', takes a mandatory pre-delete "
+        "backup, and refuses outright when the deletion would lose history Kiteworks "
+        "cannot re-serve (use bpd_reingest_local instead)."
     ),
     annotations={
         "readOnlyHint": False,
-        "destructiveHint": False,
+        "destructiveHint": True,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -332,6 +338,7 @@ async def bpd_refresh_dataset(
     ctx: Context,
     dataset: KnownDataset,
     full: bool = False,
+    confirm_destructive: str | None = None,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
@@ -339,7 +346,48 @@ async def bpd_refresh_dataset(
         app.client,
         app.warehouse_rw,
         app.settings,
-        RefreshDatasetInput(dataset=dataset, full=full, response_format=response_format),
+        RefreshDatasetInput(
+            dataset=dataset,
+            full=full,
+            confirm_destructive=confirm_destructive,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_reingest_local",
+    description=(
+        "Recovery tool: load BPD zips already in the local raw archive (~/.bpd-mcp/raw) "
+        "into the warehouse WITHOUT downloading anything. Use after data loss or to "
+        "ingest orphan zips that are no longer available in Kiteworks (~2-week source "
+        "retention makes the local archive the only copy of older history). Skips "
+        "already-loaded files by default; `dry_run=true` previews. Idempotent."
+    ),
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bpd_reingest_local(
+    ctx: Context,
+    datasets: list[KnownDataset] | None = None,
+    only_unledgered: bool = True,
+    dry_run: bool = False,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await sync_tools.reingest_local(
+        app.warehouse_rw,
+        app.settings,
+        ReingestLocalInput(
+            datasets=datasets,
+            only_unledgered=only_unledgered,
+            dry_run=dry_run,
+            response_format=response_format,
+        ),
     )
 
 

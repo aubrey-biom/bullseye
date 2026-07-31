@@ -56,7 +56,7 @@ async def _run_checks(
     *,
     tmp_path: Path,
     warehouse: Warehouse | None = None,
-    bundle: TokenBundle | None | object = _UNSET,
+    bundle: TokenBundle | object | None = _UNSET,
     skip_network: bool = True,
     settings: Settings | None = None,
 ):

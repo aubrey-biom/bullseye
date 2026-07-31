@@ -126,9 +126,10 @@ echo "[8/8] MCP entry point..."
 # Importable + tool registration succeeds is enough; we don't actually start stdio.
 PYTHONPATH=src $PY -c "
 from bpd_mcp import server
+from bpd_mcp.tools.admin import EXPECTED_TOOL_COUNT
 n = len(server.mcp._tool_manager._tools)
-if n != 20:
-    print(f'  FAIL: tool count={n}, expected 20')
+if n != EXPECTED_TOOL_COUNT:
+    print(f'  FAIL: tool count={n}, expected {EXPECTED_TOOL_COUNT}')
     raise SystemExit(1)
 print(f'  PASS ({n} tools registered)')
 " || HAS_FAIL=1

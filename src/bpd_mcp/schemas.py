@@ -158,7 +158,38 @@ class RefreshDatasetInput(_BaseModel):
     dataset: KnownDataset
     full: bool = Field(
         default=False,
-        description="If true, clear the existing table+ledger for this dataset first.",
+        description=(
+            "If true, clear the existing table+ledger for this dataset first. "
+            "DESTRUCTIVE: Kiteworks retains only ~2 weeks of files, so local "
+            "history older than that is permanently lost. Requires "
+            "confirm_destructive."
+        ),
+    )
+    confirm_destructive: str | None = Field(
+        default=None,
+        description=(
+            "Required when full=true. Must be exactly: "
+            "'I understand this deletes local history'."
+        ),
+    )
+    response_format: ResponseFormat = "markdown"
+
+
+class ReingestLocalInput(_BaseModel):
+    datasets: list[KnownDataset] | None = Field(
+        default=None,
+        description="If supplied, restrict the reingest to these dataset names.",
+    )
+    only_unledgered: bool = Field(
+        default=True,
+        description=(
+            "Skip zips whose file_name already has a status='loaded' ledger row "
+            "(default). Set false to force re-loading everything on disk."
+        ),
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="If true, list which zips would be reingested without loading.",
     )
     response_format: ResponseFormat = "markdown"
 

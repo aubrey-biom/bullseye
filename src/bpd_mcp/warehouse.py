@@ -149,6 +149,22 @@ class Warehouse:
             except Exception:
                 pass
 
+    def backup_to(self, dest: Path) -> Path:
+        """Copy the warehouse file to `dest` in a consistent state (Patch #9).
+
+        CHECKPOINT flushes the WAL into the main file while the lock excludes
+        every writer in this single-writer-process design, so the copy is a
+        complete, openable snapshot. Returns `dest`.
+        """
+        import shutil as _shutil
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._conn.execute("CHECKPOINT")
+            _shutil.copy2(self._db_path, dest)
+        logger.info("warehouse_backed_up", dest=str(dest))
+        return dest
+
     # ---------- schema ----------
 
     def register_schema(
