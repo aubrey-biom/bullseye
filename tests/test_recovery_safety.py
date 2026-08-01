@@ -560,3 +560,219 @@ def test_raw_cap_never_evicts_unledgered_zips(tmp_path: Path) -> None:
 
     assert orphan.exists(), "un-ingested zip must never be evicted"
     assert not ledgered.exists(), "loaded zip is fair game for LRU eviction"
+
+
+# ---------- stale dimensional snapshots (Patch #10 — the location_attr incident) ----------
+
+LOC_ATTR_OLD = "ALL_WKLY_LOC_ATTR_V0_0_05022026_KW.zip"
+LOC_ATTR_NEW = "ALL_WKLY_LOC_ATTR_V0_0_07242026_KW.zip"
+
+
+def _loc_attr_body(remodel: str) -> str:
+    return (
+        "LOCATION_NUMBER\tLOCATION_NAME\tLAST_REMODEL_DATE\n"
+        f"1442\tSTORE A\t{remodel}\n"
+    )
+
+
+async def test_reingest_never_rolls_a_dimension_back(tmp_path: Path) -> None:
+    """Replay of the July 2026 incident. Dimensional datasets are full-universe
+    last-write-wins snapshots: only the newest file may load, in every mode."""
+    s = _settings(tmp_path)
+    _zip(s.raw_dir / LOC_ATTR_OLD, _loc_attr_body("2026-05-01"))
+    _zip(s.raw_dir / LOC_ATTR_NEW, _loc_attr_body("2026-07-20"))
+
+    wh = Warehouse(s.db_path)
+    try:
+        # Fresh warehouse, both zips unledgered: ONLY the newest loads.
+        r1 = await reingest_local_files(wh, s)
+        assert (r1.files_loaded, r1.files_skipped) == (1, 1), r1
+        by_name = {o.file_name: o for o in r1.outcomes}
+        assert by_name[LOC_ATTR_OLD].status == "skipped"
+        assert "stale dimensional" in (by_name[LOC_ATTR_OLD].error or "")
+        _, rows = wh.execute_sql(
+            "SELECT MAX(CAST(last_remodel_date AS DATE)) FROM location_attr"
+        )
+        assert str(rows[0][0]) == "2026-07-20"
+
+        # Incident shape: newest is ledgered, old zip is an unledgered orphan.
+        # Pre-guard this loaded the old snapshot and rolled the dimension back.
+        r2 = await reingest_local_files(wh, s)
+        assert r2.files_loaded == 0, r2
+        assert r2.files_skipped == 2  # new: already loaded; old: stale
+        _, rows2 = wh.execute_sql(
+            "SELECT MAX(CAST(last_remodel_date AS DATE)) FROM location_attr"
+        )
+        assert str(rows2[0][0]) == "2026-07-20"
+
+        # Deliberate rebuild (only_unledgered=False): still only the newest.
+        r3 = await reingest_local_files(wh, s, only_unledgered=False)
+        assert (r3.files_loaded, r3.files_skipped) == (1, 1), r3
+        _, led = wh.execute_sql(
+            "SELECT file_name FROM _file_ledger WHERE dataset='location_attr' "
+            "AND status='loaded'"
+        )
+        assert {r[0] for r in led} == {LOC_ATTR_NEW}
+    finally:
+        wh.close()
+
+
+async def test_reingest_stale_guard_leaves_period_replace_datasets_alone(
+    tmp_path: Path,
+) -> None:
+    """Only DIMENSIONAL datasets get the newest-only treatment — transactional
+    period-replace files must all load (that's the whole recovery path)."""
+    s = _settings(tmp_path)
+    _zip(
+        s.raw_dir / "BV_139440_HISTORY_SALES_WEEKLY_01032026_KW.zip",
+        f"{SALES_WEEKLY_HDR}\n{_sales_row('2026-01-03')}\n",
+    )
+    _zip(
+        s.raw_dir / "BV_139440_WEEKLY_SALES_TCIN_LOC_04252026_KW.zip",
+        f"{SALES_WEEKLY_HDR}\n{_sales_row('2026-04-25')}\n",
+    )
+    wh = Warehouse(s.db_path)
+    try:
+        r = await reingest_local_files(wh, s)
+        assert (r.files_loaded, r.files_skipped) == (2, 0), r
+    finally:
+        wh.close()
+
+
+@respx.mock
+async def test_sync_skips_stale_dimensional_before_download(tmp_path: Path) -> None:
+    """Live-sync side of the guard: a stale dimensional file in the folder
+    listing is skipped WITHOUT being downloaded (its content route is not even
+    mocked — a download attempt would error the test)."""
+    s = _settings(tmp_path)
+    _mock_kiteworks(
+        [
+            {
+                "id": "OLDDIM",
+                "name": LOC_ATTR_OLD,
+                "type": "f",
+                "parentId": "F1",
+                "size": 100,
+                "fingerprint": "fp-old",
+            },
+            {
+                "id": "NEWDIM",
+                "name": LOC_ATTR_NEW,
+                "type": "f",
+                "parentId": "F1",
+                "size": 100,
+                "fingerprint": "fp-new",
+            },
+        ]
+    )
+    zb = tmp_path / "payload.zip"
+    _zip(zb, _loc_attr_body("2026-07-20"))
+    respx.get(f"{BASE}/rest/files/NEWDIM/content").mock(
+        return_value=httpx.Response(200, content=zb.read_bytes())
+    )
+    zb.unlink()
+
+    wh = Warehouse(s.db_path)
+    try:
+        async with httpx.AsyncClient() as http:
+            auth = AuthManager(s, http, bundle=_bundle())
+            client = KiteworksClient(s, auth, http)
+            r = await sync_new_files(client, wh, s, triggered_by="test")
+        assert (r.files_loaded, r.files_skipped) == (1, 1), r
+        by_name = {o.file_name: o for o in r.outcomes}
+        assert by_name[LOC_ATTR_OLD].status == "skipped"
+        assert "stale dimensional" in (by_name[LOC_ATTR_OLD].error or "")
+        _, rows = wh.execute_sql(
+            "SELECT MAX(CAST(last_remodel_date AS DATE)) FROM location_attr"
+        )
+        assert str(rows[0][0]) == "2026-07-20"
+    finally:
+        wh.close()
+
+
+async def test_dimensional_falls_back_when_newest_is_corrupt(tmp_path: Path) -> None:
+    """Adversarial-review fix: staleness is judged against VERIFIED loads only.
+    A corrupt newest file must not block the next-newest good snapshot (and a
+    non-zip file must fail its own ledger row, not crash the batch)."""
+    s = _settings(tmp_path)
+    corrupt = s.raw_dir / "ALL_WKLY_LOC_ATTR_V0_0_07312026_KW.zip"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_bytes(b"this is not a zip file")
+    _zip(s.raw_dir / LOC_ATTR_NEW, _loc_attr_body("2026-07-20"))
+
+    wh = Warehouse(s.db_path)
+    try:
+        r = await reingest_local_files(wh, s)
+        assert r.files_failed == 1, r
+        assert r.files_loaded == 1, r
+        by_name = {o.file_name: o for o in r.outcomes}
+        assert by_name[corrupt.name].status == "failed"
+        assert by_name[LOC_ATTR_NEW].status == "loaded"
+        _, rows = wh.execute_sql(
+            "SELECT MAX(CAST(last_remodel_date AS DATE)) FROM location_attr"
+        )
+        assert str(rows[0][0]) == "2026-07-20"
+        # The corrupt file is ledgered as failed, so the next run retries it
+        # while the good snapshot stays loaded.
+        _, led = wh.execute_sql(
+            "SELECT file_name, status FROM _file_ledger ORDER BY file_name"
+        )
+        assert (corrupt.name, "failed") in led
+    finally:
+        wh.close()
+
+
+@respx.mock
+async def test_sync_dimensional_falls_back_when_newest_download_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    """Live-sync variant: the newest dimensional file downloads but fails to
+    parse — the next-newest must then load instead of being pre-skipped."""
+    s = _settings(tmp_path)
+    newest = "ALL_WKLY_LOC_ATTR_V0_0_07312026_KW.zip"
+    _mock_kiteworks(
+        [
+            {
+                "id": "GOODDIM",
+                "name": LOC_ATTR_NEW,
+                "type": "f",
+                "parentId": "F1",
+                "size": 100,
+                "fingerprint": "fp-good",
+            },
+            {
+                "id": "BADDIM",
+                "name": newest,
+                "type": "f",
+                "parentId": "F1",
+                "size": 100,
+                "fingerprint": "fp-bad",
+            },
+        ]
+    )
+    respx.get(f"{BASE}/rest/files/BADDIM/content").mock(
+        return_value=httpx.Response(200, content=b"garbage, not a zip")
+    )
+    zb = tmp_path / "payload.zip"
+    _zip(zb, _loc_attr_body("2026-07-20"))
+    respx.get(f"{BASE}/rest/files/GOODDIM/content").mock(
+        return_value=httpx.Response(200, content=zb.read_bytes())
+    )
+    zb.unlink()
+
+    wh = Warehouse(s.db_path)
+    try:
+        async with httpx.AsyncClient() as http:
+            auth = AuthManager(s, http, bundle=_bundle())
+            client = KiteworksClient(s, auth, http)
+            r = await sync_new_files(client, wh, s, triggered_by="test")
+        assert (r.files_loaded, r.files_failed) == (1, 1), r
+        by_name = {o.file_name: o for o in r.outcomes}
+        assert by_name[newest].status == "failed"
+        assert by_name[LOC_ATTR_NEW].status == "loaded"
+        _, rows = wh.execute_sql(
+            "SELECT MAX(CAST(last_remodel_date AS DATE)) FROM location_attr"
+        )
+        assert str(rows[0][0]) == "2026-07-20"
+    finally:
+        wh.close()

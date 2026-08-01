@@ -16,7 +16,6 @@ from .logging_setup import get_logger
 from .parsers import (
     Dataset,
     ParsedFilename,
-    ParseError,
     classify_filename,
     derive_duckdb_schema,
     read_dataframe,
@@ -157,6 +156,46 @@ def _pick_primary_key(
     return parsed.pattern.primary_key_candidates[0]
 
 
+# --- Dimensional snapshot ordering (Patch #10) ------------------------------------------
+#
+# Dimensional datasets (DATASET_KINDS == 'dimensional': location_attr, item_attr,
+# item_attr_extended) are full-universe keyed-overwrite snapshots: whichever file
+# loads LAST wins outright, with no row-count change to signal anything. Loading a
+# file older than the newest VERIFIED snapshot silently rolls the dimension back —
+# the July 2026 location_attr regression, where a reingested 05-02 zip erased 12
+# weeks of remodel dates.
+#
+# Staleness is only ever judged against VERIFIED state (adversarial-review fix):
+#   - a file older than the ledger's newest status='loaded' file_date is stale;
+#   - within a batch, candidates are tried NEWEST-FIRST and older ones are marked
+#     stale only after a newer one actually loads. If the newest candidate is
+#     corrupt or fails to download, the next-newest is attempted — a broken file
+#     can never pin the dimension to an old snapshot or leave it empty.
+# Bonus: at most one file per dimensional dataset loads per batch.
+
+
+def _is_dimensional(dataset: str) -> bool:
+    from .column_roles import DATASET_KINDS
+
+    return DATASET_KINDS.get(dataset) == "dimensional"
+
+
+def _ledger_loaded_max_file_date(warehouse: Warehouse, dataset: str) -> Any:
+    """Newest file_date with a status='loaded' ledger row — VERIFIED state."""
+    _, rows = warehouse.execute_sql(
+        "SELECT MAX(file_date) FROM _file_ledger "
+        f"WHERE dataset = '{dataset}' AND status = 'loaded'"
+    )
+    return rows[0][0] if rows and rows[0] else None
+
+
+def _stale_dimension_note(file_date: Any, newest: Any) -> str:
+    return (
+        f"stale dimensional snapshot ({file_date} < newest {newest}); skipped — "
+        "loading an older full-universe file would silently roll the dimension back"
+    )
+
+
 # --- Warehouse backups (Patch #9) ------------------------------------------------------
 
 def create_backup(
@@ -225,7 +264,10 @@ async def _parse_and_load_zip(
         parse_result = await loop.run_in_executor(
             None, read_dataframe, zip_path, dataset
         )
-    except ParseError as e:
+    # Broad on purpose (Patch #10 review fix): a truncated download raises
+    # zipfile.BadZipFile (not ParseError), and one unreadable file must fail
+    # its own ledger row, not crash the whole sync/reingest batch.
+    except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
         logger.warning(
             "file_parse_failed",
@@ -522,7 +564,7 @@ async def sync_new_files(
 
     # Filter to known patterns and (optionally) the requested datasets.
     wanted = set(datasets) if datasets else None
-    targets: list[dict[str, Any]] = []
+    candidates: list[tuple[dict[str, Any], ParsedFilename]] = []
     for entry in files:
         parsed = classify_filename(str(entry.get("name", "")))
         if parsed is None:
@@ -538,7 +580,54 @@ async def sync_new_files(
             continue
         if wanted is not None and parsed.pattern.dataset not in wanted:
             continue
-        targets.append(entry)
+        candidates.append((entry, parsed))
+
+    # Patch #10 stale-dimension guard: split candidates into regular files
+    # (processed concurrently, as before) and per-dataset DIMENSIONAL groups
+    # (newest-first with fallback — see the guard comment above). Files older
+    # than the ledger's VERIFIED loaded max skip before download.
+    targets: list[dict[str, Any]] = []
+    dim_groups: dict[str, list[tuple[dict[str, Any], ParsedFilename]]] = {}
+    for entry, parsed in candidates:
+        ds = parsed.pattern.dataset
+        if _is_dimensional(ds):
+            dim_groups.setdefault(ds, []).append((entry, parsed))
+        else:
+            targets.append(entry)
+
+    def _skip_stale(file_id: str, name: str, ds: str, file_date: Any, newest: Any) -> None:
+        result.files_skipped += 1
+        logger.info(
+            "stale_dimensional_snapshot_skipped",
+            file_name=name,
+            dataset=ds,
+            file_date=str(file_date),
+            newest=str(newest),
+        )
+        result.outcomes.append(
+            FileOutcome(
+                file_id=file_id,
+                file_name=name,
+                dataset=ds,
+                status="skipped",
+                error=_stale_dimension_note(file_date, newest),
+            )
+        )
+
+    for ds, group in dim_groups.items():
+        group.sort(key=lambda t: (t[1].file_date, str(t[0].get("name", ""))), reverse=True)
+        ledger_max = _ledger_loaded_max_file_date(warehouse, ds)
+        if ledger_max is not None:
+            kept = []
+            for entry, parsed in group:
+                if parsed.file_date < ledger_max:
+                    _skip_stale(
+                        str(entry.get("id", "")), str(entry.get("name", "")),
+                        ds, parsed.file_date, ledger_max,
+                    )
+                else:
+                    kept.append((entry, parsed))
+            dim_groups[ds] = kept
 
     if dry_run:
         for entry in targets:
@@ -551,13 +640,83 @@ async def sync_new_files(
                     status="dry_run",
                 )
             )
+        n_dry = len(targets)
+        for ds, group in dim_groups.items():
+            for i, (entry, _parsed) in enumerate(group):
+                n_dry += 1
+                result.outcomes.append(
+                    FileOutcome(
+                        file_id=str(entry["id"]),
+                        file_name=str(entry["name"]),
+                        dataset=ds,
+                        status="dry_run",
+                        error=None if i == 0 else (
+                            "fallback candidate — loads only if every newer "
+                            f"{ds} file fails"
+                        ),
+                    )
+                )
         result.finished_at = datetime.now(UTC)
-        result.notes = f"dry_run: would process {len(targets)} file(s)"
+        result.notes = f"dry_run: would process {n_dry} file(s)"
         return result
 
     sem = asyncio.Semaphore(max(1, settings.bpd_max_parallel_downloads))
-    coros = [_process_one_file(client, warehouse, settings, e, sem) for e in targets]
-    outcomes = await asyncio.gather(*coros, return_exceptions=False)
+
+    async def _process_dimensional_group(
+        ds: str, group: list[tuple[dict[str, Any], ParsedFilename]]
+    ) -> list[FileOutcome]:
+        """Newest-first; the first file that verifiably lands (loaded, or
+        already-loaded per ledger fingerprint) makes every older one stale.
+        A failing newest falls back to the next-newest instead of blocking it."""
+        outcomes: list[FileOutcome] = []
+        satisfied_date: Any = None
+        for entry, parsed in group:
+            if satisfied_date is not None:
+                logger.info(
+                    "stale_dimensional_snapshot_skipped",
+                    file_name=str(entry.get("name", "")),
+                    dataset=ds,
+                    file_date=str(parsed.file_date),
+                    newest=str(satisfied_date),
+                )
+                outcomes.append(
+                    FileOutcome(
+                        file_id=str(entry.get("id", "")),
+                        file_name=str(entry.get("name", "")),
+                        dataset=ds,
+                        status="skipped",
+                        error=_stale_dimension_note(parsed.file_date, satisfied_date),
+                    )
+                )
+                continue
+            outcome = await _process_one_file(client, warehouse, settings, entry, sem)
+            outcomes.append(outcome)
+            if outcome.status in ("loaded", "skipped"):
+                satisfied_date = parsed.file_date
+            else:
+                logger.warning(
+                    "dimensional_newest_failed_falling_back",
+                    dataset=ds,
+                    file_name=str(entry.get("name", "")),
+                    error=outcome.error,
+                )
+        return outcomes
+
+    coros: list[Any] = [
+        _process_one_file(client, warehouse, settings, e, sem) for e in targets
+    ]
+    group_coros = [
+        _process_dimensional_group(ds, group)
+        for ds, group in dim_groups.items()
+        if group
+    ]
+    gathered = await asyncio.gather(*coros, *group_coros, return_exceptions=False)
+    outcomes = []
+    for item in gathered:
+        if isinstance(item, list):
+            outcomes.extend(item)
+        else:
+            outcomes.append(item)
     result.outcomes.extend(outcomes)
 
     for o in outcomes:
@@ -597,6 +756,7 @@ async def sync_new_files(
         warehouse.ensure_views()
     except Exception as e:
         logger.warning("ensure_views_failed", error=str(e))
+    _log_unresolvable_roles(warehouse)
 
     result.finished_at = datetime.now(UTC)
     warehouse.log_sync(
@@ -609,6 +769,18 @@ async def sync_new_files(
         notes=result.notes,
     )
     return result
+
+
+def _log_unresolvable_roles(warehouse: Warehouse) -> None:
+    """Post-load warning pass over REQUIRED_ROLES (Patch #10). Log-only —
+    the hard gate is the roles_resolvable health check."""
+    try:
+        from .column_roles import validate_roles
+
+        for failure in validate_roles(warehouse):
+            logger.warning("role_unresolvable", **failure)
+    except Exception as e:
+        logger.warning("role_validation_failed", error=str(e))
 
 
 async def _remote_min_file_date(
@@ -768,12 +940,58 @@ async def reingest_local_files(
             continue
         targets.append((parsed, zp))
 
+    # Patch #10 stale-dimension guard (see the guard comment near the top of
+    # this module): regular files load ascending; dimensional datasets are
+    # grouped and tried NEWEST-FIRST — older candidates go stale only once a
+    # newer one verifiably loads, and files older than the ledger's loaded max
+    # skip outright.
+    regular: list[tuple[Any, Path]] = []
+    dim_groups: dict[str, list[tuple[Any, Path]]] = {}
+    for parsed, zp in targets:
+        ds = parsed.pattern.dataset
+        if _is_dimensional(ds):
+            dim_groups.setdefault(ds, []).append((parsed, zp))
+        else:
+            regular.append((parsed, zp))
+
+    def _skip_stale_local(zp: Path, ds: str, file_date: Any, newest: Any) -> None:
+        result.files_skipped += 1
+        logger.info(
+            "stale_dimensional_snapshot_skipped",
+            file_name=zp.name,
+            dataset=ds,
+            file_date=str(file_date),
+            newest=str(newest),
+        )
+        result.outcomes.append(
+            FileOutcome(
+                file_id=f"local:{zp.name}",
+                file_name=zp.name,
+                dataset=ds,
+                status="skipped",
+                error=_stale_dimension_note(file_date, newest),
+            )
+        )
+
+    for ds, group in dim_groups.items():
+        group.sort(key=lambda t: (t[0].file_date, t[1].name), reverse=True)
+        ledger_max = _ledger_loaded_max_file_date(warehouse, ds)
+        if ledger_max is not None:
+            kept: list[tuple[Any, Path]] = []
+            for parsed, zp in group:
+                if parsed.file_date < ledger_max:
+                    _skip_stale_local(zp, ds, parsed.file_date, ledger_max)
+                else:
+                    kept.append((parsed, zp))
+            dim_groups[ds] = kept
+
     # Ascending file_date so period-replace datasets end with the newest
     # generation per period, mirroring what live syncs would have produced.
-    targets.sort(key=lambda t: (t[0].file_date, t[1].name))
+    regular.sort(key=lambda t: (t[0].file_date, t[1].name))
+    n_targets = len(regular) + sum(len(g) for g in dim_groups.values())
 
     if dry_run:
-        for parsed, zp in targets:
+        for parsed, zp in regular:
             result.outcomes.append(
                 FileOutcome(
                     file_id=f"local:{zp.name}",
@@ -782,17 +1000,31 @@ async def reingest_local_files(
                     status="dry_run",
                 )
             )
+        for ds, group in dim_groups.items():
+            for i, (_parsed, zp) in enumerate(group):
+                result.outcomes.append(
+                    FileOutcome(
+                        file_id=f"local:{zp.name}",
+                        file_name=zp.name,
+                        dataset=ds,
+                        status="dry_run",
+                        error=None if i == 0 else (
+                            "fallback candidate — loads only if every newer "
+                            f"{ds} file fails"
+                        ),
+                    )
+                )
         result.finished_at = datetime.now(UTC)
-        result.notes = f"dry_run: would reingest {len(targets)} file(s) from raw_dir"
+        result.notes = f"dry_run: would reingest {n_targets} file(s) from raw_dir"
         return result
 
-    if targets and not warehouse.read_only:
+    if n_targets and not warehouse.read_only:
         try:
             create_backup(warehouse, settings, reason="pre-reingest")
         except Exception as e:
             logger.warning("auto_backup_failed", error=str(e))
 
-    for parsed, zp in targets:
+    async def _load_local(parsed: Any, zp: Path) -> FileOutcome:
         outcome = await _parse_and_load_zip(
             warehouse,
             parsed=parsed,
@@ -808,12 +1040,33 @@ async def reingest_local_files(
             result.files_loaded += 1
         elif outcome.status == "failed":
             result.files_failed += 1
+        return outcome
+
+    for parsed, zp in regular:
+        await _load_local(parsed, zp)
+    for ds, group in dim_groups.items():
+        satisfied_date: Any = None
+        for parsed, zp in group:
+            if satisfied_date is not None:
+                _skip_stale_local(zp, ds, parsed.file_date, satisfied_date)
+                continue
+            outcome = await _load_local(parsed, zp)
+            if outcome.status == "loaded":
+                satisfied_date = parsed.file_date
+            else:
+                logger.warning(
+                    "dimensional_newest_failed_falling_back",
+                    dataset=ds,
+                    file_name=zp.name,
+                    error=outcome.error,
+                )
     result.files_new = result.files_loaded + result.files_failed
 
     try:
         warehouse.ensure_views()
     except Exception as e:
         logger.warning("ensure_views_failed", error=str(e))
+    _log_unresolvable_roles(warehouse)
 
     result.finished_at = datetime.now(UTC)
     result.notes = "local reingest from raw_dir (no downloads)"
