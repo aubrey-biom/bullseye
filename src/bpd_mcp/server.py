@@ -730,10 +730,14 @@ async def bpd_get_upcoming_pos(
 @mcp.tool(
     name="bpd_get_forecast_vs_actual",
     description=(
-        "Join Target's DFE weekly forecast (forecast_weekly) with sales_weekly actuals. "
-        "Returns forecast_units, actual_units, variance_units, and variance_pct per "
-        "group. `aggregate` controls grouping: by_sku_week (default), "
-        "by_sku_location_week (most granular), or by_sku (collapses time)."
+        "Join Target's DFE weekly forecast (forecast_weekly) with sales_weekly actuals "
+        "on a coverage-honest (tcin, location, week) spine: only MATCHED cells produce "
+        "variance; unmatched forecast/actual volume is counted in extra.coverage (and "
+        "returned as rows only with include_unmatched=true) — never zero-filled. "
+        "variance_pct is a true percent (0-100 scale). weeks_back is clamped to actuals "
+        "coverage with the effective range echoed. snapshot_policy picks "
+        "latest_available (default) or pre_week forecast snapshots; extra.forecast_drops "
+        "classifies each snapshot as weekly_retrospective vs forward_horizon."
     ),
     annotations={
         "readOnlyHint": True,
@@ -748,6 +752,8 @@ async def bpd_get_forecast_vs_actual(
     tcin_filter: list[int] | None = None,
     location_filter: list[int] | None = None,
     aggregate: Literal["by_sku_week", "by_sku_location_week", "by_sku"] = "by_sku_week",
+    snapshot_policy: Literal["latest_available", "pre_week"] = "latest_available",
+    include_unmatched: bool = False,
     as_of_date: _date | None = None,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
@@ -759,6 +765,8 @@ async def bpd_get_forecast_vs_actual(
             tcin_filter=tcin_filter,
             location_filter=location_filter,
             aggregate=aggregate,
+            snapshot_policy=snapshot_policy,
+            include_unmatched=include_unmatched,
             as_of_date=as_of_date,
             response_format=response_format,
         ),

@@ -75,9 +75,11 @@ def _seed_real_columns(path: Path) -> Warehouse:
     wh.execute_sql(
         "INSERT INTO forecast_weekly VALUES "
         # Two snapshots of the same forecast week — different last_update_d.
-        "(100, 2750, '2026-05-04', DATE '2026-05-01', 55), "  # pre-week prediction
-        "(100, 2750, '2026-05-04', DATE '2026-05-12', 48), "  # post-week revised
-        "(200, 2750, '2026-05-04', DATE '2026-05-01', 10)"
+        # Week begins Sunday 2026-05-03 → canonical Saturday week-end 05-09,
+        # aligning with sales_weekly's sales_date above.
+        "(100, 2750, '2026-05-03', DATE '2026-05-01', 55), "  # pre-week prediction
+        "(100, 2750, '2026-05-03', DATE '2026-05-12', 48), "  # post-week revised
+        "(200, 2750, '2026-05-03', DATE '2026-05-01', 10)"
     )
     return wh
 
@@ -141,6 +143,9 @@ async def test_get_inventory_snapshot_works_with_real_column_names(tmp_path: Pat
 
 
 async def test_get_forecast_vs_actual_works_with_real_column_names(tmp_path: Path) -> None:
+    """Patch #11 semantics: coverage-honest spine. Only MATCHED (tcin, location,
+    week) cells produce variance — tcin 100's loc-3275 actuals have no forecast
+    and are counted in extra.coverage instead of inflating actual_units."""
     wh = _seed_real_columns(tmp_path)
     ro = ReadOnlyView(wh)
     try:
@@ -161,32 +166,52 @@ async def test_get_forecast_vs_actual_works_with_real_column_names(tmp_path: Pat
     by_tcin = {r["tcin"]: r for r in rows}
     # With as_of_date=2026-05-03 we use the 5/1 snapshot (55) not the 5/12 one (48).
     assert by_tcin[100]["forecast_units"] == 55
-    # Actual units for tcin 100 in sales_weekly: 50 + 30 = 80
-    assert by_tcin[100]["actual_units"] == 80
-    # variance_units = 80 - 55 = 25; variance_pct = 25/55 ≈ 0.4545
-    assert by_tcin[100]["variance_units"] == 25
-    assert abs(by_tcin[100]["variance_pct"] - 25 / 55) < 1e-6
+    # Matched cell only: loc 2750 actuals (50). Loc 3275's 30 units have no
+    # forecast — they are actual_only coverage, NOT silently added.
+    assert by_tcin[100]["actual_units"] == 50
+    assert by_tcin[100]["variance_units"] == -5
+    # variance_pct is now a true percent: 100 * -5 / 55 ≈ -9.09
+    assert abs(by_tcin[100]["variance_pct"] - (100 * -5 / 55)) < 1e-6
+    assert by_tcin[200]["forecast_units"] == 10
+    assert by_tcin[200]["actual_units"] == 12
+    cov = resp.data["coverage"]
+    assert cov["matched"]["cells"] == 2
+    assert cov["actual_only"]["cells"] == 1
+    assert cov["actual_only"]["actual_units"] == 30
 
 
-async def test_get_forecast_vs_actual_default_as_of_picks_pre_week(tmp_path: Path) -> None:
-    """When as_of_date is None, default cutoff = (week_start - 1 day)."""
+async def test_get_forecast_vs_actual_snapshot_policy(tmp_path: Path) -> None:
+    """Patch #11: default policy is latest_available (per-key retention keeps
+    one snapshot anyway); pre_week recovers the old pre-week-prediction pick."""
     wh = _seed_real_columns(tmp_path)
     ro = ReadOnlyView(wh)
     try:
-        resp = await get_forecast_vs_actual(
+        latest = await get_forecast_vs_actual(
             ro,
             ForecastVsActualInput(
                 weeks_back=104, aggregate="by_sku", response_format="json"
             ),
         )
+        pre_week = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104,
+                aggregate="by_sku",
+                snapshot_policy="pre_week",
+                response_format="json",
+            ),
+        )
     finally:
         wh.close()
-    assert resp.ok is True, resp.error
-    # Pre-week cutoff (2026-05-03) → only the 5/1 snapshot is eligible.
-    rows = {r["tcin"]: r for r in resp.data["rows"]}
-    assert rows[100]["forecast_units"] == 55
-    # Extra reports as_of_date used
-    assert "pre-week" in resp.data["as_of_date_used"]
+    assert latest.ok and pre_week.ok
+    latest_rows = {r["tcin"]: r for r in latest.data["rows"]}
+    pre_rows = {r["tcin"]: r for r in pre_week.data["rows"]}
+    # latest_available → the 5/12 post-week revision (48) wins.
+    assert latest_rows[100]["forecast_units"] == 48
+    assert "latest_available" in latest.data["snapshot_policy"]
+    # pre_week → only the 5/1 snapshot (55) is eligible (published before 5/03).
+    assert pre_rows[100]["forecast_units"] == 55
+    assert "pre_week" in pre_week.data["snapshot_policy"]
 
 
 async def test_get_forecast_vs_actual_diagnostic_error_when_column_missing(
@@ -354,8 +379,8 @@ async def test_forecast_vs_actual_canonicalizes_sunday_to_saturday(
     assert by_pair[(100, date(2026, 4, 25))]["actual_units"] == 50
     # variance_units = actual - forecast = 50 - 60 = -10
     assert by_pair[(100, date(2026, 4, 25))]["variance_units"] == -10
-    # variance_pct = -10/60 ≈ -0.1667
-    assert abs(by_pair[(100, date(2026, 4, 25))]["variance_pct"] - (-10 / 60)) < 1e-6
+    # variance_pct is a true percent (Patch #11): 100 * -10/60 ≈ -16.67
+    assert abs(by_pair[(100, date(2026, 4, 25))]["variance_pct"] - (100 * -10 / 60)) < 1e-6
 
     assert by_pair[(100, date(2026, 5, 2))]["forecast_units"] == 70
     assert by_pair[(100, date(2026, 5, 2))]["actual_units"] == 90
@@ -365,16 +390,40 @@ async def test_forecast_vs_actual_canonicalizes_sunday_to_saturday(
     assert by_pair[(100, date(2026, 5, 9))]["actual_units"] == 75
     assert by_pair[(100, date(2026, 5, 9))]["variance_units"] == -5
 
-    # Forecast-only: tcin 999 on week ending 5/9 — forecast 12, actual 0.
-    fc_only = by_pair.get((999, date(2026, 5, 9)))
-    assert fc_only is not None
-    assert fc_only["forecast_units"] == 12
-    assert fc_only["actual_units"] == 0
+    # Patch #11: unmatched cells are EXCLUDED from the default output — never
+    # zero-filled into fake variances — and counted in extra.coverage instead.
+    assert (999, date(2026, 5, 9)) not in by_pair, "forecast-only row must not appear"
+    assert (888, date(2026, 5, 2)) not in by_pair, "actual-only row must not appear"
+    cov = resp.data["coverage"]
+    assert cov["forecast_only"] == {"cells": 1, "forecast_units": 12, "actual_units": None}
+    assert cov["actual_only"] == {"cells": 1, "forecast_units": None, "actual_units": 5}
+    assert cov["matched"]["cells"] == 3
 
-    # Actual-only: tcin 888 on week ending 5/2 — forecast 0, actual 5.
-    act_only = by_pair.get((888, date(2026, 5, 2)))
-    assert act_only is not None
-    assert act_only["forecast_units"] == 0
+    # include_unmatched=true returns them with the missing side NULL (not 0).
+    wh2 = _seed_sunday_saturday_pairs(tmp_path / "again")
+    ro2 = ReadOnlyView(wh2)
+    try:
+        resp2 = await get_forecast_vs_actual(
+            ro2,
+            ForecastVsActualInput(
+                weeks_back=104,
+                aggregate="by_sku_week",
+                as_of_date=date(2026, 5, 12),
+                include_unmatched=True,
+                response_format="json",
+            ),
+        )
+    finally:
+        wh2.close()
+    by_pair2 = {(r["tcin"], r["week_end_date"]): r for r in resp2.data["rows"]}
+    fc_only = by_pair2[(999, date(2026, 5, 9))]
+    assert fc_only["coverage"] == "forecast_only"
+    assert fc_only["forecast_units"] == 12
+    assert fc_only["actual_units"] is None
+    assert fc_only["variance_pct"] is None
+    act_only = by_pair2[(888, date(2026, 5, 2))]
+    assert act_only["coverage"] == "actual_only"
+    assert act_only["forecast_units"] is None
     assert act_only["actual_units"] == 5
 
     # Extra surfaces the shift so future-debugging is one tool call away.
@@ -675,3 +724,337 @@ async def test_get_upcoming_pos_bad_date_value_degrades_to_skipped_table(
         assert "probe failed" in resp.data["skipped_tables"]["po_plan_biweekly"]
     finally:
         wh.close()
+
+
+# --------- Patch #11: forecast_vs_actual honesty features ---------
+
+
+async def test_forecast_window_clamps_to_actuals_coverage(tmp_path: Path) -> None:
+    """A 104-week ask over ~3 weeks of actuals reports its effective range
+    instead of silently truncating (4e)."""
+    wh = _seed_sunday_saturday_pairs(tmp_path)
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104,
+                aggregate="by_sku_week",
+                as_of_date=date(2026, 5, 12),
+                response_format="json",
+            ),
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    assert resp.data["requested_weeks_back"] == 104
+    assert resp.data["effective_start"] == "2026-04-25"
+    assert resp.data["effective_end"] == "2026-05-09"
+    assert resp.data["effective_weeks_covered"] == 3
+    assert resp.data["window_truncated_to_actuals_coverage"] is True
+
+
+async def test_forecast_no_overlap_returns_data_unavailable(tmp_path: Path) -> None:
+    """Actuals entirely outside the requested window → structured error, not
+    an empty table that reads as 'zero variance'."""
+    from datetime import timedelta
+
+    from bpd_mcp.warehouse import Warehouse
+
+    future = (date.today() + timedelta(days=30)).isoformat()
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+        "fiscal_week_begin_d VARCHAR, last_update_d DATE, selected_forecast_q BIGINT)"
+    )
+    wh.execute_sql(
+        f"INSERT INTO forecast_weekly VALUES (100, 1, '{future}', DATE '{future}', 5)"
+    )
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql(
+        f"INSERT INTO sales_weekly VALUES (100, 1, DATE '{future}', 9)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_forecast_vs_actual(
+            ro, ForecastVsActualInput(weeks_back=1, response_format="json")
+        )
+    finally:
+        wh.close()
+    assert resp.ok is False
+    assert resp.error.code == "DATA_UNAVAILABLE"
+    assert "does not overlap" in resp.error.message
+
+
+async def test_forecast_drops_classified_and_pre_week_never_zero_fills(
+    tmp_path: Path,
+) -> None:
+    """4a + 4b together. forecast_weekly holds a forward-horizon drop and a
+    post-hoc retrospective drop. extra.forecast_drops labels both. Under
+    pre_week, a week whose forecast exists ONLY post-hoc becomes unmatched —
+    not a fabricated forecast=0 row; under latest_available it matches."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+        "fiscal_week_begin_d VARCHAR, last_update_d DATE, selected_forecast_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO forecast_weekly VALUES "
+        # Forward-horizon drop: 3 weeks published 04-18, before any of them.
+        "(100, 1, '2026-04-19', DATE '2026-04-18', 60), "
+        "(100, 1, '2026-04-26', DATE '2026-04-18', 70), "
+        "(100, 1, '2026-05-03', DATE '2026-04-18', 80), "
+        # Retrospective drop: week 05-10 published 06-01 — AFTER the week.
+        "(100, 1, '2026-05-10', DATE '2026-06-01', 40)"
+    )
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO sales_weekly VALUES "
+        "(100, 1, DATE '2026-04-25', 50), "
+        "(100, 1, DATE '2026-05-02', 90), "
+        "(100, 1, DATE '2026-05-09', 75), "
+        "(100, 1, DATE '2026-05-16', 33)"   # week whose forecast is post-hoc only
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        latest = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104, aggregate="by_sku_week", response_format="json"
+            ),
+        )
+        pre = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104,
+                aggregate="by_sku_week",
+                snapshot_policy="pre_week",
+                response_format="json",
+            ),
+        )
+    finally:
+        wh.close()
+    assert latest.ok and pre.ok, (latest.error, pre.error)
+
+    # Drop classification (4b).
+    drops = {d["last_update_d"]: d for d in latest.data["forecast_drops"]}
+    assert drops["2026-04-18"]["drop_kind"] == "forward_horizon"
+    assert drops["2026-04-18"]["horizon_weeks"] == 3
+    assert drops["2026-06-01"]["drop_kind"] == "weekly_retrospective"
+
+    # latest_available: the post-hoc 05-16 forecast matches its actuals.
+    latest_pairs = {(r["tcin"], str(r["week_end_date"])): r for r in latest.data["rows"]}
+    assert latest_pairs[(100, "2026-05-16")]["forecast_units"] == 40
+
+    # pre_week: that week's only snapshot is post-hoc → unmatched, NOT zero.
+    pre_pairs = {(r["tcin"], str(r["week_end_date"])): r for r in pre.data["rows"]}
+    assert (100, "2026-05-16") not in pre_pairs
+    assert pre.data["coverage"]["actual_only"]["cells"] == 1
+    assert pre.data["coverage"]["actual_only"]["actual_units"] == 33
+    # The three forward-horizon weeks still match under pre_week.
+    assert pre.data["coverage"]["matched"]["cells"] == 3
+    # Snapshot-lag honesty: the post-hoc drop is visible in the lag stats.
+    assert pre.data["snapshot_lag"]["post_hoc_rows"] == 1
+
+
+async def test_forecast_dedup_keeps_all_locations_when_sales_is_chain_level(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix (critical): snapshot dedup must run at the
+    FORECAST table's own grain. With per-location forecasts and chain-level
+    sales, the dedup partition previously collapsed to (tcin, week) and kept
+    ONE arbitrary store's forecast — here that read 60 (or 40) instead of 100."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+        "fiscal_week_begin_d VARCHAR, last_update_d DATE, selected_forecast_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO forecast_weekly VALUES "
+        "(100, 1, '2026-05-03', DATE '2026-05-01', 60), "
+        "(100, 2, '2026-05-03', DATE '2026-05-01', 40)"
+    )
+    # Chain-level sales: NO location column.
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql("INSERT INTO sales_weekly VALUES (100, DATE '2026-05-09', 95)")
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104, aggregate="by_sku_week", response_format="json"
+            ),
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    assert resp.data["spine"] == "tcin, week"
+    row = resp.data["rows"][0]
+    assert row["forecast_units"] == 100, "both locations' forecasts must survive dedup"
+    assert row["actual_units"] == 95
+    assert row["variance_units"] == -5
+    assert resp.data["coverage"]["matched"]["forecast_units"] == 100
+
+
+async def test_forecast_snapshot_cutoff_requires_snapshot_column(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix: pre_week / as_of_date against a forecast table
+    with no snapshot column must ERROR, not silently no-op while extra claims
+    the cutoff was applied."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+        "fiscal_week_begin_d VARCHAR, selected_forecast_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO forecast_weekly VALUES (100, 1, '2026-05-03', 55)"
+    )
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO sales_weekly VALUES (100, 1, DATE '2026-05-09', 50)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        pre = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104, snapshot_policy="pre_week", response_format="json"
+            ),
+        )
+        fixed = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104, as_of_date=date(2026, 4, 1), response_format="json"
+            ),
+        )
+        default = await get_forecast_vs_actual(
+            ro, ForecastVsActualInput(weeks_back=104, response_format="json")
+        )
+    finally:
+        wh.close()
+    assert pre.ok is False and pre.error.code == "SCHEMA_INCOMPATIBLE"
+    assert "snapshot" in pre.error.message
+    assert fixed.ok is False and fixed.error.code == "SCHEMA_INCOMPATIBLE"
+    # Default latest_available works and says so honestly.
+    assert default.ok is True, default.error
+    assert "no snapshot column" in default.data["snapshot_policy"]
+
+
+async def test_forecast_drops_forward_labels_survive_decay_and_cap_keeps_newest(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fixes: (a) a decayed forward drop (single surviving
+    week, published before it) and a genuine one-week-ahead forward drop are
+    forward_horizon, not 'anomalous'; (b) with >40 snapshots the NEWEST are
+    kept, so the current forward_horizon drop is always visible."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+        "fiscal_week_begin_d VARCHAR, last_update_d DATE, selected_forecast_q BIGINT)"
+    )
+    # 44 decayed weekly forward residues: snapshot each Friday before its one
+    # surviving week (Sunday), Jan 2025 onward.
+    rows = []
+    from datetime import timedelta
+
+    week0 = date(2025, 1, 5)  # a Sunday
+    for i in range(44):
+        wk = week0 + timedelta(weeks=i)
+        snap = wk - timedelta(days=2)
+        rows.append(f"(100, 1, '{wk.isoformat()}', DATE '{snap.isoformat()}', 10)")
+    # Newest drop: a genuine 3-week forward horizon.
+    horizon_snap = week0 + timedelta(weeks=45)
+    for j in range(3):
+        wk = horizon_snap + timedelta(days=1 + 7 * j)
+        rows.append(
+            f"(100, 1, '{wk.isoformat()}', DATE '{horizon_snap.isoformat()}', 20)"
+        )
+    wh.execute_sql("INSERT INTO forecast_weekly VALUES " + ", ".join(rows))
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql(
+        f"INSERT INTO sales_weekly VALUES "
+        f"(100, 1, DATE '{(week0 + timedelta(days=6)).isoformat()}', 9)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_forecast_vs_actual(
+            ro, ForecastVsActualInput(weeks_back=104, response_format="json")
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    drops = resp.data["forecast_drops"]
+    assert len(drops) == 40
+    assert resp.data["forecast_drops_total"] == 45
+    kinds = {d["last_update_d"]: d["drop_kind"] for d in drops}
+    # The newest (multi-week forward) drop MUST be present and labeled forward.
+    assert kinds[horizon_snap.isoformat()] == "forward_horizon"
+    # Decayed single-week forward residues are forward_horizon, not anomalous.
+    residue_kinds = {
+        k for d, k in kinds.items() if d != horizon_snap.isoformat()
+    }
+    assert residue_kinds == {"forward_horizon"}
+
+
+async def test_forecast_lag_probe_failure_keeps_drop_classification(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix: a failing snapshot-lag probe must not discard a
+    successful drop classification or misattribute the error."""
+
+    wh = _seed_sunday_saturday_pairs(tmp_path)
+
+    class _FlakyLag:
+        """Proxy that fails only the lag query (FILTER (WHERE ...))."""
+
+        def __init__(self, inner: Warehouse) -> None:
+            self._inner = inner
+
+        @property
+        def read_only(self) -> bool:
+            return self._inner.read_only
+
+        def execute_sql(self, sql: str):
+            if "FILTER (WHERE" in sql:
+                raise RuntimeError("transient lock contention")
+            return self._inner.execute_sql(sql)
+
+    try:
+        resp = await get_forecast_vs_actual(
+            _FlakyLag(wh),
+            ForecastVsActualInput(
+                weeks_back=104,
+                as_of_date=date(2026, 5, 12),
+                response_format="json",
+            ),
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    drops = resp.data["forecast_drops"]
+    assert all("error" not in d for d in drops), "classification must survive"
+    assert resp.data.get("snapshot_lag") is None
+    assert "lag probe failed" in resp.data["snapshot_lag_error"]

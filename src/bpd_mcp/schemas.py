@@ -345,15 +345,32 @@ class ForecastVsActualInput(_BaseModel):
             "`by_sku_location_week` is the most granular; `by_sku` collapses time."
         ),
     )
+    snapshot_policy: Literal["latest_available", "pre_week"] = Field(
+        default="latest_available",
+        description=(
+            "Which forecast snapshot to compare (Patch #11). 'latest_available' "
+            "(default): the newest snapshot per (tcin, location, week) — ingest "
+            "retains exactly one per key anyway, since last_update_d is not in "
+            "the natural key. 'pre_week': only snapshots published BEFORE each "
+            "week began (Target's true pre-week prediction); weeks whose "
+            "forecast only exists post-hoc become unmatched instead of being "
+            "zero-filled."
+        ),
+    )
+    include_unmatched: bool = Field(
+        default=False,
+        description=(
+            "Also return forecast-only / actual-only rows (with the missing "
+            "side NULL, never fabricated as 0). Unmatched volume is always "
+            "counted in extra.coverage regardless."
+        ),
+    )
     as_of_date: _date | None = Field(
         default=None,
         description=(
-            "Forecast snapshot cutoff. forecast_weekly contains multiple snapshots "
-            "over time (different last_update_d values per (tcin, location, week)). "
-            "When set, only forecasts with last_update_d <= as_of_date are considered, "
-            "and the latest within that window is used. When omitted, defaults to "
-            "the day before each forecast week begins — giving you the pre-week "
-            "prediction Target actually published, not a post-hoc revised one."
+            "Explicit forecast snapshot cutoff: only snapshots with "
+            "last_update_d <= as_of_date are considered (latest within the "
+            "window wins). Overrides snapshot_policy."
         ),
     )
     response_format: ResponseFormat = "markdown"

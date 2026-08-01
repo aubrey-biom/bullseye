@@ -839,15 +839,84 @@ async def get_upcoming_pos(
 # ---------- bpd_get_forecast_vs_actual ----------
 
 
+def _classify_forecast_drops(
+    warehouse: Warehouse, week_begin_day: str, snap_day: str
+) -> list[dict[str, Any]]:
+    """Per-snapshot drop summary for forecast_weekly (Patch #11).
+
+    Target ships two structurally different drops into the same file pattern:
+    weekly retrospectives (one week, published AFTER it) and forward horizons
+    (many weeks, published before they start). Classified at query time from
+    whatever rows survived ingest — nothing is persisted, because the per-key
+    overwrite retention would stale any parse-time stamp. Consumers wanting
+    "Target's current forward forecast" should read the most recent
+    forward_horizon drop — NOT max(last_update_d), which is usually a tiny
+    retrospective file (the §6 10x-understatement trap).
+    """
+    from datetime import timedelta as _td
+
+    _, rows = warehouse.execute_sql(
+        f"SELECT {snap_day} AS snap, "
+        f"COUNT(DISTINCT {week_begin_day}) AS horizon_weeks, "
+        f"MIN({week_begin_day}) AS min_week, "
+        f"MAX({week_begin_day}) AS max_week, "
+        "COUNT(*) AS n_rows "
+        "FROM forecast_weekly GROUP BY 1 ORDER BY 1"
+    )
+    out: list[dict[str, Any]] = []
+    for snap, horizon_weeks, min_week, max_week, n_rows in rows:
+        # Published on/before its first covered week (+7d tolerance) → forward,
+        # REGARDLESS of how many weeks survive: per-key overwrites decay old
+        # forward drops to single-week residues, and genuine one-week-ahead
+        # forward files exist — both are forward-published (review fix: the old
+        # horizon_weeks>1 requirement made 'anomalous' the steady-state label).
+        if snap is None or min_week is None:
+            kind = "anomalous"
+        elif snap <= min_week + _td(days=7):
+            kind = "forward_horizon"
+        elif horizon_weeks == 1:
+            kind = "weekly_retrospective"
+        else:
+            kind = "anomalous"  # published after some covered weeks began
+        out.append(
+            {
+                "last_update_d": str(snap),
+                "drop_kind": kind,
+                "horizon_weeks": horizon_weeks,
+                "min_week_begin": str(min_week),
+                "max_week_begin": str(max_week),
+                "rows": n_rows,
+            }
+        )
+    return out
+
+
 async def get_forecast_vs_actual(
     warehouse: Warehouse, params: ForecastVsActualInput
 ) -> ToolResponse:
-    """Join Target's DFE weekly forecast with sales_weekly actuals.
+    """Join Target's DFE weekly forecast with sales_weekly actuals (Patch #11).
 
-    Pre-week vs post-hoc forecast: forecast_weekly contains multiple snapshots
-    per (tcin, location, week). When `as_of_date` is omitted (default), we pick
-    the latest forecast published before the week begins — Target's pre-week
-    prediction. Set `as_of_date` explicitly to lock the cutoff.
+    Design points (all from the verified defect-spec review):
+      * Coverage-honest spine: both sides are aggregated to the finest common
+        grain — (tcin, location, week) when both tables have a location column
+        — and only MATCHED cells produce variance rows. Unmatched cells
+        (forecast with no actuals, or vice versa) are never zero-filled into
+        fake -100%/+inf variances; they are counted in `extra.coverage` and
+        returned as rows only when `include_unmatched=true`.
+      * snapshot_policy: 'latest_available' (default — ingest retains exactly
+        one snapshot per key anyway, since last_update_d is not in the natural
+        key) or 'pre_week' (only snapshots published before each week began —
+        Target's true pre-week prediction; weeks whose forecast was published
+        post-hoc become unmatched). An explicit as_of_date overrides both with
+        a fixed cutoff.
+      * weeks_back is clamped to actuals coverage and the effective range is
+        echoed — a 12-week ask over 8 weeks of data reports itself instead of
+        silently truncating (and both sides window on the same canonical
+        Saturday week-end anchor).
+      * variance_pct is a true percentage (x100, 0-100 scale like Target's
+        _percentage columns).
+      * extra.forecast_drops classifies each forecast snapshot as
+        weekly_retrospective / forward_horizon / anomalous.
     """
     fmt = params.response_format
     if not table_exists(warehouse, "forecast_weekly"):
@@ -864,161 +933,242 @@ async def get_forecast_vs_actual(
         act_tcin = resolve_column(warehouse, "sales_weekly", "tcin")
     except ColumnNotFound as e:
         return _column_not_found_error(e, fmt=fmt)
-    try:
-        fc_snap = resolve_column(warehouse, "forecast_weekly", "snapshot_date")
-    except ColumnNotFound:
-        fc_snap = None
-    try:
-        fc_loc = resolve_column(warehouse, "forecast_weekly", "location")
-    except ColumnNotFound:
-        fc_loc = None
-    try:
-        act_loc = resolve_column(warehouse, "sales_weekly", "location")
-    except ColumnNotFound:
-        act_loc = None
+    fc_snap = _try_resolve(warehouse, "forecast_weekly", "snapshot_date")
+    fc_loc = _try_resolve(warehouse, "forecast_weekly", "location")
+    act_loc = _try_resolve(warehouse, "sales_weekly", "location")
 
     fc_date_expr = fc_date.select_as_date()
     act_date_expr = act_date.select_as_date()
 
     # Patch #5: forecast_weekly uses Sunday-anchored fiscal_week_begin_d while
-    # sales_weekly uses Saturday-anchored sales_date. Pre-fix, the FULL OUTER
-    # JOIN on week_end_date produced ZERO matches because the two sides were
-    # always 6 days apart. Canonicalize both to week-end (Saturday) when
-    # joining: if the resolved forecast date column is a week-BEGIN field,
-    # shift +6 days. Otherwise leave it alone (some Target variants ship a
-    # week-end column directly).
+    # sales_weekly uses Saturday-anchored sales_date. Canonicalize both sides
+    # to the Saturday week-END; keep a week-BEGIN expr for the pre-week policy
+    # and drop classification.
     fc_name_lower = fc_date.name.lower()
     fc_is_week_begin = "begin" in fc_name_lower or "start" in fc_name_lower
     if fc_is_week_begin:
-        # DuckDB's DATE + INTERVAL returns TIMESTAMP; cast back to DATE so the
-        # join column type matches sales_weekly's pure DATE.
         fc_week_end_expr = f"CAST({fc_date_expr} + INTERVAL 6 DAY AS DATE)"
+        fc_week_begin_expr = fc_date_expr
     else:
         fc_week_end_expr = fc_date_expr
+        fc_week_begin_expr = f"CAST({fc_date_expr} - INTERVAL 6 DAY AS DATE)"
 
+    # ---- effective window: requested weeks_back clamped to actuals coverage.
     weeks_back = int(params.weeks_back)
+    try:
+        _, cov = warehouse.execute_sql(
+            f"SELECT MIN(CAST({act_date_expr} AS DATE)), "
+            f"MAX(CAST({act_date_expr} AS DATE)) FROM sales_weekly"
+        )
+    except Exception as e:
+        return make_error_response(
+            code="SQL_EXECUTION_FAILED",
+            message=f"actuals coverage probe failed: {e}",
+            fmt=fmt,
+        )
+    act_min, act_max = (cov[0] if cov else (None, None))
+    if act_min is None:
+        return make_error_response(
+            code="DATA_UNAVAILABLE",
+            message="sales_weekly exists but contains no rows yet — run bpd_sync_new_files.",
+            fmt=fmt,
+        )
+    from datetime import timedelta as _td
+
+    def _as_date(v: Any) -> date:
+        return v if isinstance(v, date) else date.fromisoformat(str(v)[:10])
+
+    act_min, act_max = _as_date(act_min), _as_date(act_max)
+    requested_start = date.today() - _td(weeks=weeks_back)
+    requested_end = date.today()
+    effective_start = max(requested_start, act_min)
+    effective_end = min(requested_end, act_max)
+    if effective_start > effective_end:
+        return make_error_response(
+            code="DATA_UNAVAILABLE",
+            message=(
+                f"requested window {requested_start} → {requested_end} does not "
+                f"overlap actuals coverage {act_min} → {act_max}."
+            ),
+            details={
+                "requested_start": str(requested_start),
+                "requested_end": str(requested_end),
+                "actuals_min": str(act_min),
+                "actuals_max": str(act_max),
+            },
+            fmt=fmt,
+        )
+    truncated = effective_start > requested_start or effective_end < requested_end
+
+    # ---- spine: (tcin, location, week) when both sides have a location.
+    spine_has_location = fc_loc is not None and act_loc is not None
+    if params.aggregate == "by_sku_location_week" and not spine_has_location:
+        return make_error_response(
+            code="SCHEMA_INCOMPATIBLE",
+            message="by_sku_location_week requires a location column on both tables.",
+            fmt=fmt,
+        )
+    if params.location_filter and not spine_has_location:
+        return make_error_response(
+            code="SCHEMA_INCOMPATIBLE",
+            message=(
+                "location_filter supplied but one of the tables lacks a "
+                f"location column (forecast loc={fc_loc and fc_loc.name}, "
+                f"sales loc={act_loc and act_loc.name})"
+            ),
+            fmt=fmt,
+        )
+
+    # ---- per-side filters (tcin/location/effective window).
     fc_where: list[str] = [
-        f"{fc_date_expr} >= current_date - INTERVAL '{weeks_back} weeks'",
-        f"{fc_date_expr} <= current_date",
+        f"CAST({fc_week_end_expr} AS DATE) >= DATE '{effective_start.isoformat()}'",
+        f"CAST({fc_week_end_expr} AS DATE) <= DATE '{effective_end.isoformat()}'",
     ]
     act_where: list[str] = [
-        f"{act_date_expr} >= current_date - INTERVAL '{weeks_back} weeks'",
-        f"{act_date_expr} <= current_date",
+        f"CAST({act_date_expr} AS DATE) >= DATE '{effective_start.isoformat()}'",
+        f"CAST({act_date_expr} AS DATE) <= DATE '{effective_end.isoformat()}'",
     ]
     if params.tcin_filter:
-        fc_in = ",".join(str(int(v)) for v in params.tcin_filter)
-        fc_where.append(f"{quote_ident(fc_tcin.name)} IN ({fc_in})")
-        act_where.append(f"{quote_ident(act_tcin.name)} IN ({fc_in})")
+        tcin_in = ",".join(str(int(v)) for v in params.tcin_filter)
+        fc_where.append(f"{quote_ident(fc_tcin.name)} IN ({tcin_in})")
+        act_where.append(f"{quote_ident(act_tcin.name)} IN ({tcin_in})")
     if params.location_filter:
-        if fc_loc is None or act_loc is None:
-            return make_error_response(
-                code="SCHEMA_INCOMPATIBLE",
-                message=(
-                    "location_filter supplied but one of the tables lacks a "
-                    f"location column (forecast loc={fc_loc and fc_loc.name}, "
-                    f"sales loc={act_loc and act_loc.name})"
-                ),
-                fmt=fmt,
-            )
         loc_in = ",".join(str(int(v)) for v in params.location_filter)
         fc_where.append(f"{quote_ident(fc_loc.name)} IN ({loc_in})")
         act_where.append(f"{quote_ident(act_loc.name)} IN ({loc_in})")
 
-    # Snapshot disambiguation: forecast_weekly may have multiple snapshots
-    # (last_update_d) per week. Pick the latest snapshot ≤ as_of_date so we
-    # don't accidentally compare against Target's revised post-hoc forecast.
-    snap_cte = ""
+    # ---- snapshot policy → optional cutoff inside the ranked CTE.
+    # A cutoff is only enforceable when a snapshot column exists; requesting
+    # one against a table that lacks it is a hard error, never a silent no-op
+    # with metadata claiming otherwise (adversarial-review fix).
+    policy = params.snapshot_policy
+    if fc_snap is None and (params.as_of_date is not None or policy == "pre_week"):
+        return make_error_response(
+            code="SCHEMA_INCOMPATIBLE",
+            message=(
+                "snapshot_policy='pre_week' / as_of_date need a forecast "
+                "snapshot column (role 'snapshot_date', e.g. last_update_d), "
+                "which forecast_weekly does not have — the cutoff cannot be "
+                "enforced. Use the default snapshot_policy='latest_available'."
+            ),
+            fmt=fmt,
+        )
+    if params.as_of_date is not None:
+        cutoff_sql: str | None = f"DATE '{params.as_of_date.isoformat()}'"
+        cutoff_desc = f"fixed as_of_date {params.as_of_date.isoformat()}"
+    elif policy == "pre_week":
+        cutoff_sql = f"({fc_week_begin_expr} - INTERVAL 1 DAY)"
+        cutoff_desc = "pre_week (snapshot published before each week began)"
+    elif fc_snap is None:
+        cutoff_sql = None
+        cutoff_desc = "latest_available (table has no snapshot column)"
+    else:
+        cutoff_sql = None
+        cutoff_desc = "latest_available (no snapshot cutoff)"
+
+    spine_cols = ["tcin"] + (["location_id"] if spine_has_location else []) + ["week_end_date"]
+    spine_key = ", ".join(spine_cols)
+
     if fc_snap is not None:
         snap_date_expr = fc_snap.select_as_date()
-        # `as_of_date` defaults to "the day before each forecast week begins"
-        # so we get the prediction Target actually published pre-week.
-        if params.as_of_date is None:
-            cutoff_expr = f"({fc_date_expr} - INTERVAL '1 day')"
-        else:
-            cutoff_expr = f"DATE '{params.as_of_date.isoformat()}'"
-        partition_cols = [quote_ident(fc_tcin.name), fc_date_expr]
+        # Snapshot dedup MUST run at the forecast table's OWN grain — include
+        # the forecast location column whenever it exists, independent of the
+        # spine. Partitioning only by the (coarser) spine collapsed every
+        # location's forecast to one arbitrary row when sales_weekly was
+        # chain-level (adversarial-review fix: critical). The units tiebreak
+        # keeps equal-snapshot duplicates deterministic across queries.
+        partition_cols = [quote_ident(fc_tcin.name), fc_week_end_expr]
         if fc_loc is not None:
             partition_cols.insert(1, quote_ident(fc_loc.name))
-        snap_cte = f"""
+        snap_where = f"WHERE {snap_date_expr} <= {cutoff_sql} AND " if cutoff_sql else "WHERE "
+        fc_source_cte = f"""
             ranked_fc AS (
                 SELECT *,
                        ROW_NUMBER() OVER (
                            PARTITION BY {", ".join(partition_cols)}
-                           ORDER BY {snap_date_expr} DESC
+                           ORDER BY {snap_date_expr} DESC,
+                                    {quote_ident(fc_units.name)} DESC
                        ) AS _snap_rn
                 FROM forecast_weekly
-                WHERE {snap_date_expr} <= {cutoff_expr}
-                  AND {' AND '.join(fc_where)}
+                {snap_where}{" AND ".join(fc_where)}
             ),
-            fc_src AS (SELECT * FROM ranked_fc WHERE _snap_rn = 1),
-        """
-        fc_from_clause = "fc_src"
-        fc_where_clause = ""  # already applied inside ranked_fc
+            fc_src AS (SELECT * FROM ranked_fc WHERE _snap_rn = 1),"""
+        fc_cells_from = "fc_src"
+        fc_cells_where = ""
     else:
-        fc_from_clause = "forecast_weekly"
-        fc_where_clause = f"WHERE {' AND '.join(fc_where)}"
-
-    # Build the projection / GROUP BY based on aggregate mode.
-    if params.aggregate == "by_sku":
-        group_cols = ("tcin",)
-        select_join_key = "tcin"
-    elif params.aggregate == "by_sku_location_week":
-        if fc_loc is None or act_loc is None:
-            return make_error_response(
-                code="SCHEMA_INCOMPATIBLE",
-                message="by_sku_location_week requires a location column on both tables.",
-                fmt=fmt,
-            )
-        group_cols = ("tcin", "location_id", "week_end_date")
-        select_join_key = "tcin, location_id, week_end_date"
-    else:  # by_sku_week (default)
-        group_cols = ("tcin", "week_end_date")
-        select_join_key = "tcin, week_end_date"
+        fc_source_cte = ""
+        fc_cells_from = "forecast_weekly"
+        fc_cells_where = f"WHERE {' AND '.join(fc_where)}"
 
     fc_loc_proj = (
-        f"{quote_ident(fc_loc.name)} AS location_id, " if (fc_loc and "location_id" in group_cols) else ""
+        f"{quote_ident(fc_loc.name)} AS location_id, " if spine_has_location else ""
     )
     act_loc_proj = (
-        f"{quote_ident(act_loc.name)} AS location_id, " if (act_loc and "location_id" in group_cols) else ""
-    )
-    # Project the canonical Saturday week-end on BOTH sides so the join works.
-    fc_week_proj = (
-        f"{fc_week_end_expr} AS week_end_date, " if "week_end_date" in group_cols else ""
-    )
-    act_week_proj = (
-        f"{act_date_expr} AS week_end_date, " if "week_end_date" in group_cols else ""
+        f"{quote_ident(act_loc.name)} AS location_id, " if spine_has_location else ""
     )
 
-    sql = f"""
-        WITH {snap_cte}
-        fc AS (
-            SELECT {quote_ident(fc_tcin.name)} AS tcin, {fc_loc_proj}{fc_week_proj}
-                   SUM({quote_ident(fc_units.name)}) AS forecast_units
-            FROM {fc_from_clause}
-            {fc_where_clause}
-            GROUP BY {select_join_key}
+    cte_prefix = f"""
+        WITH {fc_source_cte}
+        fc_cells AS (
+            SELECT {quote_ident(fc_tcin.name)} AS tcin, {fc_loc_proj}
+                   CAST({fc_week_end_expr} AS DATE) AS week_end_date,
+                   COALESCE(SUM({quote_ident(fc_units.name)}), 0) AS forecast_units
+            FROM {fc_cells_from}
+            {fc_cells_where}
+            GROUP BY {spine_key}
         ),
-        act AS (
-            SELECT {quote_ident(act_tcin.name)} AS tcin, {act_loc_proj}{act_week_proj}
-                   SUM({quote_ident(act_units.name)}) AS actual_units
+        act_cells AS (
+            SELECT {quote_ident(act_tcin.name)} AS tcin, {act_loc_proj}
+                   CAST({act_date_expr} AS DATE) AS week_end_date,
+                   COALESCE(SUM({quote_ident(act_units.name)}), 0) AS actual_units
             FROM sales_weekly
-            WHERE {' AND '.join(act_where)}
-            GROUP BY {select_join_key}
+            WHERE {" AND ".join(act_where)}
+            GROUP BY {spine_key}
+        ),
+        all_cells AS (
+            SELECT {spine_key}, forecast_units, actual_units,
+                   CASE WHEN forecast_units IS NOT NULL AND actual_units IS NOT NULL
+                        THEN 'matched'
+                        WHEN forecast_units IS NOT NULL THEN 'forecast_only'
+                        ELSE 'actual_only' END AS coverage
+            FROM fc_cells FULL OUTER JOIN act_cells USING ({spine_key})
         )
-        SELECT {select_join_key},
-               COALESCE(fc.forecast_units, 0) AS forecast_units,
-               COALESCE(act.actual_units, 0) AS actual_units,
-               (COALESCE(act.actual_units, 0) - COALESCE(fc.forecast_units, 0)) AS variance_units,
-               CASE WHEN COALESCE(fc.forecast_units, 0) = 0 THEN NULL
-                    ELSE (COALESCE(act.actual_units, 0) - fc.forecast_units) * 1.0
-                         / fc.forecast_units
+    """
+
+    # Output grouping per the requested aggregate.
+    if params.aggregate == "by_sku":
+        group_key = "tcin"
+    elif params.aggregate == "by_sku_location_week":
+        group_key = "tcin, location_id, week_end_date"
+    else:  # by_sku_week
+        group_key = "tcin, week_end_date"
+
+    coverage_filter = "" if params.include_unmatched else "WHERE coverage = 'matched'"
+    sql = f"""{cte_prefix}
+        SELECT {group_key}, coverage,
+               SUM(forecast_units) AS forecast_units,
+               SUM(actual_units) AS actual_units,
+               COUNT(*) AS cell_count,
+               SUM(actual_units) - SUM(forecast_units) AS variance_units,
+               CASE WHEN COALESCE(SUM(forecast_units), 0) = 0 THEN NULL
+                    ELSE (SUM(actual_units) - SUM(forecast_units)) * 100.0
+                         / SUM(forecast_units)
                END AS variance_pct
-        FROM fc FULL OUTER JOIN act USING ({select_join_key})
-        ORDER BY {select_join_key}
+        FROM all_cells
+        {coverage_filter}
+        GROUP BY {group_key}, coverage
+        ORDER BY {group_key}, coverage
         LIMIT 2000
+    """
+    coverage_sql = f"""{cte_prefix}
+        SELECT coverage, COUNT(*) AS cells,
+               SUM(forecast_units) AS forecast_units,
+               SUM(actual_units) AS actual_units
+        FROM all_cells GROUP BY coverage
     """
     try:
         out_cols, rows = warehouse.execute_sql(sql)
+        _, cov_rows = warehouse.execute_sql(coverage_sql)
     except Exception as e:
         return make_error_response(
             code="SQL_EXECUTION_FAILED",
@@ -1026,31 +1176,93 @@ async def get_forecast_vs_actual(
             details={"sql": sql},
             fmt=fmt,
         )
+    coverage_summary = {
+        r[0]: {"cells": r[1], "forecast_units": r[2], "actual_units": r[3]}
+        for r in cov_rows
+    }
+
+    # Best-effort honesty metadata: drop classification + snapshot lag.
+    # Separate try/excepts (review fix): a lag-query failure must not discard
+    # a successful classification or misattribute the error.
+    forecast_drops: list[dict[str, Any]] | None = None
+    snapshot_lag: dict[str, Any] | None = None
+    snapshot_lag_error: str | None = None
+    if fc_snap is not None:
+        snap_day = f"CAST({fc_snap.select_as_date()} AS DATE)"
+        week_begin_day = f"CAST({fc_week_begin_expr} AS DATE)"
+        try:
+            forecast_drops = _classify_forecast_drops(warehouse, week_begin_day, snap_day)
+        except Exception as e:  # metadata must never break the tool
+            forecast_drops = [{"error": f"drop classification failed: {e}"}]
+        try:
+            _, lag = warehouse.execute_sql(
+                f"SELECT MIN({week_begin_day} - {snap_day}), "
+                f"MAX({week_begin_day} - {snap_day}), "
+                f"COUNT(*) FILTER (WHERE {snap_day} > {week_begin_day}) "
+                "FROM forecast_weekly"
+            )
+            if lag and lag[0][0] is not None:
+                snapshot_lag = {
+                    "min_lead_days": _interval_days(lag[0][0]),
+                    "max_lead_days": _interval_days(lag[0][1]),
+                    "post_hoc_rows": lag[0][2],
+                }
+        except Exception as e:
+            snapshot_lag_error = f"snapshot lag probe failed: {e}"
+
+    effective_weeks = ((effective_end - effective_start).days // 7) + 1
+    title = (
+        f"Forecast vs actual ({effective_start} → {effective_end}, "
+        f"aggregate={params.aggregate}, matched"
+        f"{'+unmatched' if params.include_unmatched else ' cells only'})"
+    )
+    extra: dict[str, Any] = {
+        "snapshot_policy": cutoff_desc,
+        "spine": "tcin, location, week" if spine_has_location else "tcin, week",
+        "coverage": coverage_summary,
+        "include_unmatched": params.include_unmatched,
+        "requested_weeks_back": weeks_back,
+        "effective_start": str(effective_start),
+        "effective_end": str(effective_end),
+        "effective_weeks_covered": effective_weeks,
+        "window_truncated_to_actuals_coverage": truncated,
+        "forecast_date_col": fc_date.name,
+        "forecast_week_anchor": "begin" if fc_is_week_begin else "end",
+        "forecast_week_shift_days": 6 if fc_is_week_begin else 0,
+        "forecast_units_col": fc_units.name,
+        "forecast_snapshot_col": fc_snap.name if fc_snap else None,
+        "actual_date_col": act_date.name,
+        "actual_units_col": act_units.name,
+        "variance_pct_scale": "percent (0-100)",
+        "sql": sql,
+    }
+    if forecast_drops is not None:
+        # The list is snapshot-ascending; keep the NEWEST 40 — consumers are
+        # directed to the most recent forward_horizon drop, which a head slice
+        # would eventually truncate away (review fix).
+        extra["forecast_drops"] = forecast_drops[-40:]
+        if len(forecast_drops) > 40:
+            extra["forecast_drops_total"] = len(forecast_drops)
+    if snapshot_lag is not None:
+        extra["snapshot_lag"] = snapshot_lag
+    if snapshot_lag_error is not None:
+        extra["snapshot_lag_error"] = snapshot_lag_error
     return make_table_response(
         rows=_rows_to_dicts(out_cols, rows),
         columns=out_cols,
-        title=(
-            f"Forecast vs actual (trailing {weeks_back} weeks, "
-            f"aggregate={params.aggregate})"
-        ),
-        extra={
-            "forecast_date_col": fc_date.name,
-            "forecast_date_type": fc_date.duckdb_type,
-            "forecast_week_anchor": "begin" if fc_is_week_begin else "end",
-            "forecast_week_shift_days": 6 if fc_is_week_begin else 0,
-            "forecast_units_col": fc_units.name,
-            "forecast_snapshot_col": fc_snap.name if fc_snap else None,
-            "actual_date_col": act_date.name,
-            "actual_units_col": act_units.name,
-            "as_of_date_used": (
-                params.as_of_date.isoformat()
-                if params.as_of_date
-                else "pre-week (week_start - 1 day)"
-            ),
-            "sql": sql,
-        },
+        title=title,
+        extra=extra,
         fmt=fmt,
     )
+
+
+def _interval_days(v: Any) -> Any:
+    """DuckDB DATE-DATE may come back as int days or timedelta; normalize."""
+    from datetime import timedelta as _td
+
+    if isinstance(v, _td):
+        return v.days
+    return v
 
 
 # --------------------------------------------------------------------------------------
