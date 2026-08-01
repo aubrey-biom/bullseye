@@ -528,84 +528,25 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
 
 
 # --------------------------------------------------------------------------------------
-# S&OP analytics tools (May 2026 patch)
+# S&OP analytics tools (May 2026 patch; rebuilt on the central registry in Patch #10)
 # --------------------------------------------------------------------------------------
 #
-# These three tools all share a common shape: the data warehouse schema is discovered
-# at runtime (not hardcoded), so each helper below first probes `warehouse.describe()`
-# to find the right column for date/qty/location/etc, then composes SQL dynamically.
-# If the required dataset hasn't been loaded yet, the tool returns DATA_UNAVAILABLE
-# rather than a cryptic Catalog Error.
+# These tools resolve columns through column_roles.resolve_column at call time —
+# the SAME registry the other analytics tools use. The module-local candidate
+# tuples that used to live here (a duplicated, divergent resolver full of
+# invented names) were deleted in Patch #10: registry fixes were invisible to
+# these tools, which is exactly how they shipped hard-broken against real
+# Target orders/po_plan columns.
 
 
-def _table_cols(warehouse: Warehouse, table: str) -> set[str] | None:
-    """Set of column names in `table`, or None if the table doesn't exist."""
-    desc = warehouse.describe()["tables"]
-    if table not in desc:
+def _try_resolve(
+    warehouse: Warehouse, dataset: str, role: str
+) -> ResolvedColumn | None:
+    """`resolve_column`, but None instead of raising — for optional roles."""
+    try:
+        return resolve_column(warehouse, dataset, role)
+    except ColumnNotFound:
         return None
-    return {c["name"] for c in desc[table]["columns"]}
-
-
-def _first_present(candidates: tuple[str, ...], cols: set[str]) -> str | None:
-    return next((c for c in candidates if c in cols), None)
-
-
-# Candidate columns shared across the new datasets. Order matters — first hit wins.
-_DATE_COL_CANDIDATES = (
-    "order_date",
-    "po_date",
-    "plan_date",
-    "expected_date",
-    "period_start_date",
-    "period_end_date",
-    "forecast_date",
-    "week_end_date",
-    "week_start_date",
-    "sale_date",
-    "snapshot_date",
-)
-_LOC_COL_CANDIDATES = (
-    "location_id",
-    "store_id",
-    "loc_id",
-    "store_nbr",
-    "location_nbr",
-)
-_QTY_COL_CANDIDATES = (
-    # In priority order: "remaining/open" first because for open-orders we want
-    # what's *outstanding*, not the total ordered.
-    "open_units",
-    "units_open",
-    "units_remaining",
-    "remaining_units",
-    "qty_open",
-    "open_qty",
-    "qty_remaining",
-    "remaining_qty",
-    "outstanding_units",
-    "outstanding_qty",
-    # Then planned / expected.
-    "planned_units",
-    "planned_qty",
-    "expected_units",
-    "expected_qty",
-    "po_units",
-    "po_qty",
-    "order_units",
-    "order_qty",
-    "ordered_units",
-    "ordered_qty",
-    # Generic fallbacks.
-    "units",
-    "qty",
-)
-_STATUS_COL_CANDIDATES = (
-    "order_status",
-    "status",
-    "fulfillment_status",
-    "ship_status",
-    "po_status",
-)
 
 
 def _in_list_sql(col: str, values: list[int] | None) -> str | None:
@@ -622,88 +563,79 @@ def _in_list_sql(col: str, values: list[int] | None) -> str | None:
 async def get_open_orders(
     warehouse: Warehouse, params: OpenOrdersInput
 ) -> ToolResponse:
-    """Outstanding Target POs to the vendor, summed by SKU.
+    """Outstanding Target POs summed by SKU, derived from the latest-state order book.
 
-    "Open" is heuristic: we prefer a remaining/outstanding quantity column if present;
-    failing that, we exclude rows whose status looks fulfilled; failing both, we sum
-    all ordered units placed on or before as_of_date. The choice is reported in `extra`.
+    orders_daily is a delta feed materialized as LATEST STATE: its natural key
+    (purchase_order_id, tcin, receiving_location_id) has no date column and each
+    load replaces matching keys, so the table always holds exactly one row —
+    the last-known state — per PO line. No snapshot filter or dedup is needed.
+
+    There is no physical "open units" column (and `purchase_order_active_f` is
+    unpopulated at source), so open units are DERIVED per line as
+    ordered - received - cancel_remaining, keeping lines where that is > 0
+    (Patch #10).
     """
-    cols = _table_cols(warehouse, "orders_daily")
-    if cols is None:
-        return make_error_response(
-            code="DATA_UNAVAILABLE",
-            message="orders_daily not loaded yet — run bpd_sync_new_files first.",
-            fmt=params.response_format,
-        )
+    table = "orders_daily"
+    fmt = params.response_format
+    if not table_exists(warehouse, table):
+        return _missing_table_error(table=table, fmt=fmt)
 
-    date_col = _first_present(_DATE_COL_CANDIDATES, cols)
-    qty_col = _first_present(_QTY_COL_CANDIDATES, cols)
-    status_col = _first_present(_STATUS_COL_CANDIDATES, cols)
-    loc_col = _first_present(_LOC_COL_CANDIDATES, cols)
+    try:
+        ordered = resolve_column(warehouse, table, "ordered")
+        received = resolve_column(warehouse, table, "received")
+        cancel_rem = resolve_column(warehouse, table, "cancel_remaining")
+        po_id = resolve_column(warehouse, table, "po_id")
+        tcin_col = resolve_column(warehouse, table, "tcin")
+        loc_col = resolve_column(warehouse, table, "location")
+    except ColumnNotFound as e:
+        return _column_not_found_error(e, fmt=fmt)
+    created = _try_resolve(warehouse, table, "order_created")
 
-    if qty_col is None or "tcin" not in cols:
-        return make_error_response(
-            code="SCHEMA_INCOMPATIBLE",
-            message=(
-                "orders_daily missing required columns: need a qty/units column "
-                f"(looked for {_QTY_COL_CANDIDATES}) and `tcin`. Actual columns: "
-                f"{sorted(cols)}"
-            ),
-            fmt=params.response_format,
-        )
-
-    as_of = params.as_of_date or date.today()
     where_clauses: list[str] = []
-    method: str
-
-    if status_col:
-        # Exclude statuses that look fulfilled/cancelled. Case-insensitive contains.
+    scope = "whole order book (latest-known state of every PO line)"
+    if params.as_of_date is not None:
+        if created is None:
+            return make_error_response(
+                code="SCHEMA_INCOMPATIBLE",
+                message=(
+                    "as_of_date filtering needs the PO-creation date column "
+                    "(role 'order_created', e.g. purchase_order_create_d), "
+                    f"which {table} does not have."
+                ),
+                fmt=fmt,
+            )
         where_clauses.append(
-            f"COALESCE(UPPER({quote_ident(status_col)}), '') NOT IN "
-            f"('FULFILLED','SHIPPED','CLOSED','CANCELLED','CANCELED','COMPLETE','RECEIVED','DELIVERED')"
+            f"{created.select_as_date()} <= DATE '{params.as_of_date.isoformat()}'"
         )
-        method = f"status-filter (excludes {status_col} ∈ fulfilled/closed)"
-    elif qty_col in (
-        "open_units", "units_open", "units_remaining", "remaining_units",
-        "qty_open", "open_qty", "qty_remaining", "remaining_qty",
-        "outstanding_units", "outstanding_qty",
-    ):
-        # The column itself already represents outstanding; no extra filter.
-        method = f"qty column ({qty_col}) already represents outstanding units"
-    else:
-        method = (
-            f"no status/remaining column found; summing total ordered ({qty_col})"
+        scope = (
+            f"POs created on or before {params.as_of_date.isoformat()} — each "
+            "still reflects its latest-known state, NOT a reconstruction of the "
+            "book as it stood on that date (the table is latest-state only)"
         )
 
-    if date_col:
-        where_clauses.append(
-            f"{quote_ident(date_col)} <= DATE '{as_of.isoformat()}'"
-        )
-
-    loc_filter = (
-        _in_list_sql(loc_col, params.location_filter) if loc_col else None
-    )
+    loc_filter = _in_list_sql(loc_col.name, params.location_filter)
     if loc_filter:
         where_clauses.append(loc_filter)
-    elif params.location_filter:
-        return make_error_response(
-            code="SCHEMA_INCOMPATIBLE",
-            message=(
-                "location_filter supplied but orders_daily has no location column "
-                f"(looked for {_LOC_COL_CANDIDATES})"
-            ),
-            fmt=params.response_format,
-        )
-
-    tcin_filter = _in_list_sql("tcin", params.tcin_filter)
+    tcin_filter = _in_list_sql(tcin_col.name, params.tcin_filter)
     if tcin_filter:
         where_clauses.append(tcin_filter)
-
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    open_expr = (
+        f"COALESCE({quote_ident(ordered.name)}, 0) "
+        f"- COALESCE({quote_ident(received.name)}, 0) "
+        f"- COALESCE({quote_ident(cancel_rem.name)}, 0)"
+    )
     sql = (
-        f"SELECT tcin, SUM({quote_ident(qty_col)}) AS open_units, "
-        f"COUNT(*) AS line_count "
-        f"FROM orders_daily {where_sql} "
+        f"WITH lines AS ("
+        f"SELECT {quote_ident(tcin_col.name)} AS tcin, "
+        f"{quote_ident(po_id.name)} AS po_id, "
+        f"{open_expr} AS open_units "
+        f"FROM {quote_ident(table)} {where_sql}"
+        ") "
+        "SELECT tcin, COUNT(DISTINCT po_id) AS po_count, "
+        "SUM(open_units) AS open_units, COUNT(*) AS line_count "
+        "FROM lines WHERE open_units > 0 "
         "GROUP BY tcin ORDER BY open_units DESC NULLS LAST"
     )
 
@@ -714,22 +646,35 @@ async def get_open_orders(
             code="SQL_EXECUTION_FAILED",
             message=str(e),
             details={"sql": sql},
-            fmt=params.response_format,
+            fmt=fmt,
         )
 
+    title = (
+        "Open orders (latest order-book state)"
+        if params.as_of_date is None
+        else f"Open orders — POs created on or before {params.as_of_date.isoformat()}"
+    )
     return make_table_response(
         rows=_rows_to_dicts(out_cols, rows),
         columns=out_cols,
-        title=f"Open orders as of {as_of.isoformat()}",
+        title=title,
         extra={
-            "method": method,
-            "date_col": date_col,
-            "qty_col": qty_col,
-            "status_col": status_col,
-            "location_col": loc_col,
+            "method": (
+                f"derived: {ordered.name} - COALESCE({received.name},0) - "
+                f"COALESCE({cancel_rem.name},0) per PO line, keeping lines > 0"
+            ),
+            "scope": scope,
+            "resolved_columns": {
+                "ordered": ordered.name,
+                "received": received.name,
+                "cancel_remaining": cancel_rem.name,
+                "po_id": po_id.name,
+                "location": loc_col.name,
+                "order_created": created.name if created else None,
+            },
             "sql": sql,
         },
-        fmt=params.response_format,
+        fmt=fmt,
     )
 
 
@@ -739,72 +684,120 @@ async def get_open_orders(
 async def get_upcoming_pos(
     warehouse: Warehouse, params: UpcomingPosInput
 ) -> ToolResponse:
-    """Forward-looking PO plan from po_plan_daily + po_plan_biweekly, grouped by week.
+    """Forward-looking PO plan from po_plan_daily + po_plan_biweekly.
 
-    If both tables exist, we UNION ALL them after projecting each to (tcin, week, qty).
-    Each table's date column and qty column are resolved at runtime — the brief said
-    not to hardcode them, and we don't.
+    Both po_plan tables ACCUMULATE snapshots: their natural key includes
+    `business_d` (the as-of date), so every generation of the full plan
+    coexists in the table. Each table is therefore filtered to its own latest
+    `business_d` before anything is summed — without that filter, totals
+    multiply by the number of snapshots retained (Patch #10).
+
+    The forward window is on `order_d` (the date each planned PO is targeted
+    at). Results are grouped by (tcin, week, source): the daily and biweekly
+    plans have different horizons and must not be silently added together for
+    the same planned order. Per-source totals are in `extra.source_totals`.
     """
-    daily_cols = _table_cols(warehouse, "po_plan_daily")
-    biweekly_cols = _table_cols(warehouse, "po_plan_biweekly")
-    if daily_cols is None and biweekly_cols is None:
+    fmt = params.response_format
+    tables = [
+        t for t in ("po_plan_daily", "po_plan_biweekly") if table_exists(warehouse, t)
+    ]
+    if not tables:
         return make_error_response(
             code="DATA_UNAVAILABLE",
             message="Neither po_plan_daily nor po_plan_biweekly is loaded yet.",
-            fmt=params.response_format,
+            fmt=fmt,
         )
 
-    def _project(table: str, cols: set[str]) -> tuple[str, dict[str, str | None]] | None:
-        date_col = _first_present(_DATE_COL_CANDIDATES, cols)
-        qty_col = _first_present(_QTY_COL_CANDIDATES, cols)
-        if date_col is None or qty_col is None or "tcin" not in cols:
-            return None
-        tcin_filter = _in_list_sql("tcin", params.tcin_filter)
+    projections: list[str] = []
+    resolved_cols: dict[str, dict[str, Any]] = {}
+    skipped_tables: dict[str, str] = {}
+    empty_tables: list[str] = []
+    for table in tables:
+        try:
+            snap = resolve_column(warehouse, table, "date")  # business_d (as-of)
+            order_d = resolve_column(warehouse, table, "order_date")  # order_d
+            qty = resolve_column(warehouse, table, "units")  # ordered_q
+            tcin_col = resolve_column(warehouse, table, "tcin")
+        except ColumnNotFound as e:
+            skipped_tables[table] = str(e)
+            continue
+
+        # Normalize the snapshot column to a DATE regardless of physical type
+        # (VARCHAR ISO string, DATE, or TIMESTAMP). Wrapped so one table's bad
+        # date value degrades to skipped_tables instead of aborting the tool
+        # (review fix).
+        snap_day = f"CAST({snap.select_as_date()} AS DATE)"
+        try:
+            _, mx = warehouse.execute_sql(
+                f"SELECT MAX({snap_day}) FROM {quote_ident(table)}"
+            )
+        except Exception as e:
+            skipped_tables[table] = (
+                f"latest-snapshot probe failed: {type(e).__name__}: {e}"
+            )
+            continue
+        latest_snapshot = mx[0][0] if mx else None
+        if latest_snapshot is None:
+            # Present-but-empty is a data-availability state, not a schema
+            # problem — tracked separately so it never reads as breakage
+            # (review fix: the health smoke test treats DATA_UNAVAILABLE as
+            # a benign skip).
+            empty_tables.append(table)
+            continue
+        latest_iso = str(latest_snapshot)[:10]
+
+        order_expr = order_d.select_as_date()
         where = [
-            f"{quote_ident(date_col)} >= current_date",
-            f"{quote_ident(date_col)} < current_date + INTERVAL '{int(params.weeks_forward)} weeks'",
+            f"{snap_day} = DATE '{latest_iso}'",
+            f"{order_expr} >= current_date",
+            f"{order_expr} < current_date + INTERVAL '{int(params.weeks_forward)} weeks'",
         ]
+        tcin_filter = _in_list_sql(tcin_col.name, params.tcin_filter)
         if tcin_filter:
             where.append(tcin_filter)
-        proj = (
-            f"SELECT tcin, "
-            f"date_trunc('week', {quote_ident(date_col)}) AS week, "
-            f"{quote_ident(qty_col)} AS qty, "
+        projections.append(
+            f"SELECT {quote_ident(tcin_col.name)} AS tcin, "
+            f"date_trunc('week', {order_expr}) AS week, "
+            f"{quote_ident(qty.name)} AS qty, "
             f"'{table}' AS source "
             f"FROM {quote_ident(table)} "
             f"WHERE {' AND '.join(where)}"
         )
-        return proj, {"date_col": date_col, "qty_col": qty_col}
-
-    projections = []
-    resolved_cols: dict[str, dict[str, str | None]] = {}
-    if daily_cols is not None:
-        result = _project("po_plan_daily", daily_cols)
-        if result is not None:
-            projections.append(result[0])
-            resolved_cols["po_plan_daily"] = result[1]
-    if biweekly_cols is not None:
-        result = _project("po_plan_biweekly", biweekly_cols)
-        if result is not None:
-            projections.append(result[0])
-            resolved_cols["po_plan_biweekly"] = result[1]
+        resolved_cols[table] = {
+            "snapshot_col": snap.name,
+            "order_date_col": order_d.name,
+            "qty_col": qty.name,
+            "latest_snapshot": latest_iso,
+        }
 
     if not projections:
+        if skipped_tables:
+            return make_error_response(
+                code="SCHEMA_INCOMPATIBLE",
+                message=(
+                    "po_plan tables exist but no projection could be built — "
+                    + "; ".join(f"{t}: {msg}" for t, msg in skipped_tables.items())
+                    + (f"; empty: {empty_tables}" if empty_tables else "")
+                ),
+                details={**skipped_tables, "empty_tables": empty_tables},
+                fmt=fmt,
+            )
         return make_error_response(
-            code="SCHEMA_INCOMPATIBLE",
+            code="DATA_UNAVAILABLE",
             message=(
-                "po_plan_* tables exist but lack the columns we expect "
-                "(need a date column and a qty/units column plus `tcin`)."
+                f"po_plan table(s) {empty_tables} exist but contain no rows yet "
+                "— run bpd_sync_new_files (or the feed may have nothing planned)."
             ),
-            fmt=params.response_format,
+            details={"empty_tables": empty_tables},
+            fmt=fmt,
         )
 
     union_sql = " UNION ALL ".join(f"({p})" for p in projections)
     sql = (
         f"WITH planned AS ({union_sql}) "
-        "SELECT tcin, week, SUM(qty) AS planned_units, "
-        "string_agg(DISTINCT source, ',') AS sources "
-        "FROM planned GROUP BY tcin, week ORDER BY week, tcin"
+        "SELECT tcin, week, source, SUM(qty) AS planned_units, "
+        "COUNT(*) AS line_count "
+        "FROM planned GROUP BY tcin, week, source ORDER BY week, tcin, source"
     )
     try:
         out_cols, rows = warehouse.execute_sql(sql)
@@ -813,14 +806,33 @@ async def get_upcoming_pos(
             code="SQL_EXECUTION_FAILED",
             message=str(e),
             details={"sql": sql},
-            fmt=params.response_format,
+            fmt=fmt,
         )
+
+    dict_rows = _rows_to_dicts(out_cols, rows)
+    source_totals: dict[str, Any] = {}
+    for r in dict_rows:
+        source_totals[r["source"]] = (
+            source_totals.get(r["source"], 0) + (r["planned_units"] or 0)
+        )
+    extra: dict[str, Any] = {
+        "resolved_columns": resolved_cols,
+        "source_totals": source_totals,
+        "sql": sql,
+    }
+    if skipped_tables:
+        extra["skipped_tables"] = skipped_tables
+    if empty_tables:
+        extra["empty_tables"] = empty_tables
     return make_table_response(
-        rows=_rows_to_dicts(out_cols, rows),
+        rows=dict_rows,
         columns=out_cols,
-        title=f"Upcoming POs (next {params.weeks_forward} weeks)",
-        extra={"resolved_columns": resolved_cols, "sql": sql},
-        fmt=params.response_format,
+        title=(
+            f"Upcoming POs (next {params.weeks_forward} weeks, "
+            "latest snapshot per source)"
+        ),
+        extra=extra,
+        fmt=fmt,
     )
 
 

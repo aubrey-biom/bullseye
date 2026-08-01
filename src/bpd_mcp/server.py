@@ -110,6 +110,16 @@ async def build_context(settings: Settings | None = None) -> AppContext:
     client = KiteworksClient(s, auth, http)
     warehouse_rw = Warehouse(s.db_path, read_only=False)
     warehouse_ro = ReadOnlyView(warehouse_rw)
+    # Patch #10: log-only startup pass over the role registry. Never fatal —
+    # tables are created lazily by sync, so empty installs legitimately have
+    # nothing to validate. The hard gate is the roles_resolvable health check.
+    try:
+        from .column_roles import validate_roles
+
+        for failure in validate_roles(warehouse_rw):
+            logger.warning("role_unresolvable", **failure)
+    except Exception as e:
+        logger.warning("role_validation_failed", error=str(e))
     logger.info(
         "context_built",
         base_url=s.base_url,
@@ -652,11 +662,11 @@ async def bpd_get_sell_through(
 @mcp.tool(
     name="bpd_get_open_orders",
     description=(
-        "Outstanding Target POs to the vendor, summed by SKU. Reads the orders_daily "
-        "table loaded from `BV_<BPID>_DAILY_ORDER_TCIN_LOC_*.zip`. Uses any of "
-        "{open_units, units_remaining, qty_open, ...} if present; otherwise excludes "
-        "rows whose status looks fulfilled; otherwise sums all ordered units placed "
-        "on or before `as_of_date`. The chosen method is reported in `extra.method`."
+        "Outstanding Target POs to the vendor, summed by SKU. orders_daily is a "
+        "latest-state order book (one row per PO line); open units are DERIVED as "
+        "revised_order_q - item_received_q - cancel_remaining_order_q, keeping "
+        "lines > 0. `as_of_date` filters by PO creation date (not time travel). "
+        "Returns po_count, open_units, line_count per TCIN; derivation in `extra`."
     ),
     annotations={
         "readOnlyHint": True,
@@ -687,9 +697,11 @@ async def bpd_get_open_orders(
 @mcp.tool(
     name="bpd_get_upcoming_pos",
     description=(
-        "Target's planned future POs to Biom, by week and SKU. Combines po_plan_daily "
-        "and po_plan_biweekly (UNION ALL after projecting to (tcin, week, qty)). The "
-        "qty and date columns on each table are resolved at runtime, not hardcoded."
+        "Target's planned future POs to Biom, by week and SKU. Reads po_plan_daily "
+        "and po_plan_biweekly, each filtered to its LATEST business_d snapshot (the "
+        "tables accumulate a full plan snapshot per day). Windows on order_d (the "
+        "planned order date) and groups by (tcin, week, source) — daily and biweekly "
+        "plans are reported separately, with per-source totals in `extra`."
     ),
     annotations={
         "readOnlyHint": True,
@@ -829,7 +841,7 @@ async def bpd_clear_cache(
 @mcp.tool(
     name="bpd_health_check",
     description=(
-        "Run a comprehensive 14-check health audit across auth, warehouse, sync ledger, "
+        "Run a comprehensive multi-check health audit across auth, warehouse, sync ledger, "
         "disk usage, and MCP self-state. Each check returns pass/warn/fail with a "
         "human-readable detail. The aggregate `overall_status` is `fail` if any check "
         "fails, `warn` if any warns and none fail, else `pass`. Use this as the first "

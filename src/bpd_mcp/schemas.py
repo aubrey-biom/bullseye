@@ -296,8 +296,10 @@ class OpenOrdersInput(_BaseModel):
     as_of_date: _date | None = Field(
         default=None,
         description=(
-            "Treat orders placed on or before this date as candidates for being open. "
-            "Defaults to today."
+            "Only count POs CREATED on or before this date "
+            "(purchase_order_create_d). The order book is latest-state per PO "
+            "line, so this is not a historical reconstruction. Default: the "
+            "whole current order book."
         ),
     )
     location_filter: list[int] | None = Field(

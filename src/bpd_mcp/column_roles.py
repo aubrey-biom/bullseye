@@ -8,6 +8,30 @@ at execution time (NOT at module load) so a sync that creates a new table is
 visible without restarting the MCP.
 
 Adding a new dataset or a new variant just means appending to a list here.
+Real Target names go FIRST in each candidate list; older/invented aliases stay
+behind them for fixture compatibility and rename tolerance.
+
+Target BPD column-naming convention (Patch #10 — documentation only; nothing
+may programmatically suffix-match, resolution is always exact against these
+ordered lists):
+
+    suffix          meaning                          example
+    ------          -------                          -------
+    _q              quantity (units)                 ending_on_hand_q, ordered_q
+    _a              amount (USD)                     net_sales_a, sale_amount*
+    _d              date                             business_d, order_d, snapshot_d
+    _f              flag (boolean, often as "")      purchase_order_active_f
+    _c              code                             (various)
+    _id             identifier                       purchase_order_id, location_id
+    _percentage     percent on a 0-100 scale         instock_percentage
+
+    * sales feeds predate the convention and ship sale_amount/sale_quantity.
+
+Bookend prefixes `beginning_` / `ending_` appear on inventory measures; the
+period-end (`ending_`) value is the default meaning of "on hand" and is always
+ordered first. The location key is `location_id` in sales/inventory/forecast
+feeds but `receiving_location_id` (the destination DC/store) in orders_daily
+and po_plan_*. See also parsers.CANONICAL_RENAMES for cross-generation renames.
 """
 
 from __future__ import annotations
@@ -78,7 +102,14 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
             "inv_date",
             "as_of_date",
         ],
+        # Patch #10 (P0-1): real Target columns are `ending_on_hand_q` /
+        # `beginning_on_hand_q`, exactly as in inventory_weekly below — the
+        # Patch #7.1 correction was applied to the weekly siblings but missed
+        # this dataset, hard-failing get_inventory_snapshot/get_sell_through
+        # whenever inventory_daily was loaded. Invented aliases kept behind.
         "on_hand": [
+            "ending_on_hand_q",
+            "beginning_on_hand_q",
             "on_hand_units",
             "on_hand_qty",
             "inventory_quantity",
@@ -212,44 +243,29 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
     },
     # ---------- orders / PO plan / forecast ----------
     "orders_daily": {
+        # Patch #10 (P0-1): the old "units"/"status" roles were 20+ invented
+        # names (open_units, order_status, ...) — no such columns exist in real
+        # Target orders files, so get_open_orders hard-failed. There is NO
+        # physical "open units" column: open units are DERIVED as
+        # ordered - received - cancel_remaining (see get_open_orders). The
+        # roles below name the real derivation inputs.
+        "ordered": ["revised_order_q", "original_order_q"],
+        "received": ["item_received_q"],
+        "cancel_remaining": ["cancel_remaining_order_q"],
+        "po_id": ["purchase_order_id", "purchase_order_number"],
+        # snapshot_d is the file's as-of stamp; the table itself is latest-state
+        # per (purchase_order_id, tcin, receiving_location_id) — see FEED notes.
+        "snapshot_date": ["snapshot_d"],
+        "order_created": ["purchase_order_create_d"],
+        "eta": ["revised_estimated_arrival_d", "original_estimated_arrival_d"],
+        # Generic "date" kept for detect_date_column's registry tier; snapshot
+        # stamp first, then legacy invented aliases.
         "date": [
+            "snapshot_d",
+            "purchase_order_create_d",
             "order_date",
             "po_date",
-            "expected_delivery_date",
-            "ship_date",
             "report_date_dim",
-        ],
-        "units": [
-            "open_units",
-            "units_open",
-            "units_remaining",
-            "remaining_units",
-            "qty_open",
-            "open_qty",
-            "qty_remaining",
-            "remaining_qty",
-            "outstanding_units",
-            "outstanding_qty",
-            "planned_units",
-            "planned_qty",
-            "expected_units",
-            "expected_qty",
-            "po_units",
-            "po_qty",
-            "order_units",
-            "order_qty",
-            "ordered_units",
-            "ordered_qty",
-            "order_quantity",
-            "units",
-            "qty",
-        ],
-        "status": [
-            "order_status",
-            "status",
-            "fulfillment_status",
-            "ship_status",
-            "po_status",
         ],
         "tcin": ["tcin", "item_id"],
         # `receiving_location_id` is orders-specific (destination location for
@@ -276,7 +292,10 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "order_date": ["order_d", "order_date"],
         # Same orders-specific destination-location concept as orders_daily.
         "receiving_location": ["receiving_location_id"],
+        # Patch #10 (P0-1): `ordered_q` is the real Target column — it was
+        # already first in po_plan_biweekly's list but missing here.
         "units": [
+            "ordered_q",
             "planned_units",
             "planned_qty",
             "planned_quantity",
@@ -371,6 +390,66 @@ DATASET_KINDS: dict[str, str] = {
     "item_attr_extended": "dimensional",
     "location_attr": "dimensional",
 }
+
+
+# Roles a dataset MUST resolve for the analytics tools that query it to work
+# (Patch #10). Derived from which resolve_column calls in tools/query.py are
+# NOT wrapped in try/except. Datasets absent here have no tool that hard-
+# depends on them. Consumed by `validate_roles` → the `roles_resolvable`
+# health check, which makes "the candidate lists match real Target names"
+# an executable claim instead of a hope.
+REQUIRED_ROLES: dict[str, tuple[str, ...]] = {
+    "sales_daily": ("date", "units", "tcin", "location"),
+    "sales_weekly": ("date", "units", "tcin", "location"),
+    "inventory_daily": ("date", "on_hand", "tcin", "location"),
+    "inventory_weekly": ("date", "on_hand", "tcin", "location"),
+    "gross_margin": ("date", "tcin"),
+    "orders_daily": (
+        "ordered", "received", "cancel_remaining", "po_id", "tcin", "location",
+    ),
+    "po_plan_daily": ("date", "order_date", "units", "tcin"),
+    "po_plan_biweekly": ("date", "order_date", "units", "tcin"),
+    "forecast_weekly": ("date", "units", "tcin"),
+}
+
+
+# Columns Target ships but never populates (every row is their `""` NULL
+# placeholder — see parsers._attempt_strict and Patch #6). This is a
+# data-source fact, not a parser bug: the boolean caster demonstrably handles
+# mixed values (tests/test_parsers.py). No tool may filter on these columns;
+# a drift-guard test enforces that none appears in any COLUMN_ROLES candidate
+# list, and the `known_unpopulated_columns` health check warns if Target ever
+# starts populating one (at which point it can be promoted to a real role).
+KNOWN_UNPOPULATED_AT_SOURCE: dict[str, tuple[str, ...]] = {
+    "orders_daily": ("purchase_order_active_f",),
+}
+
+
+def validate_roles(warehouse) -> list[dict[str, Any]]:
+    """Check every REQUIRED_ROLES entry against the live schema.
+
+    Only POPULATED tables are validated: tables are created lazily by sync, so
+    absent/empty tables are expected on a fresh install and are skipped —
+    "fail at boot" is the wrong shape for this architecture (see module
+    docstring on call-time resolution). Returns one failure dict per
+    unresolvable (dataset, role), each carrying the ColumnNotFound diagnostic
+    detail (candidates tried, actual columns present).
+    """
+    failures: list[dict[str, Any]] = []
+    for dataset, roles in REQUIRED_ROLES.items():
+        if not table_exists(warehouse, dataset):
+            continue
+        _, rows = warehouse.execute_sql(
+            f"SELECT COUNT(*) FROM {_safe(dataset)}"
+        )
+        if not rows or rows[0][0] == 0:
+            continue
+        for role in roles:
+            try:
+                resolve_column(warehouse, dataset, role)
+            except ColumnNotFound as e:
+                failures.append(e.detail)
+    return failures
 
 
 @dataclass(frozen=True)

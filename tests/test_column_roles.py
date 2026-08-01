@@ -149,3 +149,145 @@ def test_column_roles_covers_every_dataset_in_catalog() -> None:
             f"dataset {p.dataset!r} from PATTERNS has no entry in COLUMN_ROLES; "
             "add one (even if empty) to avoid silent drift."
         )
+
+
+# --------- Patch #10: REQUIRED_ROLES against real Target headers ---------
+
+# The real (post-parse, lowercased) column sets Target ships per dataset, as
+# observed during live validation. This makes "the candidate lists match real
+# Target names" an executable claim: if Target renames a column AND the
+# candidate list lacks the new name, this test (and the roles_resolvable
+# health check) fails instead of one analytics tool at a time.
+REAL_TARGET_HEADERS: dict[str, list[str]] = {
+    "sales_daily": [
+        "sales_date", "vendor_id", "barcode", "tcin", "dpci",
+        "origination_channel", "reporting_channel", "fulfillment_type",
+        "location_id", "sale_amount", "sale_quantity",
+    ],
+    "sales_weekly": [
+        "sales_date", "vendor_id", "barcode", "tcin", "dpci",
+        "origination_channel", "reporting_channel", "fulfillment_type",
+        "location_id", "sale_amount", "sale_quantity",
+    ],
+    "inventory_daily": [
+        "business_d", "primary_vendor_id", "tcin", "dpci", "location_id",
+        "beginning_on_hand_q", "ending_on_hand_q", "ending_on_transfer_q",
+    ],
+    "inventory_weekly": [
+        "business_d", "primary_vendor_id", "tcin", "dpci", "location_id",
+        "beginning_on_hand_q", "ending_on_hand_q", "ending_on_transfer_q",
+    ],
+    "gross_margin": [
+        "fiscal_week_end_d", "vendor_id", "tcin", "dpci",
+        "channel_originated", "location_id_originated", "location_id",
+        "channel_fulfilled", "fulfillment_type", "fulfillment_subtype",
+        "net_sales_a", "net_sales_q", "adjusted_gross_margin_a",
+    ],
+    "orders_daily": [
+        "snapshot_d", "purchase_order_id", "purchase_order_create_d",
+        "tcin", "dpci", "receiving_location_id",
+        "original_order_q", "revised_order_q", "item_received_q",
+        "cancel_remaining_order_q", "original_estimated_arrival_d",
+        "revised_estimated_arrival_d", "purchase_order_active_f",
+    ],
+    "po_plan_daily": [
+        "business_d", "tcin", "dpci", "order_d",
+        "receiving_location_id", "ordered_q",
+    ],
+    "po_plan_biweekly": [
+        "business_d", "tcin", "dpci", "order_d",
+        "receiving_location_id", "ordered_q",
+    ],
+    "forecast_weekly": [
+        "fiscal_week_begin_d", "last_update_d", "tcin", "location_id",
+        "selected_forecast_q",
+    ],
+}
+
+
+def test_required_roles_resolve_against_real_target_headers(tmp_path: Path) -> None:
+    from bpd_mcp.column_roles import REQUIRED_ROLES, validate_roles
+
+    assert set(REAL_TARGET_HEADERS) == set(REQUIRED_ROLES), (
+        "keep REAL_TARGET_HEADERS in lockstep with REQUIRED_ROLES"
+    )
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        for ds, cols in REAL_TARGET_HEADERS.items():
+            ddl_cols = ", ".join(f"{c} VARCHAR" for c in cols)
+            wh.execute_sql(f"CREATE TABLE {ds} ({ddl_cols})")
+            placeholders = ", ".join(["NULL"] * len(cols))
+            wh.execute_sql(f"INSERT INTO {ds} VALUES ({placeholders})")
+        failures = validate_roles(wh)
+        assert failures == [], (
+            "required role(s) unresolvable against real Target headers: "
+            f"{failures}"
+        )
+        # Spot-check the P0-1 fixes resolve to the REAL columns, not aliases.
+        assert resolve_column(wh, "inventory_daily", "on_hand").name == "ending_on_hand_q"
+        assert resolve_column(wh, "orders_daily", "ordered").name == "revised_order_q"
+        assert resolve_column(wh, "orders_daily", "location").name == "receiving_location_id"
+        assert resolve_column(wh, "po_plan_daily", "units").name == "ordered_q"
+        assert resolve_column(wh, "po_plan_daily", "order_date").name == "order_d"
+    finally:
+        wh.close()
+
+
+def test_validate_roles_skips_empty_and_absent_tables(tmp_path: Path) -> None:
+    from bpd_mcp.column_roles import validate_roles
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        # Absent tables: nothing to validate.
+        assert validate_roles(wh) == []
+        # Present but EMPTY table with hopeless columns: still skipped.
+        wh.execute_sql("CREATE TABLE inventory_daily (nothing_useful VARCHAR)")
+        assert validate_roles(wh) == []
+        # One row makes it validate — and fail.
+        wh.execute_sql("INSERT INTO inventory_daily VALUES ('x')")
+        failures = validate_roles(wh)
+        assert {(f["dataset"], f["role"]) for f in failures} >= {
+            ("inventory_daily", "on_hand"),
+            ("inventory_daily", "date"),
+        }
+    finally:
+        wh.close()
+
+
+def test_known_unpopulated_columns_never_in_candidate_lists() -> None:
+    """No tool may resolve (and then filter on) a column Target never
+    populates. Guards both the central registry and the Patch-#10 requirement
+    that query.py's parallel candidate tuples stay deleted."""
+    from bpd_mcp import column_roles as cr
+    from bpd_mcp.tools import query as query_mod
+
+    banned = {
+        col for cols in cr.KNOWN_UNPOPULATED_AT_SOURCE.values() for col in cols
+    }
+    for ds, roles in cr.COLUMN_ROLES.items():
+        for role, candidates in roles.items():
+            hits = banned.intersection(candidates)
+            assert not hits, f"{ds}.{role} lists known-unpopulated column(s) {hits}"
+    # The divergent local resolver must never come back.
+    for stale in (
+        "_QTY_COL_CANDIDATES",
+        "_DATE_COL_CANDIDATES",
+        "_LOC_COL_CANDIDATES",
+        "_STATUS_COL_CANDIDATES",
+        "_first_present",
+    ):
+        assert not hasattr(query_mod, stale), (
+            f"tools/query.py regrew {stale} — route through column_roles instead"
+        )
+
+
+def test_required_roles_datasets_exist_in_registry() -> None:
+    from bpd_mcp.column_roles import COLUMN_ROLES, REQUIRED_ROLES
+
+    for ds, roles in REQUIRED_ROLES.items():
+        assert ds in COLUMN_ROLES, f"REQUIRED_ROLES references unknown dataset {ds}"
+        for role in roles:
+            assert role in COLUMN_ROLES[ds], (
+                f"REQUIRED_ROLES demands {ds}.{role} but the registry has no "
+                "candidate list for it"
+            )

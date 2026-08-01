@@ -1,6 +1,6 @@
-"""Tests for the `bpd_health_check` tool (Patch #3).
+"""Tests for the `bpd_health_check` tool (Patch #3; extended in Patch #10).
 
-Each of the 15 checks gets a pass-path test and (where the check has a non-trivial
+Each check gets a pass-path test and (where the check has a non-trivial
 failure mode) a fail-path test driven by deliberately broken state.
 """
 
@@ -99,7 +99,7 @@ async def test_health_check_all_pass_on_healthy_install(tmp_path: Path) -> None:
     resp = await _run_checks(tmp_path=tmp_path)
     assert resp.ok is True
     by = _by_name(resp)
-    # All 15 checks present.
+    # All 19 checks present (15 from Patch #3/#4 + 4 from Patch #10).
     expected_names = {
         "auth_token_valid",
         "auth_kiteworks_reachable",
@@ -112,6 +112,10 @@ async def test_health_check_all_pass_on_healthy_install(tmp_path: Path) -> None:
         "sync_no_orphan_raw_files",
         "datasets_have_data",
         "warehouse_no_duplicate_rows",
+        "roles_resolvable",
+        "tools_smoke_test",
+        "known_unpopulated_columns",
+        "dimension_recency",
         "disk_usage",
         "token_expiry_window",
         "config_validity",
@@ -133,6 +137,13 @@ async def test_health_check_all_pass_on_healthy_install(tmp_path: Path) -> None:
     assert by["mcp_self_check"]["status"] == "pass"
     assert by["disk_usage"]["status"] == "pass"
     assert by["warehouse_no_duplicate_rows"]["status"] == "pass"
+    # Patch #10 checks on a fresh install: no populated tables → roles pass,
+    # dataset tools all skip but the always-on tools (run_sql etc.) invoke ok.
+    assert by["roles_resolvable"]["status"] == "pass"
+    assert by["tools_smoke_test"]["status"] == "pass"
+    assert "skipped" in by["tools_smoke_test"]["detail"]
+    assert by["known_unpopulated_columns"]["status"] == "pass"
+    assert by["dimension_recency"]["status"] == "pass"
 
 
 async def test_health_check_warehouse_no_duplicate_rows_warns_on_dup(
@@ -392,3 +403,169 @@ async def test_health_check_records_duration_ms(tmp_path: Path) -> None:
 def test_expected_ledger_columns_matches_constant() -> None:
     """The EXPECTED_LEDGER_COLUMNS tuple should be the full 13-column list."""
     assert len(EXPECTED_LEDGER_COLUMNS) == 13
+
+
+# --------- Patch #10: roles_resolvable / tools_smoke_test / drift checks ---------
+
+
+def _real_orders_daily_ddl() -> str:
+    return (
+        "CREATE TABLE orders_daily ("
+        "snapshot_d DATE, purchase_order_id VARCHAR, "
+        "purchase_order_create_d DATE, tcin BIGINT, "
+        "receiving_location_id BIGINT, original_order_q BIGINT, "
+        "revised_order_q BIGINT, item_received_q BIGINT, "
+        "cancel_remaining_order_q BIGINT, purchase_order_active_f BOOLEAN)"
+    )
+
+
+async def test_health_check_p0_1_class_breakage_fails_loudly(tmp_path: Path) -> None:
+    """The P0-1 regression scenario: a POPULATED table whose real columns match
+    no candidate for a required role. Pre-Patch-#10 this passed health while
+    four tools hard-failed; now BOTH detectors must fail and flip overall."""
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        wh.execute_sql(
+            "CREATE TABLE inventory_daily ("
+            "business_d DATE, tcin BIGINT, location_id BIGINT, "
+            "weird_stock_metric BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO inventory_daily VALUES (DATE '2026-07-01', 100, 500, 5)"
+        )
+        resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
+    finally:
+        wh.close()
+    by = _by_name(resp)
+    assert by["roles_resolvable"]["status"] == "fail"
+    assert "inventory_daily.on_hand" in by["roles_resolvable"]["detail"]
+    assert by["tools_smoke_test"]["status"] == "fail"
+    assert "bpd_get_inventory_snapshot" in by["tools_smoke_test"]["detail"]
+    assert "SCHEMA_INCOMPATIBLE" in by["tools_smoke_test"]["detail"]
+    assert resp.data["overall_status"] == "fail"
+
+
+async def test_health_check_smoke_and_roles_pass_on_real_columns(
+    tmp_path: Path,
+) -> None:
+    """With real Target column names, the rewritten tools invoke cleanly."""
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        wh.execute_sql(_real_orders_daily_ddl())
+        wh.execute_sql(
+            "INSERT INTO orders_daily VALUES "
+            "(DATE '2026-07-30', 'PO-1', DATE '2026-06-01', 100, 500, "
+            "100, 100, 40, 10, NULL)"
+        )
+        resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
+    finally:
+        wh.close()
+    by = _by_name(resp)
+    assert by["roles_resolvable"]["status"] == "pass"
+    assert by["tools_smoke_test"]["status"] == "pass"
+    assert by["known_unpopulated_columns"]["status"] == "pass"
+
+
+async def test_health_check_known_unpopulated_warns_when_populated(
+    tmp_path: Path,
+) -> None:
+    """If Target starts shipping real values in purchase_order_active_f, warn
+    so the column can be promoted to a role instead of staying ignored."""
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        wh.execute_sql(_real_orders_daily_ddl())
+        wh.execute_sql(
+            "INSERT INTO orders_daily VALUES "
+            "(DATE '2026-07-30', 'PO-1', DATE '2026-06-01', 100, 500, "
+            "100, 100, 40, 10, TRUE)"
+        )
+        resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
+    finally:
+        wh.close()
+    by = _by_name(resp)
+    assert by["known_unpopulated_columns"]["status"] == "warn"
+    assert "purchase_order_active_f" in by["known_unpopulated_columns"]["detail"]
+
+
+async def test_health_check_dimension_recency_fails_on_rollback(
+    tmp_path: Path,
+) -> None:
+    """Ledger-only detector for the July 2026 location_attr incident: the most
+    recently loaded dimensional file is OLDER (by file_date) than one loaded
+    before it → the table content has been rolled back."""
+    from datetime import date
+
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        t0 = datetime.now(UTC) - timedelta(hours=2)
+        t1 = datetime.now(UTC) - timedelta(hours=1)
+        common = {
+            "folder_id": "F1",
+            "dataset": "location_attr",
+            "bytes": 10,
+            "fingerprint": None,
+            "row_count": 2220,
+            "status": "loaded",
+            "error_message": None,
+            "parse_method": "strict",
+        }
+        # Newest snapshot loaded FIRST...
+        wh.ledger_upsert(
+            {
+                **common,
+                "file_id": "NEW",
+                "file_name": "ALL_WKLY_LOC_ATTR_V0_0_07242026_KW.zip",
+                "file_date": date(2026, 7, 24),
+                "downloaded_at": t0,
+                "loaded_at": t0,
+            }
+        )
+        # ...then an OLDER snapshot loaded after it (the regression).
+        wh.ledger_upsert(
+            {
+                **common,
+                "file_id": "local:OLD",
+                "file_name": "ALL_WKLY_LOC_ATTR_V0_0_05022026_KW.zip",
+                "file_date": date(2026, 5, 2),
+                "downloaded_at": t1,
+                "loaded_at": t1,
+            }
+        )
+        resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
+    finally:
+        wh.close()
+    by = _by_name(resp)
+    assert by["dimension_recency"]["status"] == "fail"
+    assert "location_attr" in by["dimension_recency"]["detail"]
+    assert "bpd_reingest_local" in by["dimension_recency"]["detail"]
+    assert resp.data["overall_status"] == "fail"
+
+
+async def test_health_check_smoke_skips_empty_po_plan_table(tmp_path: Path) -> None:
+    """Adversarial-review fix: a present-but-zero-row po_plan table (e.g. left
+    behind by a failed first load, or a sunset feed after a full refresh) must
+    NOT flip health to fail — it's DATA_UNAVAILABLE, a benign skip."""
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        wh.execute_sql(
+            "CREATE TABLE po_plan_daily ("
+            "business_d DATE, tcin BIGINT, order_d DATE, "
+            "receiving_location_id BIGINT, ordered_q BIGINT)"
+        )
+        resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
+    finally:
+        wh.close()
+    by = _by_name(resp)
+    assert by["tools_smoke_test"]["status"] == "pass"
+    assert by["roles_resolvable"]["status"] == "pass"
+    assert resp.data["overall_status"] == "warn"  # only the usual fresh-install warns

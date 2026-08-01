@@ -431,3 +431,247 @@ async def test_forecast_vs_actual_no_shift_when_column_is_week_end(
     assert len(matched) == 1
     assert matched[0]["tcin"] == 100
     assert matched[0]["week_end_date"] == date(2026, 5, 2)
+
+
+# --------- Patch #10: rewritten S&OP tools against real Target columns ---------
+
+
+def _seed_orders_and_plans(path: Path):
+    """orders_daily + po_plan_* with REAL Target column names.
+
+    Deliberately includes the columns the old (deleted) local candidate tuples
+    could never resolve — these tests fail on any regression to that path.
+    """
+    from datetime import timedelta
+
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE orders_daily ("
+        "snapshot_d DATE, purchase_order_id VARCHAR, "
+        "purchase_order_create_d DATE, tcin BIGINT, "
+        "receiving_location_id BIGINT, original_order_q BIGINT, "
+        "revised_order_q BIGINT, item_received_q BIGINT, "
+        "cancel_remaining_order_q BIGINT, purchase_order_active_f BOOLEAN)"
+    )
+    wh.execute_sql(
+        "INSERT INTO orders_daily VALUES "
+        # PO-1 line 1: open = 100 - 40 - 10 = 50
+        "(DATE '2026-07-30', 'PO-1', DATE '2026-06-01', 100, 500, 100, 100, 40, 10, NULL), "
+        # PO-1 line 2: fully received → open 0 → excluded
+        "(DATE '2026-07-30', 'PO-1', DATE '2026-06-01', 200, 500, 30, 30, 30, 0, NULL), "
+        # PO-2: NULL received/cancel treated as 0 → open 20
+        "(DATE '2026-07-30', 'PO-2', DATE '2026-07-01', 100, 501, 20, 20, NULL, NULL, NULL), "
+        # PO-3: over-received → negative → excluded
+        "(DATE '2026-07-30', 'PO-3', DATE '2026-06-15', 300, 500, 15, 15, 20, 0, NULL)"
+    )
+
+    today = date.today()
+    fresh = (today - timedelta(days=1)).isoformat()
+    stale = (today - timedelta(days=2)).isoformat()
+    in_window = (today + timedelta(days=3)).isoformat()
+    out_window = (today + timedelta(weeks=20)).isoformat()
+    for table in ("po_plan_daily", "po_plan_biweekly"):
+        wh.execute_sql(
+            f"CREATE TABLE {table} ("
+            "business_d DATE, tcin BIGINT, order_d DATE, "
+            "receiving_location_id BIGINT, ordered_q BIGINT)"
+        )
+    wh.execute_sql(
+        "INSERT INTO po_plan_daily VALUES "
+        # STALE snapshot — must be invisible to the tool.
+        f"(DATE '{stale}', 100, DATE '{in_window}', 500, 999), "
+        # Latest snapshot: 40 + 60 units inside the window...
+        f"(DATE '{fresh}', 100, DATE '{in_window}', 500, 40), "
+        f"(DATE '{fresh}', 100, DATE '{in_window}', 501, 60), "
+        # ...and 77 outside the 8-week window.
+        f"(DATE '{fresh}', 100, DATE '{out_window}', 500, 77)"
+    )
+    wh.execute_sql(
+        "INSERT INTO po_plan_biweekly VALUES "
+        f"(DATE '{fresh}', 100, DATE '{in_window}', 500, 500)"
+    )
+    return wh
+
+
+async def test_get_open_orders_derives_open_units_from_latest_state(
+    tmp_path: Path,
+) -> None:
+    from bpd_mcp.schemas import OpenOrdersInput
+    from bpd_mcp.tools.query import get_open_orders
+
+    wh = _seed_orders_and_plans(tmp_path)
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_open_orders(ro, OpenOrdersInput(response_format="json"))
+        assert resp.ok is True, resp.error
+        rows = {r["tcin"]: r for r in resp.data["rows"]}
+        # tcin 100: PO-1 (50 open) + PO-2 (20 open) = 70 across 2 POs.
+        assert rows[100]["open_units"] == 70
+        assert rows[100]["po_count"] == 2
+        assert rows[100]["line_count"] == 2
+        # Fully-received and over-received lines never appear.
+        assert 200 not in rows
+        assert 300 not in rows
+        assert "revised_order_q" in resp.data["method"]
+
+        # as_of_date = PO CREATION cutoff (not time travel): only PO-1 (6/01)
+        # and PO-3 (6/15) qualify at 6/15; PO-3 has nothing open.
+        resp2 = await get_open_orders(
+            ro,
+            OpenOrdersInput(as_of_date=date(2026, 6, 15), response_format="json"),
+        )
+        rows2 = {r["tcin"]: r for r in resp2.data["rows"]}
+        assert rows2[100]["open_units"] == 50
+        assert rows2[100]["po_count"] == 1
+
+        # location_filter routes through receiving_location_id.
+        resp3 = await get_open_orders(
+            ro, OpenOrdersInput(location_filter=[501], response_format="json")
+        )
+        rows3 = {r["tcin"]: r for r in resp3.data["rows"]}
+        assert rows3[100]["open_units"] == 20
+    finally:
+        wh.close()
+
+
+async def test_get_upcoming_pos_uses_latest_snapshot_and_splits_sources(
+    tmp_path: Path,
+) -> None:
+    """The two Patch-#10 landmines: (1) without the max(business_d) filter the
+    stale snapshot's 999 units would double-count; (2) without per-source
+    grouping the daily 100 and biweekly 500 would blend into one 600."""
+    from bpd_mcp.schemas import UpcomingPosInput
+    from bpd_mcp.tools.query import get_upcoming_pos
+
+    wh = _seed_orders_and_plans(tmp_path)
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_upcoming_pos(
+            ro, UpcomingPosInput(weeks_forward=8, response_format="json")
+        )
+        assert resp.ok is True, resp.error
+        rows = resp.data["rows"]
+        by_source = {}
+        for r in rows:
+            by_source.setdefault(r["source"], 0)
+            by_source[r["source"]] += r["planned_units"]
+        # Only the LATEST snapshot counts: 40+60, not 999, not 77 (outside window).
+        assert by_source == {"po_plan_daily": 100, "po_plan_biweekly": 500}
+        assert resp.data["source_totals"] == {
+            "po_plan_daily": 100,
+            "po_plan_biweekly": 500,
+        }
+        resolved = resp.data["resolved_columns"]
+        assert resolved["po_plan_daily"]["qty_col"] == "ordered_q"
+        assert resolved["po_plan_daily"]["order_date_col"] == "order_d"
+        assert resolved["po_plan_daily"]["snapshot_col"] == "business_d"
+    finally:
+        wh.close()
+
+
+async def test_inventory_tools_work_with_real_inventory_daily_columns(
+    tmp_path: Path,
+) -> None:
+    """P0-1 regression guard: inventory_daily with the REAL on-hand column
+    (ending_on_hand_q) must resolve — this exact shape hard-failed before."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE inventory_daily ("
+        "business_d DATE, tcin BIGINT, location_id BIGINT, "
+        "beginning_on_hand_q BIGINT, ending_on_hand_q BIGINT, "
+        "ending_on_transfer_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO inventory_daily VALUES "
+        "(DATE '2026-07-01', 100, 500, 10, 8, 1), "
+        "(DATE '2026-07-02', 100, 500, 8, 5, 0)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_inventory_snapshot(
+            ro, InventorySnapshotInput(response_format="json")
+        )
+        assert resp.ok is True, resp.error
+        assert resp.data["on_hand_col"] == "ending_on_hand_q"
+        rows = resp.data["rows"]
+        assert len(rows) == 1
+        # Latest day's ENDING on-hand, not the beginning_ bookend (10).
+        assert rows[0]["on_hand"] == 5
+    finally:
+        wh.close()
+
+
+async def test_get_upcoming_pos_empty_tables_are_data_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix: a present-but-empty po_plan table is a
+    data-availability state, not SCHEMA_INCOMPATIBLE — the health smoke test
+    treats DATA_UNAVAILABLE as a benign skip, anything else as breakage."""
+    from bpd_mcp.schemas import UpcomingPosInput
+    from bpd_mcp.tools.query import get_upcoming_pos
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE po_plan_daily ("
+        "business_d DATE, tcin BIGINT, order_d DATE, "
+        "receiving_location_id BIGINT, ordered_q BIGINT)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_upcoming_pos(ro, UpcomingPosInput(response_format="json"))
+        assert resp.ok is False
+        assert resp.error is not None
+        assert resp.error.code == "DATA_UNAVAILABLE"
+        assert "po_plan_daily" in resp.error.message
+    finally:
+        wh.close()
+
+
+async def test_get_upcoming_pos_bad_date_value_degrades_to_skipped_table(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix: an uncastable date value in ONE table must not
+    abort the tool — the healthy table still returns, the broken one lands in
+    extra.skipped_tables."""
+    from datetime import timedelta
+
+    from bpd_mcp.schemas import UpcomingPosInput
+    from bpd_mcp.tools.query import get_upcoming_pos
+    from bpd_mcp.warehouse import Warehouse
+
+    today = date.today()
+    fresh = (today - timedelta(days=1)).isoformat()
+    in_window = (today + timedelta(days=3)).isoformat()
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE po_plan_daily ("
+        "business_d DATE, tcin BIGINT, order_d DATE, "
+        "receiving_location_id BIGINT, ordered_q BIGINT)"
+    )
+    wh.execute_sql(
+        f"INSERT INTO po_plan_daily VALUES (DATE '{fresh}', 100, DATE '{in_window}', 500, 40)"
+    )
+    # VARCHAR business_d with a value that cannot CAST to DATE.
+    wh.execute_sql(
+        "CREATE TABLE po_plan_biweekly ("
+        "business_d VARCHAR, tcin BIGINT, order_d DATE, "
+        "receiving_location_id BIGINT, ordered_q BIGINT)"
+    )
+    wh.execute_sql(
+        f"INSERT INTO po_plan_biweekly VALUES ('bogus', 100, DATE '{in_window}', 500, 60)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_upcoming_pos(ro, UpcomingPosInput(response_format="json"))
+        assert resp.ok is True, resp.error
+        assert resp.data["source_totals"] == {"po_plan_daily": 40}
+        assert "po_plan_biweekly" in resp.data["skipped_tables"]
+        assert "probe failed" in resp.data["skipped_tables"]["po_plan_biweekly"]
+    finally:
+        wh.close()

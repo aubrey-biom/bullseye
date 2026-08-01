@@ -130,8 +130,8 @@ accepts a `response_format` of `markdown` (default) or `json`.
 
 | Tool                          | Purpose                                                                                  |
 | ----------------------------- | ---------------------------------------------------------------------------------------- |
-| `bpd_get_open_orders`         | Outstanding Target POs summed by SKU. Uses an "open/remaining" qty col if present; else excludes statuses that look fulfilled/closed; else sums all ordered units placed ≤ `as_of_date`. Method chosen is reported in `extra.method`. |
-| `bpd_get_upcoming_pos`        | UNION of `po_plan_daily` + `po_plan_biweekly`, grouped by week. `weeks_forward` (default 8) is anchored at today. |
+| `bpd_get_open_orders`         | Outstanding Target POs summed by SKU. `orders_daily` is a latest-state order book (one row per PO line — the natural key has no date); open units are **derived** as `revised_order_q − item_received_q − cancel_remaining_order_q`, keeping lines > 0. `as_of_date` filters by PO **creation** date (not time travel). |
+| `bpd_get_upcoming_pos`        | `po_plan_daily` + `po_plan_biweekly`, each filtered to its **latest `business_d` snapshot** (the tables accumulate a full plan per day — unfiltered sums multiply by snapshot count). Windows on `order_d`, grouped by (tcin, week, **source**) so the two plans never blend; per-source totals in `extra`. |
 | `bpd_get_forecast_vs_actual`  | Joins Target's DFE `forecast_weekly` against `sales_weekly`. Returns forecast/actual/variance per group; `aggregate` picks `by_sku_week` (default), `by_sku_location_week`, or `by_sku`. |
 
 ### Admin
@@ -141,7 +141,7 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | `bpd_auth_status`          | OAuth state, scope, expires_in_s, user email (via `/rest/users/me`).                       |
 | `bpd_cache_status`         | Disk usage, row counts. Reports two date ranges: `earliest/latest_data_date` (transactional datasets only — the business-data range) and `earliest/latest_data_date_including_dimensional` (covers `location_attr.last_remodel_date` etc.). Per-dataset breakdown includes the detected date column and dataset `kind`. |
 | `bpd_clear_cache`          | **Destructive.** Requires `confirm=true`. Otherwise returns a dry-run preview.            |
-| `bpd_health_check`         | 15-check audit across auth, warehouse, sync ledger, disk, MCP self-state. Each returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
+| `bpd_health_check`         | Multi-check audit across auth, warehouse, sync ledger, disk, and MCP self-state — including a **tool smoke test** that actually invokes every warehouse-only tool (a broken tool fails health, not just its own callers), a **roles_resolvable** check that validates the column-role registry against every populated table, and a **dimension_recency** check that catches rolled-back dimension tables. Each check returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
 | `bpd_export_query_to_csv`  | Run a read-only SQL query and write the result to `~/.bpd-mcp/exports/<filename>` (mode 0644). Useful for sharing data with team members who don't have MCP access. Same read-only safety as `bpd_run_sql`. |
 
 ---
@@ -388,6 +388,17 @@ copy of its data anywhere. It is skipped (with a warning) even if that leaves
 the directory over the cap; ingest it with `bpd_reingest_local` to make it
 evictable.
 
+**4. Stale-dimension guard (Patch #10).** Dimensional datasets
+(`location_attr`, `item_attr`, `item_attr_extended`) are full-universe
+last-write-wins snapshots: whichever file loads last wins outright, with no
+row-count change to signal anything. Both the live sync and `bpd_reingest_local`
+now refuse to load a dimensional file older than the newest known snapshot
+(batch + ledger) — so an out-of-order arrival or an orphaned old zip can never
+silently roll a dimension back (the July 2026 `location_attr` regression). As
+a bonus, at most one file per dimensional dataset loads per batch — older ones
+were dead work anyway. The `dimension_recency` health check detects the
+rolled-back state after the fact from the ledger alone.
+
 ### Recovery runbook
 
 If warehouse data is lost (or after restoring an older `bpd.duckdb`):
@@ -461,7 +472,8 @@ Coverage requirements (§13):
 * `tests/test_health_check.py` — every health check has pass + fail tests.
 * `tests/test_audit_drift_guards.py` — pin parallel sources of truth (PATTERNS ↔ KnownDataset, EXPECTED_LEDGER_COLUMNS ↔ DDL, EXPECTED_TOOL_COUNT ↔ registered tools).
 * `tests/test_tools_query.py` — sales_summary math + markdown/json toggle.
-* `tests/test_recovery_safety.py` — Patch #9: backups + retention, confirm-phrase gate, would-lose-history refusal, full-refresh happy path, local reingest (recovery, idempotency, ordering), raw-dir eviction protection.
+* `tests/test_recovery_safety.py` — Patch #9: backups + retention, confirm-phrase gate, would-lose-history refusal, full-refresh happy path, local reingest (recovery, idempotency, ordering), raw-dir eviction protection; Patch #10: stale-dimension guard (reingest + live sync).
+* `tests/test_column_roles.py` — resolver behavior + Patch #10: every REQUIRED_ROLES entry resolves against real Target headers (executable "the lists match reality" claim); known-unpopulated columns banned from candidate lists.
 
 ---
 
@@ -475,7 +487,7 @@ pkill -f bpd-mcp && sleep 2
 rm -f ~/.bpd-mcp/bpd.duckdb.ro ~/.bpd-mcp/bpd.duckdb.ro.wal   # one-time, patch #3
 ./scripts/verify_install.sh                                   # local checks (8 steps)
 # Fully quit + reopen Claude Desktop
-# In Claude Desktop: call bpd_health_check                    # 15-check audit
+# In Claude Desktop: call bpd_health_check                    # full audit incl. tool smoke test
 # In Claude Desktop: call bpd_sync_new_files                  # ~99 loaded, 0-2 failed
 ```
 

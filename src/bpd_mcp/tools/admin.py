@@ -542,7 +542,9 @@ async def _datasets_have_data(warehouse: Warehouse, **_: Any) -> HealthCheckResu
         status="warn",
         detail=(
             f"{populated}/{total_known} dataset(s) populated; "
-            f"empty: {empty} (likely the user is not subscribed to these)"
+            f"empty: {empty} — possible causes: not subscribed, feed sunset "
+            "by Target, or sync has not run yet (check bpd_list_folder_contents "
+            "for the file family)"
         ),
     )
 
@@ -592,8 +594,228 @@ async def _warehouse_no_duplicate_rows(
         detail=(
             "literal-row duplicates detected — "
             + "; ".join(parts)
-            + " (remediation: bpd_refresh_dataset(<dataset>, full=True))"
+            + " (remediation: bpd_refresh_dataset(<dataset>, full=True) — "
+            "DESTRUCTIVE, requires the confirm_destructive phrase and refuses "
+            "when local history can't be re-downloaded; a backup is taken first)"
         ),
+    )
+
+
+@_timed
+async def _roles_resolvable(warehouse: Warehouse, **_: Any) -> HealthCheckResult:
+    """Every REQUIRED_ROLES entry must resolve against each POPULATED table.
+
+    This is the P0-1 detector (Patch #10): a candidate list drifting from what
+    Target actually ships fails HERE, loudly, instead of surfacing one tool at
+    a time as SCHEMA_INCOMPATIBLE errors. Empty/absent tables are skipped —
+    they are expected on a fresh install (tables are created lazily by sync).
+    """
+    from ..column_roles import validate_roles
+
+    failures = validate_roles(warehouse)
+    if not failures:
+        return HealthCheckResult(
+            name="roles_resolvable",
+            status="pass",
+            detail="all required column roles resolve on every populated table",
+        )
+    parts = [
+        f"{f['dataset']}.{f['role']} (tried {f['candidates']}; "
+        f"table has {f['actual_columns']})"
+        for f in failures
+    ]
+    return HealthCheckResult(
+        name="roles_resolvable",
+        status="fail",
+        detail=(
+            "unresolvable required column role(s) — the analytics tools that "
+            "depend on them WILL fail; add the real column name to "
+            "column_roles.COLUMN_ROLES: " + "; ".join(parts)
+        ),
+    )
+
+
+@_timed
+async def _tools_smoke_test(
+    warehouse: Warehouse, settings: Settings, **_: Any
+) -> HealthCheckResult:
+    """Actually INVOKE every warehouse-only tool with default arguments.
+
+    mcp_self_check only proves tools are registered; this check proves they
+    run (Patch #10 — four tools were hard-broken for weeks while health
+    reported warn-at-worst). Excluded, deliberately: network tools
+    (bpd_list_top_folders/bpd_list_folder_contents/bpd_get_file_metadata/
+    bpd_search_files/bpd_auth_status — three have required args with no
+    default), write/side-effect tools (sync/refresh/reingest/clear_cache/
+    export_query_to_csv), and bpd_health_check itself (recursion).
+
+    Verdict per tool: ok=True → invoked; ok=False with DATA_UNAVAILABLE →
+    skipped (healthy on a fresh install); anything else → FAIL.
+    """
+    from ..schemas import (
+        DescribeSchemaInput,
+        ForecastVsActualInput,
+        InventorySnapshotInput,
+        ListDatasetsInput,
+        OpenOrdersInput,
+        RunSqlInput,
+        SalesSummaryInput,
+        SellThroughInput,
+        TopSkusInput,
+        UpcomingPosInput,
+    )
+    from ..warehouse import ReadOnlyView
+    from . import query as query_tools
+    from . import sync as sync_tools
+
+    ro = ReadOnlyView(warehouse)
+    roster: list[tuple[str, Any]] = [
+        ("bpd_run_sql", lambda: query_tools.run_sql(ro, RunSqlInput(sql="SELECT 1", limit=1))),
+        ("bpd_describe_schema", lambda: query_tools.describe_schema(ro, DescribeSchemaInput())),
+        ("bpd_get_sales_summary", lambda: query_tools.get_sales_summary(ro, SalesSummaryInput())),
+        ("bpd_get_top_skus", lambda: query_tools.get_top_skus(ro, TopSkusInput(top_n=1))),
+        ("bpd_get_inventory_snapshot", lambda: query_tools.get_inventory_snapshot(ro, InventorySnapshotInput(limit=1))),
+        ("bpd_get_sell_through", lambda: query_tools.get_sell_through(ro, SellThroughInput())),
+        ("bpd_get_open_orders", lambda: query_tools.get_open_orders(ro, OpenOrdersInput())),
+        ("bpd_get_upcoming_pos", lambda: query_tools.get_upcoming_pos(ro, UpcomingPosInput())),
+        ("bpd_get_forecast_vs_actual", lambda: query_tools.get_forecast_vs_actual(ro, ForecastVsActualInput())),
+        ("bpd_list_datasets", lambda: sync_tools.list_datasets(warehouse, ListDatasetsInput())),
+        ("bpd_cache_status", lambda: cache_status(warehouse, settings, CacheStatusInput())),
+    ]
+
+    invoked: list[str] = []
+    skipped: list[str] = []
+    failed: list[str] = []
+    for name, call in roster:
+        try:
+            resp = await call()
+        except Exception as e:
+            failed.append(f"{name}: raised {type(e).__name__}: {e}")
+            continue
+        if resp.ok:
+            invoked.append(name)
+        elif resp.error is not None and resp.error.code == "DATA_UNAVAILABLE":
+            skipped.append(name)
+        else:
+            code = resp.error.code if resp.error is not None else "?"
+            msg = resp.error.message if resp.error is not None else ""
+            failed.append(f"{name}: {code}: {msg[:160]}")
+
+    if failed:
+        return HealthCheckResult(
+            name="tools_smoke_test",
+            status="fail",
+            detail=(
+                f"{len(failed)} tool(s) broken ({len(invoked)} ok, "
+                f"{len(skipped)} skipped): " + " | ".join(failed)
+            ),
+        )
+    if not invoked:
+        return HealthCheckResult(
+            name="tools_smoke_test",
+            status="warn",
+            detail=f"all {len(skipped)} dataset tools skipped — no data loaded yet",
+        )
+    detail = f"{len(invoked)} tool(s) invoked ok"
+    if skipped:
+        detail += f", {len(skipped)} skipped (no data): {skipped}"
+    return HealthCheckResult(name="tools_smoke_test", status="pass", detail=detail)
+
+
+@_timed
+async def _known_unpopulated_columns(
+    warehouse: Warehouse, **_: Any
+) -> HealthCheckResult:
+    """Reverse drift detection for KNOWN_UNPOPULATED_AT_SOURCE columns.
+
+    These columns (e.g. orders_daily.purchase_order_active_f) ship as Target's
+    `""` NULL placeholder in every row — a data-source fact, not a parser bug.
+    If Target ever starts populating one, warn so it can be promoted to a real
+    role instead of staying invisibly ignored.
+    """
+    from ..column_roles import KNOWN_UNPOPULATED_AT_SOURCE
+
+    newly_populated: list[str] = []
+    for dataset, columns in KNOWN_UNPOPULATED_AT_SOURCE.items():
+        info = warehouse.describe()["tables"]
+        if dataset not in info:
+            continue
+        present = {c["name"] for c in info[dataset]["columns"]}
+        for col in columns:
+            if col not in present:
+                continue
+            _, r = warehouse.execute_sql(
+                f"SELECT COUNT({quote_ident(col)}) FROM {quote_ident(dataset)}"
+            )
+            if r and r[0][0] > 0:
+                newly_populated.append(f"{dataset}.{col} ({r[0][0]} non-NULL)")
+    if newly_populated:
+        return HealthCheckResult(
+            name="known_unpopulated_columns",
+            status="warn",
+            detail=(
+                "Target has started populating column(s) we treat as always-NULL: "
+                + ", ".join(newly_populated)
+                + " — consider promoting to a column_roles role"
+            ),
+        )
+    return HealthCheckResult(
+        name="known_unpopulated_columns",
+        status="pass",
+        detail="known-unpopulated source columns are still all-NULL (expected)",
+    )
+
+
+@_timed
+async def _dimension_recency(warehouse: Warehouse, **_: Any) -> HealthCheckResult:
+    """Detect a rolled-back dimension table (Patch #10).
+
+    Dimensional datasets are full-universe keyed-overwrite snapshots — the
+    most recently LOADED file wins outright, and a regression leaves row
+    counts unchanged (the July 2026 location_attr incident: an old snapshot
+    loaded last and silently erased 12 weeks of remodel dates). Detector:
+    for each dimensional dataset, the last-loaded file (by loaded_at) must
+    also be the newest by file_date. Pure ledger check, no table scan.
+    """
+    from ..column_roles import DATASET_KINDS
+
+    regressed: list[str] = []
+    for ds, kind in DATASET_KINDS.items():
+        if kind != "dimensional":
+            continue
+        _, rows = warehouse.execute_sql(
+            "SELECT file_date FROM _file_ledger "
+            f"WHERE dataset = '{ds}' AND status = 'loaded' "
+            "ORDER BY loaded_at DESC, file_date DESC LIMIT 1"
+        )
+        if not rows or rows[0][0] is None:
+            continue
+        last_loaded_fd = rows[0][0]
+        _, mrows = warehouse.execute_sql(
+            "SELECT MAX(file_date) FROM _file_ledger "
+            f"WHERE dataset = '{ds}' AND status = 'loaded'"
+        )
+        max_fd = mrows[0][0]
+        if last_loaded_fd < max_fd:
+            regressed.append(
+                f"{ds}: table reflects the {last_loaded_fd} snapshot but "
+                f"{max_fd} was loaded before it"
+            )
+    if regressed:
+        return HealthCheckResult(
+            name="dimension_recency",
+            status="fail",
+            detail=(
+                "dimension table(s) rolled back to an older snapshot — "
+                + "; ".join(regressed)
+                + " (remediation: bpd_reingest_local(datasets=[<dataset>], "
+                "only_unledgered=false) re-loads the newest snapshot)"
+            ),
+        )
+    return HealthCheckResult(
+        name="dimension_recency",
+        status="pass",
+        detail="dimensional tables reflect their newest loaded snapshot",
     )
 
 
@@ -743,6 +965,10 @@ async def health_check(
     checks.append(await _sync_no_orphan_raw_files(**common))
     checks.append(await _datasets_have_data(**common))
     checks.append(await _warehouse_no_duplicate_rows(**common))
+    checks.append(await _roles_resolvable(**common))
+    checks.append(await _tools_smoke_test(**common))
+    checks.append(await _known_unpopulated_columns(**common))
+    checks.append(await _dimension_recency(**common))
     checks.append(await _disk_usage(**common))
     checks.append(await _token_expiry_window(**common))
     checks.append(await _config_validity(**common))
