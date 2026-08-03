@@ -847,3 +847,215 @@ async def test_sync_skips_retired_feeds_unless_explicitly_requested(
         assert weeks[0][0] == 2
     finally:
         wh.close()
+
+
+# ---------- ledger hygiene (Patch #13) ----------
+
+
+async def test_reingest_reuses_existing_ledger_row_no_shadow(tmp_path: Path) -> None:
+    """Live-found bug: re-processing a synced file with only_unledgered=false
+    appended a 'local:<name>' shadow row (the ledger PK is file_id), inflating
+    file counts by one per re-processed file. The reingest must UPDATE the
+    original row — same file_id, fingerprint preserved."""
+    s = _settings(tmp_path)
+    name = "BV_139440_WEEKLY_SALES_TCIN_LOC_04252026_KW.zip"
+    _zip(s.raw_dir / name, f"{SALES_WEEKLY_HDR}\n{_sales_row('2026-04-25')}\n")
+    wh = Warehouse(s.db_path)
+    try:
+        _seed_sales_weekly(wh, week="2026-04-25", file_name=name, file_id="KW-ORIG")
+        r = await reingest_local_files(wh, s, only_unledgered=False)
+        assert r.files_loaded == 1, r
+        _, rows = wh.execute_sql(
+            "SELECT file_id, fingerprint FROM _file_ledger WHERE file_name = "
+            f"'{name}'"
+        )
+        assert len(rows) == 1, "re-processing must not create a shadow row"
+        assert rows[0][0] == "KW-ORIG"
+        assert rows[0][1] == "fp-old", "Kiteworks fingerprint must survive"
+        _, n = wh.execute_sql("SELECT COUNT(*) FROM _file_ledger")
+        assert n[0][0] == 1
+    finally:
+        wh.close()
+
+
+def test_migration_merges_local_shadow_ledger_rows(tmp_path: Path) -> None:
+    """Existing warehouses carry shadows from pre-fix reingests — opening the
+    warehouse must merge them (newer load state wins) and drop the shadow."""
+    from datetime import UTC, datetime, timedelta
+
+    db = tmp_path / "bpd.duckdb"
+    wh = Warehouse(db)
+    name = "ALL_WKLY_LOC_ATTR_V0_0_07252026_KW.zip"
+    t0 = datetime.now(UTC) - timedelta(hours=2)
+    t1 = datetime.now(UTC) - timedelta(hours=1)
+    common = {
+        "file_name": name,
+        "folder_id": "F1",
+        "dataset": "location_attr",
+        "file_date": date(2026, 7, 25),
+        "bytes": 10,
+        "error_message": None,
+    }
+    wh.ledger_upsert(
+        {
+            **common,
+            "file_id": "KW-1",
+            "fingerprint": "fp-1",
+            "downloaded_at": t0,
+            "loaded_at": t0,
+            "row_count": 2203,
+            "status": "loaded",
+            "parse_method": "strict",
+        }
+    )
+    wh.ledger_upsert(
+        {
+            **common,
+            "file_id": f"local:{name}",
+            "fingerprint": None,
+            "downloaded_at": t1,
+            "loaded_at": t1,
+            "row_count": 2220,
+            "status": "loaded",
+            "parse_method": "strict",
+        }
+    )
+    # Also an orphan-only local row (the normal recovery case) — must survive.
+    wh.ledger_upsert(
+        {
+            **common,
+            "file_name": "BV_139440_HISTORY_SALES_WEEKLY_01032026_KW.zip",
+            "dataset": "sales_weekly",
+            "file_date": date(2026, 1, 3),
+            "file_id": "local:BV_139440_HISTORY_SALES_WEEKLY_01032026_KW.zip",
+            "fingerprint": None,
+            "downloaded_at": t1,
+            "loaded_at": t1,
+            "row_count": 5,
+            "status": "loaded",
+            "parse_method": "strict",
+        }
+    )
+    wh.close()
+
+    # Re-open: migrations run and merge the shadow.
+    wh2 = Warehouse(db)
+    try:
+        _, rows = wh2.execute_sql(
+            "SELECT file_id, row_count FROM _file_ledger "
+            f"WHERE file_name = '{name}'"
+        )
+        assert len(rows) == 1
+        assert rows[0][0] == "KW-1", "the original Kiteworks id survives"
+        assert rows[0][1] == 2220, "the shadow's newer load state is merged in"
+        _, orphan = wh2.execute_sql(
+            "SELECT COUNT(*) FROM _file_ledger WHERE file_id LIKE 'local:%'"
+        )
+        assert orphan[0][0] == 1, "orphan-only local rows must survive"
+    finally:
+        wh2.close()
+
+
+async def test_reingest_never_reuses_failed_download_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix (major): a failed-download ledger row stores the
+    REMOTE fingerprint of bytes that never reached disk. Reingesting the older
+    on-disk zip must NOT stamp that fingerprint — live sync would then skip
+    the real (newer) file forever."""
+    s = _settings(tmp_path)
+    name = "BV_139440_WEEKLY_SALES_TCIN_LOC_04252026_KW.zip"
+    # The v1 zip is what's on disk; the ledger row records a FAILED download
+    # of v2 with v2's remote fingerprint.
+    _zip(s.raw_dir / name, f"{SALES_WEEKLY_HDR}\n{_sales_row('2026-04-25')}\n")
+    wh = Warehouse(s.db_path)
+    try:
+        wh.ledger_upsert(
+            {
+                "file_id": "KW-9",
+                "file_name": name,
+                "folder_id": "F1",
+                "dataset": "sales_weekly",
+                "file_date": date(2026, 4, 25),
+                "bytes": None,
+                "fingerprint": "fp-v2-REMOTE-NEVER-DOWNLOADED",
+                "downloaded_at": datetime.now(UTC),
+                "loaded_at": None,
+                "row_count": None,
+                "status": "failed",
+                "error_message": "download: HTTP 500",
+                "parse_method": None,
+            }
+        )
+        r = await reingest_local_files(wh, s)  # failed rows are targets
+        assert r.files_loaded == 1, r
+        _, rows = wh.execute_sql(
+            f"SELECT file_id, status, fingerprint FROM _file_ledger "
+            f"WHERE file_name = '{name}'"
+        )
+        assert len(rows) == 1
+        assert rows[0][0] == "KW-9", "reuse the id (no shadow)"
+        assert rows[0][1] == "loaded"
+        assert rows[0][2] is None, (
+            "the never-downloaded v2 fingerprint must NOT be stamped — a "
+            "fingerprint mismatch is what makes the next sync fetch v2"
+        )
+    finally:
+        wh.close()
+
+
+def test_migration_merges_failed_shadow_onto_failed_original(tmp_path: Path) -> None:
+    """Adversarial-review fix: a FAILED shadow newer than a FAILED original
+    must carry its (newer) error message across the merge instead of being
+    silently discarded. A LOADED original still wins over a failed shadow."""
+    from datetime import UTC, datetime, timedelta
+
+    db = tmp_path / "bpd.duckdb"
+    wh = Warehouse(db)
+    t0 = datetime.now(UTC) - timedelta(hours=2)
+    t1 = datetime.now(UTC) - timedelta(hours=1)
+
+    def _row(file_id, name, *, status, downloaded_at, loaded_at, error):
+        return {
+            "file_id": file_id,
+            "file_name": name,
+            "folder_id": "F1",
+            "dataset": "sales_weekly",
+            "file_date": date(2026, 4, 25),
+            "bytes": 10,
+            "fingerprint": None,
+            "downloaded_at": downloaded_at,
+            "loaded_at": loaded_at,
+            "row_count": None,
+            "status": status,
+            "error_message": error,
+            "parse_method": None,
+        }
+
+    # Case A: failed original + newer failed shadow → newer error survives.
+    wh.ledger_upsert(_row("KW-A", "a.zip", status="failed",
+                          downloaded_at=t0, loaded_at=None, error="old error"))
+    wh.ledger_upsert(_row("local:a.zip", "a.zip", status="failed",
+                          downloaded_at=t1, loaded_at=None, error="NEW error"))
+    # Case B: loaded original + failed shadow → stays loaded (table still
+    # holds the original's rows; failed re-processing rolled back).
+    wh.ledger_upsert({**_row("KW-B", "b.zip", status="loaded",
+                             downloaded_at=t0, loaded_at=t0, error=None),
+                      "row_count": 5})
+    wh.ledger_upsert(_row("local:b.zip", "b.zip", status="failed",
+                          downloaded_at=t1, loaded_at=None, error="late failure"))
+    wh.close()
+
+    wh2 = Warehouse(db)
+    try:
+        _, a = wh2.execute_sql(
+            "SELECT file_id, status, error_message FROM _file_ledger "
+            "WHERE file_name = 'a.zip'"
+        )
+        assert a == [("KW-A", "failed", "NEW error")]
+        _, b = wh2.execute_sql(
+            "SELECT file_id, status FROM _file_ledger WHERE file_name = 'b.zip'"
+        )
+        assert b == [("KW-B", "loaded")]
+    finally:
+        wh2.close()
