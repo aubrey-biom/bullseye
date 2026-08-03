@@ -165,6 +165,16 @@ class Warehouse:
         self._read_only = read_only
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(str(db_path), read_only=read_only)
+        # Patch #14 (critical review fix): DuckDB converts AWARE datetimes
+        # through the SESSION timezone (host OS default) when storing into
+        # naive TIMESTAMP columns — on a PT host, downloaded_at round-tripped
+        # 7h earlier than reality, breaking every modified-vs-downloaded_at
+        # comparison. Pin the session to UTC so aware-UTC values round-trip
+        # as naive UTC everywhere.
+        try:
+            self._conn.execute("SET TimeZone='UTC'")
+        except Exception:
+            pass
         # DuckDB connection objects are not thread-safe across operations; serialize.
         # RLock so helper methods (e.g. detect_date_column) can be called while a
         # caller already holds the lock without deadlocking.
@@ -432,7 +442,8 @@ class Warehouse:
     def ledger_seen(self, file_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT file_id, file_name, dataset, fingerprint, status, loaded_at "
+                "SELECT file_id, file_name, dataset, fingerprint, status, "
+                "loaded_at, bytes, downloaded_at "
                 "FROM _file_ledger WHERE file_id = ?",
                 [file_id],
             ).fetchone()
@@ -445,11 +456,26 @@ class Warehouse:
             "fingerprint": row[3],
             "status": row[4],
             "loaded_at": row[5],
+            "bytes": row[6],
+            "downloaded_at": row[7],
         }
 
     def ledger_upsert(self, row: dict[str, Any]) -> None:
         if self._read_only:
             raise RuntimeError("read-only warehouse cannot write ledger")
+        # Belt-and-suspenders alongside the session-TZ pin: normalize aware
+        # datetimes to naive UTC at the write boundary, so timestamp
+        # comparisons never depend on connection settings (Patch #14).
+        def _naive_utc(v: Any) -> Any:
+            if isinstance(v, datetime) and v.tzinfo is not None:
+                return v.astimezone(UTC).replace(tzinfo=None)
+            return v
+
+        row = {
+            **row,
+            "downloaded_at": _naive_utc(row.get("downloaded_at")),
+            "loaded_at": _naive_utc(row.get("loaded_at")),
+        }
         err = row.get("error_message")
         if isinstance(err, str) and len(err) > 2000:
             # Truncate only at 2000 to keep diagnostics readable in the DB.

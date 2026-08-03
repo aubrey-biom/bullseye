@@ -196,6 +196,60 @@ def _stale_dimension_note(file_date: Any, newest: Any) -> str:
     )
 
 
+# --- Restatement detection (Patch #14) --------------------------------------------------
+#
+# Target RESTATES trailing weeks by re-uploading a file under the SAME
+# Kiteworks file_id, bumping only `size` and `modified` (observed live
+# 2026-08-03: three consecutive weekly sales files re-posted). The original
+# skip predicate keyed on file_id + listing fingerprint — but live folder
+# listings don't carry a usable fingerprint, so every restatement was
+# indistinguishable from "already loaded" and never re-downloaded, leaving
+# period_replace semantics dead weight.
+
+
+def _parse_remote_modified(entry: dict[str, Any]) -> datetime | None:
+    """Kiteworks `modified`/`clientModified` → naive-UTC datetime (best effort)."""
+    raw = entry.get("modified") or entry.get("clientModified")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
+
+
+def _remote_unchanged(prior: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """Is the remote file provably the same content we already loaded?
+
+    Precedence:
+      1. Fingerprints on BOTH sides (content hash): equality decides outright.
+      2. Remote `modified` newer than our download time → re-posted → reload.
+    A reload is idempotent (per-key / period-replace upserts) and refreshes
+    downloaded_at, so a restated file re-downloads exactly once.
+
+    The listing's `size` is deliberately NOT compared against the ledger's
+    `bytes`: bytes is the count we actually downloaded, and if Kiteworks'
+    reported size ever differs from stored bytes (encryption padding, logical
+    sizes), a size comparison would re-download every file on every sync.
+    """
+    fingerprint = entry.get("fingerprint")
+    if fingerprint and prior.get("fingerprint"):
+        return prior["fingerprint"] == fingerprint
+
+    modified = _parse_remote_modified(entry)
+    downloaded_at = prior.get("downloaded_at")
+    if modified is not None and downloaded_at is not None:
+        if isinstance(downloaded_at, datetime) and downloaded_at.tzinfo is not None:
+            downloaded_at = downloaded_at.astimezone(UTC).replace(tzinfo=None)
+        if isinstance(downloaded_at, datetime) and modified > downloaded_at:
+            return False
+
+    return True
+
+
 # --- Warehouse backups (Patch #9) ------------------------------------------------------
 
 def create_backup(
@@ -251,6 +305,7 @@ async def _parse_and_load_zip(
     folder_id: str,
     fingerprint: Any,
     bytes_written: int,
+    downloaded_at: datetime | None = None,
 ) -> FileOutcome:
     """Parse a local zip and load it into the warehouse, writing ledger rows.
 
@@ -284,7 +339,7 @@ async def _parse_and_load_zip(
                 "file_date": parsed.file_date,
                 "bytes": bytes_written,
                 "fingerprint": fingerprint,
-                "downloaded_at": datetime.now(UTC),
+                "downloaded_at": downloaded_at or datetime.now(UTC),
                 "loaded_at": None,
                 "row_count": None,
                 "status": "failed",
@@ -341,7 +396,7 @@ async def _parse_and_load_zip(
                 "file_date": parsed.file_date,
                 "bytes": bytes_written,
                 "fingerprint": fingerprint,
-                "downloaded_at": datetime.now(UTC),
+                "downloaded_at": downloaded_at or datetime.now(UTC),
                 "loaded_at": None,
                 "row_count": None,
                 "status": "failed",
@@ -394,7 +449,7 @@ async def _parse_and_load_zip(
             "file_date": parsed.file_date,
             "bytes": bytes_written,
             "fingerprint": fingerprint,
-            "downloaded_at": datetime.now(UTC),
+            "downloaded_at": downloaded_at or datetime.now(UTC),
             "loaded_at": datetime.now(UTC),
             "row_count": rows,
             "status": "loaded",
@@ -437,16 +492,22 @@ async def _process_one_file(
 
     dataset: Dataset = parsed.pattern.dataset
     prior = warehouse.ledger_seen(file_id)
-    if (
-        prior
-        and prior.get("status") == "loaded"
-        and (not fingerprint or prior.get("fingerprint") == fingerprint)
-    ):
+    if prior and prior.get("status") == "loaded" and _remote_unchanged(prior, entry):
         return FileOutcome(
             file_id=file_id,
             file_name=name,
             dataset=dataset,
             status="skipped",
+        )
+    if prior and prior.get("status") == "loaded":
+        logger.info(
+            "restated_file_detected",
+            file_name=name,
+            dataset=dataset,
+            remote_size=entry.get("size"),
+            ledger_bytes=prior.get("bytes"),
+            remote_modified=str(entry.get("modified")),
+            downloaded_at=str(prior.get("downloaded_at")),
         )
 
     async with semaphore:
@@ -458,6 +519,25 @@ async def _process_one_file(
             logger.warning(
                 "file_download_failed", file_name=name, dataset=dataset, error=err_msg
             )
+            if prior and prior.get("status") == "loaded":
+                # A failed RE-download of a restatement (Patch #14: this path
+                # is newly reachable for loaded rows). The v1 rows are still
+                # in the data table — do not demote the ledger row to
+                # 'failed'/NULLs; leave it untouched so downloaded_at stays
+                # older than the remote `modified` and the next sync retries.
+                logger.warning(
+                    "restated_redownload_failed_prior_load_preserved",
+                    file_name=name,
+                    dataset=dataset,
+                    error=err_msg,
+                )
+                return FileOutcome(
+                    file_id=file_id,
+                    file_name=name,
+                    dataset=dataset,
+                    status="failed",
+                    error=f"restated re-download failed (prior load preserved): {err_msg}",
+                )
             warehouse.ledger_upsert(
                 {
                     "file_id": file_id,
@@ -1052,15 +1132,25 @@ async def reingest_local_files(
     # reached disk, and stamping it onto a reingest of the older on-disk zip
     # would make live sync skip the real file forever (review fix: major).
     _, ledger_rows = warehouse.execute_sql(
-        "SELECT file_name, file_id, fingerprint, status FROM _file_ledger "
+        "SELECT file_name, file_id, fingerprint, status, downloaded_at "
+        "FROM _file_ledger "
         "ORDER BY (file_id LIKE 'local:%'), loaded_at DESC NULLS LAST"
     )
-    known_rows: dict[str, tuple[str, Any]] = {}
-    for fname, fid, fp, status in ledger_rows:
-        known_rows.setdefault(fname, (fid, fp if status == "loaded" else None))
+    known_rows: dict[str, tuple[str, Any, Any]] = {}
+    for fname, fid, fp, status, dl_at in ledger_rows:
+        known_rows.setdefault(
+            fname, (fid, fp if status == "loaded" else None, dl_at)
+        )
 
     async def _load_local(parsed: Any, zp: Path) -> FileOutcome:
-        file_id, fingerprint = known_rows.get(zp.name, (f"local:{zp.name}", None))
+        # Preserve the original downloaded_at when reusing a row: a reingest
+        # re-parses LOCAL bytes, and downloaded_at must keep meaning "when we
+        # fetched the remote bytes" — bumping it here would mask any remote
+        # restatement posted since (review fix: the next sync's
+        # modified-vs-downloaded_at test would wrongly skip it forever).
+        file_id, fingerprint, prior_downloaded_at = known_rows.get(
+            zp.name, (f"local:{zp.name}", None, None)
+        )
         outcome = await _parse_and_load_zip(
             warehouse,
             parsed=parsed,
@@ -1070,6 +1160,7 @@ async def reingest_local_files(
             folder_id="local",
             fingerprint=fingerprint,
             bytes_written=zp.stat().st_size,
+            downloaded_at=prior_downloaded_at,
         )
         result.outcomes.append(outcome)
         if outcome.status == "loaded":

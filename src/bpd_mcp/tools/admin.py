@@ -884,18 +884,32 @@ async def _disk_usage(settings: Settings, **_: Any) -> HealthCheckResult:
                 total += p.stat().st_size
             except OSError:
                 pass
+    # Patch #14: backups are deliberately-retained copies pruned by
+    # BPD_BACKUP_KEEP — counting them against the working-set threshold made
+    # the check warn precisely BECAUSE the safety net exists (observed live:
+    # 3.27→4.46 GiB, almost entirely backups). Warn on the core working set;
+    # report backups separately with the prune lever.
+    backups = _dir_bytes(settings.backups_dir)
+    core = total - backups
     gib = total / (1024**3)
+    core_gib = core / (1024**3)
+    backups_gib = backups / (1024**3)
     cap_gib = settings.bpd_raw_dir_max_bytes / (1024**3)
-    if total > 4 * (1024**3):
+    breakdown = (
+        f"data_dir = {gib:.2f} GiB (core {core_gib:.2f} + backups "
+        f"{backups_gib:.2f}, prunable via BPD_BACKUP_KEEP={settings.bpd_backup_keep}; "
+        f"raw cap is {cap_gib:.2f} GiB and never evicts un-ingested zips)"
+    )
+    if core > 4 * (1024**3):
         return HealthCheckResult(
             name="disk_usage",
             status="warn",
-            detail=f"data_dir = {gib:.2f} GiB (cap is {cap_gib:.2f} GiB)",
+            detail=breakdown,
         )
     return HealthCheckResult(
         name="disk_usage",
         status="pass",
-        detail=f"data_dir = {gib:.2f} GiB",
+        detail=breakdown,
     )
 
 
