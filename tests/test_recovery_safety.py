@@ -1059,3 +1059,318 @@ def test_migration_merges_failed_shadow_onto_failed_original(tmp_path: Path) -> 
         assert b == [("KW-B", "loaded")]
     finally:
         wh2.close()
+
+
+# ---------- restatement detection (Patch #14) ----------
+
+
+def test_remote_unchanged_predicate() -> None:
+    """Fingerprints (when both exist) decide outright; otherwise size, then
+    remote modified vs our download time. Bare metadata (legacy) → unchanged."""
+    from bpd_mcp.sync import _remote_unchanged
+
+    t0 = datetime(2026, 7, 26, 16, 28)
+    prior = {"fingerprint": "fp-1", "bytes": 321729, "downloaded_at": t0}
+
+    # Hash agreement trumps everything, including a newer modified stamp.
+    assert _remote_unchanged(
+        prior, {"fingerprint": "fp-1", "size": 999, "modified": "2026-08-03T14:55:20"}
+    )
+    assert not _remote_unchanged(prior, {"fingerprint": "fp-2"})
+
+    # No fingerprint in the listing (the live reality): re-posted after our
+    # download → restated.
+    assert not _remote_unchanged(
+        prior, {"size": 321951, "modified": "2026-08-03T14:55:20+00:00"}
+    )
+    # Modified before our download → unchanged. Size is deliberately ignored
+    # (ledger bytes = downloaded count; listing size may live in a different
+    # domain — comparing them risks a redownload-every-sync loop).
+    assert _remote_unchanged(
+        prior, {"size": 999999, "modified": "2026-07-26T10:00:00Z"}
+    )
+    # Legacy listing with no usable metadata → unchanged (old behavior).
+    assert _remote_unchanged(prior, {})
+
+
+@respx.mock
+async def test_sync_reloads_restated_file_same_id(tmp_path: Path) -> None:
+    """The live 2026-08-03 incident: Target re-uploads a weekly sales file
+    under the SAME file_id with a newer `modified` and no listing fingerprint.
+    The old predicate skipped it forever; it must re-download, period_replace
+    must swap the week's rows, and the reload must not loop."""
+    s = _settings(tmp_path)
+    name = "BV_139440_WEEKLY_SALES_TCIN_LOC_07252026_KW.zip"
+    now = datetime.now(UTC)
+    downloaded_original = now - timedelta(days=2)
+    restated_modified = (now - timedelta(hours=1)).isoformat()
+
+    _mock_kiteworks(
+        [
+            {
+                "id": "KW-725",
+                "name": name,
+                "type": "f",
+                "parentId": "F1",
+                "size": 321951,
+                "modified": restated_modified,
+                # deliberately NO fingerprint — live listings don't carry one
+            }
+        ]
+    )
+    v2 = tmp_path / "v2.zip"
+    _zip(
+        v2,
+        f"{SALES_WEEKLY_HDR}\n"
+        f"{_sales_row('2026-07-25', amount=21.50)}\n"
+        f"{_sales_row('2026-07-25', tcin=111, amount=5.00)}\n",
+    )
+    respx.get(f"{BASE}/rest/files/KW-725/content").mock(
+        return_value=httpx.Response(200, content=v2.read_bytes())
+    )
+
+    wh = Warehouse(s.db_path)
+    try:
+        # State as of the original sync two days ago: v1 row in the table,
+        # ledger row loaded with NO fingerprint (live reality).
+        df = pl.DataFrame(
+            {
+                "tcin": [89854823],
+                "location_id": [918],
+                "sales_date": [date(2026, 7, 25)],
+                "sale_amount": [19.99],
+                "sale_quantity": [1.0],
+            }
+        )
+        cols = derive_duckdb_schema(df)
+        wh.ensure_data_table("sales_weekly", cols)
+        wh.upsert_dataframe(
+            "sales_weekly", df, primary_key=("tcin", "location_id", "sales_date")
+        )
+        wh.ledger_upsert(
+            {
+                "file_id": "KW-725",
+                "file_name": name,
+                "folder_id": "F1",
+                "dataset": "sales_weekly",
+                "file_date": date(2026, 7, 25),
+                "bytes": 321729,
+                "fingerprint": None,
+                "downloaded_at": downloaded_original,
+                "loaded_at": downloaded_original,
+                "row_count": 1,
+                "status": "loaded",
+                "error_message": None,
+                "parse_method": "strict",
+            }
+        )
+        async with httpx.AsyncClient() as http:
+            auth = AuthManager(s, http, bundle=_bundle())
+            client = KiteworksClient(s, auth, http)
+
+            # Restated file (modified AFTER our download) must re-download.
+            r1 = await sync_new_files(client, wh, s, triggered_by="t1")
+            assert r1.files_loaded == 1, r1
+
+            # Same listing again: downloaded_at now postdates modified → skip.
+            r2 = await sync_new_files(client, wh, s, triggered_by="t2")
+            assert r2.files_loaded == 0 and r2.files_skipped == 1, r2
+
+        _, rows = wh.execute_sql(
+            "SELECT COUNT(*), ROUND(SUM(sale_amount), 2) FROM sales_weekly"
+        )
+        # period_replace: the restated week REPLACED v1 (19.99), no mixing.
+        assert rows[0] == (2, 26.50)
+        _, led = wh.execute_sql(
+            "SELECT COUNT(*) FROM _file_ledger WHERE file_name = "
+            f"'{name}' AND status = 'loaded'"
+        )
+        assert led[0][0] == 1, "one ledger row, updated in place"
+    finally:
+        wh.close()
+
+
+async def test_disk_usage_excludes_backups_from_warn_threshold(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review context (Patch #9) finally implemented: backups are
+    deliberately-retained, prunable copies — they must not push the working-set
+    warning over the line (observed live: warn driven almost entirely by the
+    backups dir)."""
+    import os as _os
+
+    from bpd_mcp.tools.admin import _disk_usage
+
+    s = _settings(tmp_path)
+    big = 4 * 1024**3 + 100 * 1024**2  # 4.1 GiB, sparse
+
+    # 4.1 GiB of BACKUPS: pass, with the breakdown visible.
+    bpath = s.backups_dir / "bpd-20260803T000000Z-pre-sync.duckdb"
+    with open(bpath, "wb") as f:
+        f.truncate(big)
+    res = await _disk_usage(settings=s)
+    assert res.status == "pass", res.detail
+    assert "backups" in res.detail and "BPD_BACKUP_KEEP" in res.detail
+    _os.remove(bpath)
+
+    # 4.1 GiB of CORE (raw zips): warn.
+    rpath = s.raw_dir / "huge.zip"
+    with open(rpath, "wb") as f:
+        f.truncate(big)
+    res2 = await _disk_usage(settings=s)
+    assert res2.status == "warn", res2.detail
+
+
+def test_ledger_timestamps_round_trip_as_naive_utc_regardless_of_session_tz(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix (critical): DuckDB converts AWARE datetimes
+    through the SESSION timezone into naive TIMESTAMP columns — on a PT host,
+    downloaded_at read back 7h earlier than reality, breaking every
+    modified-vs-downloaded_at comparison (reload loops west of UTC, silently
+    skipped restatements east of it). The write boundary now normalizes to
+    naive UTC even if the session TZ is not UTC."""
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        # Simulate a non-UTC host by overriding the pinned session timezone.
+        wh._conn.execute("SET TimeZone='America/Los_Angeles'")
+        now_aware = datetime.now(UTC)
+        wh.ledger_upsert(
+            {
+                "file_id": "TZ-1",
+                "file_name": "tz.zip",
+                "folder_id": "F1",
+                "dataset": "sales_weekly",
+                "file_date": date(2026, 7, 25),
+                "bytes": 1,
+                "fingerprint": None,
+                "downloaded_at": now_aware,
+                "loaded_at": now_aware,
+                "row_count": 1,
+                "status": "loaded",
+                "error_message": None,
+                "parse_method": "strict",
+            }
+        )
+        prior = wh.ledger_seen("TZ-1")
+        stored = prior["downloaded_at"]
+        expected = now_aware.replace(tzinfo=None)
+        drift = abs((stored - expected).total_seconds())
+        assert drift < 5, (
+            f"downloaded_at drifted {drift}s from naive UTC — session-TZ "
+            "conversion is leaking into ledger timestamps again"
+        )
+    finally:
+        wh.close()
+
+
+async def test_reingest_preserves_downloaded_at_so_restatements_stay_detectable(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix (major): a local reingest re-parses on-disk
+    bytes — it must NOT bump downloaded_at on the Kiteworks-id row, or a
+    restatement posted between the download and the reingest becomes
+    permanently invisible to the next sync's modified-vs-downloaded_at test."""
+    from bpd_mcp.sync import _remote_unchanged
+
+    s = _settings(tmp_path)
+    name = "BV_139440_WEEKLY_SALES_TCIN_LOC_04252026_KW.zip"
+    _zip(s.raw_dir / name, f"{SALES_WEEKLY_HDR}\n{_sales_row('2026-04-25')}\n")
+    downloaded_original = datetime.now(UTC) - timedelta(days=2)
+
+    wh = Warehouse(s.db_path)
+    try:
+        wh.ledger_upsert(
+            {
+                "file_id": "KW-425",
+                "file_name": name,
+                "folder_id": "F1",
+                "dataset": "sales_weekly",
+                "file_date": date(2026, 4, 25),
+                "bytes": 100,
+                "fingerprint": None,
+                "downloaded_at": downloaded_original,
+                "loaded_at": downloaded_original,
+                "row_count": 1,
+                "status": "loaded",
+                "error_message": None,
+                "parse_method": "strict",
+            }
+        )
+        r = await reingest_local_files(wh, s, only_unledgered=False)
+        assert r.files_loaded == 1, r
+        prior = wh.ledger_seen("KW-425")
+        drift = abs(
+            (prior["downloaded_at"] - downloaded_original.replace(tzinfo=None))
+            .total_seconds()
+        )
+        assert drift < 5, "reingest must not bump downloaded_at"
+        # The pending restatement (posted yesterday, i.e. after the original
+        # download) must still register as changed.
+        restated = {"modified": (datetime.now(UTC) - timedelta(days=1)).isoformat()}
+        assert not _remote_unchanged(prior, restated)
+    finally:
+        wh.close()
+
+
+@respx.mock
+async def test_failed_restatement_redownload_preserves_loaded_ledger_row(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix: a transient error re-downloading a restatement
+    must not demote the 'loaded' row to failed/NULLs — the v1 rows are still
+    in the table, and keeping downloaded_at old is what makes the next sync
+    retry."""
+    s = _settings(tmp_path)
+    name = "BV_139440_WEEKLY_SALES_TCIN_LOC_07252026_KW.zip"
+    downloaded_original = datetime.now(UTC) - timedelta(days=2)
+    _mock_kiteworks(
+        [
+            {
+                "id": "KW-725",
+                "name": name,
+                "type": "f",
+                "parentId": "F1",
+                "size": 321951,
+                "modified": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+            }
+        ]
+    )
+    respx.get(f"{BASE}/rest/files/KW-725/content").mock(
+        return_value=httpx.Response(503, text="transient")
+    )
+    wh = Warehouse(s.db_path)
+    try:
+        wh.ledger_upsert(
+            {
+                "file_id": "KW-725",
+                "file_name": name,
+                "folder_id": "F1",
+                "dataset": "sales_weekly",
+                "file_date": date(2026, 7, 25),
+                "bytes": 321729,
+                "fingerprint": None,
+                "downloaded_at": downloaded_original,
+                "loaded_at": downloaded_original,
+                "row_count": 1,
+                "status": "loaded",
+                "error_message": None,
+                "parse_method": "strict",
+            }
+        )
+        async with httpx.AsyncClient() as http:
+            auth = AuthManager(s, http, bundle=_bundle())
+            client = KiteworksClient(s, auth, http)
+            r = await sync_new_files(client, wh, s, triggered_by="t")
+        assert r.files_failed == 1, r
+        assert "prior load preserved" in (r.outcomes[0].error or "")
+        prior = wh.ledger_seen("KW-725")
+        assert prior["status"] == "loaded", "loaded state must survive the 503"
+        assert prior["loaded_at"] is not None
+        drift = abs(
+            (prior["downloaded_at"] - downloaded_original.replace(tzinfo=None))
+            .total_seconds()
+        )
+        assert drift < 5, "downloaded_at must stay old so the next sync retries"
+    finally:
+        wh.close()
