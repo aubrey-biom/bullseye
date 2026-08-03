@@ -149,3 +149,91 @@ async def test_cache_status_transactional_vs_all_dimensional_split(tmp_path: Pat
     by_ds = {r["dataset"]: r for r in data["per_dataset"]}
     assert by_ds["sales_weekly"]["kind"] == "transactional"
     assert by_ds["location_attr"]["kind"] == "dimensional"
+
+
+# ---------- Patch #12: snapshot vs content ranges, feed kinds, retired status ----------
+
+
+def test_list_datasets_reports_snapshot_and_content_ranges(tmp_path) -> None:
+    """forecast_weekly's freshness (last_update_d) and horizon
+    (fiscal_week_begin_d) differ by months — both must be visible, and VARCHAR
+    date columns must aggregate as dates, not strings."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.execute_sql(
+            "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+            "fiscal_week_begin_d VARCHAR, last_update_d DATE, "
+            "selected_forecast_q BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO forecast_weekly VALUES "
+            "(100, 1, '2026-07-19', DATE '2026-07-20', 10), "
+            "(100, 1, '2026-10-11', DATE '2026-07-20', 20), "
+            # lexicographic trap: '2026-9-01' style would break string MIN/MAX;
+            # TRY_CAST also tolerates a garbage value without failing the row set.
+            "(100, 1, 'bogus', DATE '2026-06-01', 5)"
+        )
+        wh.execute_sql(
+            "CREATE TABLE po_plan_daily (business_d DATE, tcin BIGINT, "
+            "order_d DATE, receiving_location_id BIGINT, ordered_q BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO po_plan_daily VALUES "
+            "(DATE '2026-07-31', 100, DATE '2026-09-28', 500, 40)"
+        )
+        wh.execute_sql(
+            "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+            "sales_date DATE, sale_quantity BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO sales_weekly VALUES (100, 1, DATE '2026-07-25', 9)"
+        )
+        rows = {r["dataset"]: r for r in wh.list_datasets()}
+
+        fc = rows["forecast_weekly"]
+        assert fc["date_column"] == "last_update_d"
+        assert str(fc["max_date"]) == "2026-07-20"  # snapshot = freshness
+        assert fc["content_column"] == "fiscal_week_begin_d"
+        assert str(fc["content_max_date"]) == "2026-10-11"  # horizon
+        assert fc["feed_kind"] == "keyed_overwrite_mixed"
+        assert fc["status"] == "active"
+
+        po = rows["po_plan_daily"]
+        assert po["date_column"] == "business_d"
+        assert str(po["max_date"]) == "2026-07-31"
+        assert po["content_column"] == "order_d"
+        assert str(po["content_max_date"]) == "2026-09-28"
+        assert po["feed_kind"] == "accumulating_snapshots"
+
+        # No DATE_RANGE_ROLES entry → content == snapshot.
+        sw = rows["sales_weekly"]
+        assert sw["content_column"] == sw["date_column"]
+        assert sw["content_max_date"] == sw["max_date"]
+        assert sw["feed_kind"] == "period_replace"
+        assert sw["status"] == "active"
+    finally:
+        wh.close()
+
+
+def test_list_datasets_marks_fully_retired_datasets(tmp_path) -> None:
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.execute_sql(
+            "CREATE TABLE sales_weekly_item (tcin BIGINT, sales_date DATE, "
+            "sale_quantity BIGINT)"
+        )
+        wh.execute_sql(
+            "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+            "sales_date DATE, sale_quantity BIGINT)"
+        )
+        rows = {r["dataset"]: r for r in wh.list_datasets()}
+        # Single retired pattern → retired; active pattern + retired HISTORY
+        # twin → still active.
+        assert rows["sales_weekly_item"]["status"] == "retired"
+        assert rows["sales_weekly"]["status"] == "active"
+    finally:
+        wh.close()

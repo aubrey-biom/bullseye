@@ -580,6 +580,25 @@ async def sync_new_files(
             continue
         if wanted is not None and parsed.pattern.dataset not in wanted:
             continue
+        # Patch #12: retired feeds are excluded from routine discovery — Target
+        # sunset them, so a matching file reappearing in the folder is unusual
+        # and should be a deliberate load (name the dataset in `datasets`).
+        # Local reingest is unaffected: retired patterns stay classifiable.
+        if parsed.pattern.retired and wanted is None:
+            result.files_skipped += 1
+            result.outcomes.append(
+                FileOutcome(
+                    file_id=str(entry.get("id", "")),
+                    file_name=str(entry.get("name", "")),
+                    dataset=parsed.pattern.dataset,
+                    status="skipped",
+                    error=(
+                        "retired feed (Target sunset this file family); pass "
+                        f"datasets=[\"{parsed.pattern.dataset}\"] to load it anyway"
+                    ),
+                )
+            )
+            continue
         candidates.append((entry, parsed))
 
     # Patch #10 stale-dimension guard: split candidates into regular files

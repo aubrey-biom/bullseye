@@ -4,7 +4,7 @@ describe_schema, plus the S&OP analytics added in the May 2026 patch
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from ..column_roles import (
@@ -78,6 +78,62 @@ def _column_not_found_error(err: ColumnNotFound, *, fmt: str) -> ToolResponse:
 
 def _rows_to_dicts(cols: list[str], rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
     return [dict(zip(cols, r, strict=False)) for r in rows]
+
+
+def _as_pydate(v: Any) -> date | None:
+    """Normalize DuckDB date-ish values (date, datetime, ISO string) to date."""
+    from datetime import datetime as _datetime
+
+    if v is None:
+        return None
+    if isinstance(v, _datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except Exception:
+        return None
+
+
+def _effective_date_range(
+    warehouse: Warehouse, table: str, date_expr: str, where_sql: str = ""
+) -> tuple[date | None, date | None]:
+    """MIN/MAX of `date_expr` as DATEs under `where_sql`. Best-effort (Patch #12)."""
+    try:
+        _, dr = warehouse.execute_sql(
+            f"SELECT MIN(TRY_CAST({date_expr} AS DATE)), "
+            f"MAX(TRY_CAST({date_expr} AS DATE)) "
+            f"FROM {quote_ident(table)} {where_sql}"
+        )
+        if dr:
+            return _as_pydate(dr[0][0]), _as_pydate(dr[0][1])
+    except Exception:
+        pass
+    return None, None
+
+
+def _alternative_sales_source(
+    warehouse: Warehouse, chosen: str
+) -> dict[str, Any] | None:
+    """Coverage of the sales table NOT chosen, so callers can see when the
+    other grain reaches further back and opt in via `grain` (Patch #12)."""
+    other = "sales_daily" if chosen == "sales_weekly" else "sales_weekly"
+    if not table_exists(warehouse, other):
+        return None
+    alt_date = _try_resolve(warehouse, other, "date")
+    if alt_date is None:
+        return None
+    mn, mx = _effective_date_range(warehouse, other, alt_date.select_as_date())
+    return {
+        "table": other,
+        "min_date": str(mn) if mn else None,
+        "max_date": str(mx) if mx else None,
+        # The main response's effective range respects the call's filters;
+        # this range deliberately does not (it answers "does the other grain
+        # reach further back AT ALL").
+        "scope": "entire table, unfiltered",
+    }
 
 
 # ---------- bpd_run_sql ----------
@@ -259,18 +315,70 @@ async def get_sales_summary(
         )
 
     dict_rows = _rows_to_dicts(cols, rows)
+
+    # Patch #12 honesty: the data range actually covered, boundary-bucket
+    # flags, and the other sales table's coverage — a May-partial month must
+    # never read like a full month, and a no-arg call must say what period it
+    # spans.
+    eff_min, eff_max = _effective_date_range(warehouse, table, date_expr, where_sql)
+    source_grain = "day" if table == "sales_daily" else "week"
+    if dict_rows and params.grain in ("week", "month") and eff_min and eff_max:
+        # Conservative ±6d tolerance when buckets are built from weekly rows:
+        # a week-END anchor landing days into the bucket is still full coverage.
+        tol = timedelta(days=6) if source_grain == "week" else timedelta(days=0)
+
+        def _bounds(bucket: Any) -> tuple[date, date] | None:
+            b = _as_pydate(bucket)
+            if b is None:
+                return None
+            if params.grain == "week":
+                return b, b + timedelta(days=6)
+            nxt = (b.replace(day=28) + timedelta(days=4)).replace(day=1)
+            return b, nxt - timedelta(days=1)
+
+        # A NULL-date bucket (rows whose date is NULL) sorts last in DuckDB —
+        # anchor the boundary flags on the first/last DATED buckets, and mark
+        # the NULL bucket's flag as None (unknowable) rather than False
+        # (review fix: the true latest bucket was never flagged).
+        for r in dict_rows:
+            r["partial_bucket"] = False if _bounds(r["bucket"]) else None
+        first = next((r for r in dict_rows if _bounds(r["bucket"])), None)
+        last = next((r for r in reversed(dict_rows) if _bounds(r["bucket"])), None)
+        if first is not None:
+            fb = _bounds(first["bucket"])
+            if eff_min > fb[0] + tol:
+                first["partial_bucket"] = True
+        if last is not None:
+            lb = _bounds(last["bucket"])
+            if eff_max < lb[1] - tol:
+                last["partial_bucket"] = True
+
+    extra: dict[str, Any] = {
+        "table": table,
+        "source_grain": source_grain,
+        "date_col": date_col.name,
+        "date_col_type": date_col.duckdb_type,
+        "units_col": units_col.name,
+        "dollars_col": dollars_col.name if dollars_col else None,
+        "requested_start": str(params.start_date) if params.start_date else None,
+        "requested_end": str(params.end_date) if params.end_date else None,
+        "effective_start": str(eff_min) if eff_min else None,
+        "effective_end": str(eff_max) if eff_max else None,
+        "alternative_source": _alternative_sales_source(warehouse, table),
+        "sql": sql,
+    }
+    if params.grain == "month" and source_grain == "week":
+        extra["week_straddle_note"] = (
+            "month buckets are built from WEEKLY rows: a week straddling a "
+            "month boundary is attributed wholly to the month of its "
+            f"{date_col.name} anchor"
+        )
+    range_str = f", {eff_min}..{eff_max}" if eff_min and eff_max else ""
     return make_table_response(
         rows=dict_rows,
-        columns=cols,
-        title=f"Sales summary ({params.grain}, table={table})",
-        extra={
-            "table": table,
-            "date_col": date_col.name,
-            "date_col_type": date_col.duckdb_type,
-            "units_col": units_col.name,
-            "dollars_col": dollars_col.name if dollars_col else None,
-            "sql": sql,
-        },
+        columns=[*cols, "partial_bucket"] if dict_rows and "partial_bucket" in dict_rows[0] else cols,
+        title=f"Sales summary ({params.grain}, table={table}{range_str})",
+        extra=extra,
         fmt=fmt,
     )
 
@@ -329,14 +437,23 @@ async def get_top_skus(warehouse: Warehouse, params: TopSkusInput) -> ToolRespon
             fmt=fmt,
         )
     dict_rows = _rows_to_dicts(cols, rows)
+    # Patch #12: a no-arg call silently spanned all loaded history with no
+    # indication of the period covered — echo the effective range.
+    eff_min, eff_max = _effective_date_range(warehouse, table, date_expr, where_sql)
+    range_str = f", {eff_min}..{eff_max}" if eff_min and eff_max else ""
     return make_table_response(
         rows=dict_rows,
         columns=cols,
-        title=f"Top {params.top_n} SKUs by {params.by}",
+        title=f"Top {params.top_n} SKUs by {params.by} (table={table}{range_str})",
         extra={
             "table": table,
             "metric_col": metric_col.name,
             "metric_role": metric_role,
+            "requested_start": str(params.start_date) if params.start_date else None,
+            "requested_end": str(params.end_date) if params.end_date else None,
+            "effective_start": str(eff_min) if eff_min else None,
+            "effective_end": str(eff_max) if eff_max else None,
+            "alternative_source": _alternative_sales_source(warehouse, table),
             "sql": sql,
         },
         fmt=fmt,
@@ -377,6 +494,19 @@ async def get_inventory_snapshot(
     if params.location_id is not None:
         where.append(f"{quote_ident(loc_col.name)} = {int(params.location_id)}")
 
+    # Patch #12 staleness: 'latest known per pair' silently carries old rows
+    # forward across feed gaps. Staleness is measured against the feed's
+    # newest date WITHIN the as_of window (review fix: anchoring to the
+    # whole-table max made any historical as_of return zero rows), and pairs
+    # staler than max_staleness_days can be excluded.
+    anchor_where = f"WHERE TRY_CAST({date_expr} AS DATE) <= DATE '{as_of.isoformat()}'"
+    stale_filter = ""
+    if params.max_staleness_days is not None:
+        stale_filter = (
+            f"AND dt >= (SELECT MAX(TRY_CAST({date_expr} AS DATE)) "
+            f"FROM {quote_ident(table)} {anchor_where}) "
+            f"- INTERVAL {int(params.max_staleness_days)} DAY"
+        )
     sql = f"""
         WITH ranked AS (
             SELECT {quote_ident(tcin_col.name)} AS tcin,
@@ -391,7 +521,7 @@ async def get_inventory_snapshot(
             WHERE {' AND '.join(where)}
         )
         SELECT tcin, location_id, dt AS as_of_date, on_hand
-        FROM ranked WHERE rn = 1
+        FROM ranked WHERE rn = 1 {stale_filter}
         ORDER BY tcin, location_id
         LIMIT {int(params.limit)}
     """
@@ -404,8 +534,33 @@ async def get_inventory_snapshot(
             details={"sql": sql},
             fmt=fmt,
         )
+    dict_rows = _rows_to_dicts(out_cols, rows)
+
+    # Freshness anchor = the feed's newest date within the as_of window.
+    _mn, window_max = _effective_date_range(warehouse, table, date_expr, anchor_where)
+    staleness: dict[str, Any] = {
+        "window_max_date": str(window_max) if window_max else None,
+        "as_of": as_of.isoformat(),
+        "max_staleness_days_filter": params.max_staleness_days,
+    }
+    if window_max is not None and dict_rows:
+        def _days_old(v: Any) -> int | None:
+            d = _as_pydate(v)
+            return (window_max - d).days if d is not None else None
+
+        ages = [a for a in (_days_old(r["as_of_date"]) for r in dict_rows) if a is not None]
+        stale = [a for a in ages if a > 7]
+        staleness["returned_pairs"] = len(dict_rows)
+        staleness["stale_pairs_over_7d"] = len(stale)
+        staleness["max_staleness_days_returned"] = max(ages) if ages else None
+        if stale:
+            staleness["note"] = (
+                "stale pairs are 'latest known' carried across feed gaps — "
+                "their on_hand may be weeks old; filter with max_staleness_days "
+                "or check inventory_weekly for gap windows"
+            )
     return make_table_response(
-        rows=_rows_to_dicts(out_cols, rows),
+        rows=dict_rows,
         columns=out_cols,
         title=f"Inventory snapshot as of {as_of.isoformat()} (table={table})",
         extra={
@@ -413,6 +568,7 @@ async def get_inventory_snapshot(
             "date_col": date_col.name,
             "date_col_type": date_col.duckdb_type,
             "on_hand_col": on_hand_col.name,
+            "staleness": staleness,
         },
         fmt=fmt,
     )
@@ -450,6 +606,22 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
     sales_date_expr = sales_date.select_as_date()
     inv_date_expr = inv_date.select_as_date()
 
+    # Patch #12: optionally drop inventory pairs whose latest snapshot is
+    # staler than max_staleness_days vs the table's newest date — weeks-of-
+    # supply from 10-week-old on-hand is misleading. When the filter is on,
+    # the final join tightens to INNER so a filtered-out pair is EXCLUDED
+    # (review fix: with the LEFT JOIN it resurfaced as on_hand=0 →
+    # sell_through_rate=1.0, reading as fully sold through).
+    inv_stale_filter = ""
+    inv_join_kw = "LEFT JOIN"
+    if params.max_staleness_days is not None:
+        inv_stale_filter = (
+            f"AND inv_dt >= (SELECT MAX(TRY_CAST({inv_date_expr} AS DATE)) "
+            f"FROM {quote_ident(inv_table)}) "
+            f"- INTERVAL {int(params.max_staleness_days)} DAY"
+        )
+        inv_join_kw = "JOIN"
+
     where_sales: list[str] = []
     if params.start_date:
         where_sales.append(f"{sales_date_expr} >= DATE '{params.start_date.isoformat()}'")
@@ -477,12 +649,13 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
                 SELECT {quote_ident(inv_tcin.name)} AS tcin,
                        {quote_ident(inv_loc.name)} AS location_id,
                        {quote_ident(inv_on_hand.name)} AS on_hand,
+                       {inv_date_expr} AS inv_dt,
                        ROW_NUMBER() OVER (
                            PARTITION BY {quote_ident(inv_tcin.name)}, {quote_ident(inv_loc.name)}
                            ORDER BY {inv_date_expr} DESC
                        ) AS rn
                 FROM {quote_ident(inv_table)}
-            ) WHERE rn = 1
+            ) WHERE rn = 1 {inv_stale_filter}
         )
         SELECT s.tcin, s.location_id, s.units_sold, latest_inv.on_hand,
                CASE WHEN s.units_sold IS NULL OR s.units_sold = 0 THEN NULL
@@ -493,7 +666,7 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
                     ELSE s.units_sold * 1.0
                          / (s.units_sold + COALESCE(latest_inv.on_hand, 0))
                END AS sell_through_rate
-        FROM s LEFT JOIN latest_inv USING (tcin, location_id)
+        FROM s {inv_join_kw} latest_inv USING (tcin, location_id)
         ORDER BY s.units_sold DESC NULLS LAST
         LIMIT 1000
     """
@@ -521,6 +694,10 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
                 "inv_on_hand": inv_on_hand.name,
                 "inv_location": inv_loc.name,
             },
+            "inventory_max_date": str(
+                _effective_date_range(warehouse, inv_table, inv_date_expr)[1] or ""
+            ) or None,
+            "max_staleness_days_filter": params.max_staleness_days,
             "sql": sql,
         },
         fmt=fmt,
@@ -626,14 +803,17 @@ async def get_open_orders(
         f"- COALESCE({quote_ident(received.name)}, 0) "
         f"- COALESCE({quote_ident(cancel_rem.name)}, 0)"
     )
-    sql = (
+    lines_cte = (
         f"WITH lines AS ("
         f"SELECT {quote_ident(tcin_col.name)} AS tcin, "
         f"{quote_ident(po_id.name)} AS po_id, "
         f"{open_expr} AS open_units "
         f"FROM {quote_ident(table)} {where_sql}"
         ") "
-        "SELECT tcin, COUNT(DISTINCT po_id) AS po_count, "
+    )
+    sql = (
+        lines_cte
+        + "SELECT tcin, COUNT(DISTINCT po_id) AS po_count, "
         "SUM(open_units) AS open_units, COUNT(*) AS line_count "
         "FROM lines WHERE open_units > 0 "
         "GROUP BY tcin ORDER BY open_units DESC NULLS LAST"
@@ -648,6 +828,21 @@ async def get_open_orders(
             details={"sql": sql},
             fmt=fmt,
         )
+
+    # Patch #12: over-received lines (received + cancel > ordered) are
+    # correctly excluded from open units, but must not be invisible — surface
+    # a labeled count instead of a silent filter.
+    over_received: dict[str, Any] | None = None
+    try:
+        _, ov = warehouse.execute_sql(
+            lines_cte
+            + "SELECT COUNT(*), COALESCE(SUM(-open_units), 0) "
+            "FROM lines WHERE open_units < 0"
+        )
+        if ov:
+            over_received = {"lines": ov[0][0], "units_over": ov[0][1]}
+    except Exception:
+        over_received = None
 
     title = (
         "Open orders (latest order-book state)"
@@ -672,6 +867,7 @@ async def get_open_orders(
                 "location": loc_col.name,
                 "order_created": created.name if created else None,
             },
+            "over_received": over_received,
             "sql": sql,
         },
         fmt=fmt,
@@ -768,6 +964,9 @@ async def get_upcoming_pos(
             "order_date_col": order_d.name,
             "qty_col": qty.name,
             "latest_snapshot": latest_iso,
+            # Patch #12: snapshot age makes plan-vs-plan divergence
+            # diagnosable at a glance (the 07-29/07-31 launch-buy incident).
+            "snapshot_age_days": (date.today() - date.fromisoformat(latest_iso)).days,
         }
 
     if not projections:
@@ -820,6 +1019,19 @@ async def get_upcoming_pos(
         "source_totals": source_totals,
         "sql": sql,
     }
+    ages = [v["snapshot_age_days"] for v in resolved_cols.values()]
+    if len(ages) >= 2:
+        divergence = max(ages) - min(ages)
+        extra["snapshot_divergence_days"] = divergence
+        if divergence > 1:
+            extra["divergence_note"] = (
+                "the two plans' snapshots differ by more than a day — POs cut "
+                "in the gap appear as planned units in the older snapshot and "
+                "as firm orders (bpd_get_open_orders) in the newer one, so the "
+                "plans can legitimately disagree on launch buys. Prefer "
+                "po_plan_daily for the near horizon; use po_plan_biweekly only "
+                "beyond the daily plan's reach."
+            )
     if skipped_tables:
         extra["skipped_tables"] = skipped_tables
     if empty_tables:
@@ -865,19 +1077,24 @@ def _classify_forecast_drops(
     )
     out: list[dict[str, Any]] = []
     for snap, horizon_weeks, min_week, max_week, n_rows in rows:
-        # Published on/before its first covered week (+7d tolerance) → forward,
-        # REGARDLESS of how many weeks survive: per-key overwrites decay old
-        # forward drops to single-week residues, and genuine one-week-ahead
-        # forward files exist — both are forward-published (review fix: the old
-        # horizon_weeks>1 requirement made 'anomalous' the steady-state label).
+        # Live-validated against Target's real publication timing (Patch #12):
+        #   retro weeklies publish EXACTLY 7 days after week-begin (the Sunday
+        #   after the week ends) — snap > max_week + 6 means every covered
+        #   week had already ENDED at publication;
+        #   forward drops publish the MONDAY after the Sunday week-begin
+        #   (snap = min_week + 1), and per-key overwrites decay old forward
+        #   drops to residues with snap < min_week — both are snap ≤ min+2.
+        # The earlier +7d forward tolerance swallowed the retro pattern and
+        # labeled every drop forward_horizon; retro must be tested FIRST on
+        # the week-END side.
         if snap is None or min_week is None:
             kind = "anomalous"
-        elif snap <= min_week + _td(days=7):
-            kind = "forward_horizon"
-        elif horizon_weeks == 1:
+        elif snap > max_week + _td(days=6):
             kind = "weekly_retrospective"
+        elif snap <= min_week + _td(days=2):
+            kind = "forward_horizon"
         else:
-            kind = "anomalous"  # published after some covered weeks began
+            kind = "anomalous"  # published mid-range of its covered weeks
         out.append(
             {
                 "last_update_d": str(snap),
@@ -1042,6 +1259,23 @@ async def get_forecast_vs_actual(
     # one against a table that lacks it is a hard error, never a silent no-op
     # with metadata claiming otherwise (adversarial-review fix).
     policy = params.snapshot_policy
+    # A non-default lead only means something under pre_week (and as_of_date
+    # overrides the policy entirely) — silently dropping it would let a
+    # forgotten snapshot_policy='pre_week' read post-hoc revisions as a
+    # week-out forecast (review fix: hard error, never a silent no-op).
+    if params.pre_week_min_lead_days != 1 and (
+        policy != "pre_week" or params.as_of_date is not None
+    ):
+        return make_error_response(
+            code="INVALID_ARGUMENT",
+            message=(
+                "pre_week_min_lead_days only applies with "
+                "snapshot_policy='pre_week' and without as_of_date (which "
+                "overrides the policy). Set snapshot_policy='pre_week' or "
+                "drop the lead parameter."
+            ),
+            fmt=fmt,
+        )
     if fc_snap is None and (params.as_of_date is not None or policy == "pre_week"):
         return make_error_response(
             code="SCHEMA_INCOMPATIBLE",
@@ -1057,8 +1291,14 @@ async def get_forecast_vs_actual(
         cutoff_sql: str | None = f"DATE '{params.as_of_date.isoformat()}'"
         cutoff_desc = f"fixed as_of_date {params.as_of_date.isoformat()}"
     elif policy == "pre_week":
-        cutoff_sql = f"({fc_week_begin_expr} - INTERVAL 1 DAY)"
-        cutoff_desc = "pre_week (snapshot published before each week began)"
+        lead = int(params.pre_week_min_lead_days)
+        if lead >= 0:
+            cutoff_sql = f"({fc_week_begin_expr} - INTERVAL {lead} DAY)"
+        else:
+            cutoff_sql = f"({fc_week_begin_expr} + INTERVAL {-lead} DAY)"
+        cutoff_desc = (
+            f"pre_week (snapshot at least {lead} day(s) before each week began)"
+        )
     elif fc_snap is None:
         cutoff_sql = None
         cutoff_desc = "latest_available (table has no snapshot column)"
@@ -1222,6 +1462,8 @@ async def get_forecast_vs_actual(
         "coverage": coverage_summary,
         "include_unmatched": params.include_unmatched,
         "requested_weeks_back": weeks_back,
+        "requested_start": str(requested_start),
+        "requested_end": str(requested_end),
         "effective_start": str(effective_start),
         "effective_end": str(effective_end),
         "effective_weeks_covered": effective_weeks,
@@ -1236,6 +1478,18 @@ async def get_forecast_vs_actual(
         "variance_pct_scale": "percent (0-100)",
         "sql": sql,
     }
+    if cutoff_sql is not None:
+        # Applies to ANY historical cutoff (pre_week or as_of_date) — the
+        # thinness comes from retention, not from the policy chosen.
+        extra["snapshot_retention_caveat"] = (
+            "per-key ingest retention keeps only the NEWEST drop's row for "
+            "each (tcin, location, week) — once a later forward or "
+            "retrospective drop re-covers a week, its earlier snapshot is no "
+            "longer in the warehouse. Historical-cutoff coverage is therefore "
+            "thin for closed weeks and genuine only for weeks not yet "
+            "re-covered; a durable backtest needs snapshot archiving (a "
+            "deliberate retention change, not a query option)."
+        )
     if forecast_drops is not None:
         # The list is snapshot-ascending; keep the NEWEST 40 — consumers are
         # directed to the most recent forward_horizon drop, which a head slice

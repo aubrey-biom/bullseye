@@ -415,7 +415,9 @@ def _real_orders_daily_ddl() -> str:
         "purchase_order_create_d DATE, tcin BIGINT, "
         "receiving_location_id BIGINT, original_order_q BIGINT, "
         "revised_order_q BIGINT, item_received_q BIGINT, "
-        "cancel_remaining_order_q BIGINT, purchase_order_active_f BOOLEAN)"
+        "cancel_remaining_order_q BIGINT, "
+        "original_estimated_arrival_d DATE, revised_estimated_arrival_d DATE, "
+        "purchase_order_active_f BOOLEAN)"
     )
 
 
@@ -459,7 +461,7 @@ async def test_health_check_smoke_and_roles_pass_on_real_columns(
         wh.execute_sql(
             "INSERT INTO orders_daily VALUES "
             "(DATE '2026-07-30', 'PO-1', DATE '2026-06-01', 100, 500, "
-            "100, 100, 40, 10, NULL)"
+            "100, 100, 40, 10, DATE '2026-08-15', DATE '2026-08-20', NULL)"
         )
         resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
     finally:
@@ -483,7 +485,7 @@ async def test_health_check_known_unpopulated_warns_when_populated(
         wh.execute_sql(
             "INSERT INTO orders_daily VALUES "
             "(DATE '2026-07-30', 'PO-1', DATE '2026-06-01', 100, 500, "
-            "100, 100, 40, 10, TRUE)"
+            "100, 100, 40, 10, DATE '2026-08-15', DATE '2026-08-20', TRUE)"
         )
         resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
     finally:
@@ -569,3 +571,101 @@ async def test_health_check_smoke_skips_empty_po_plan_table(tmp_path: Path) -> N
     assert by["tools_smoke_test"]["status"] == "pass"
     assert by["roles_resolvable"]["status"] == "pass"
     assert resp.data["overall_status"] == "warn"  # only the usual fresh-install warns
+
+
+async def test_roles_resolvable_warns_not_fails_for_listing_only_roles(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix: an orders_daily generation without the ETA
+    columns breaks nothing but the dataset listings' content range — that's a
+    WARN with an accurate message, not a false 'analytics tools WILL fail'."""
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        # All REQUIRED_ROLES columns present; only the eta candidates missing.
+        wh.execute_sql(
+            "CREATE TABLE orders_daily ("
+            "snapshot_d DATE, purchase_order_id VARCHAR, "
+            "purchase_order_create_d DATE, tcin BIGINT, "
+            "receiving_location_id BIGINT, original_order_q BIGINT, "
+            "revised_order_q BIGINT, item_received_q BIGINT, "
+            "cancel_remaining_order_q BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO orders_daily VALUES "
+            "(DATE '2026-07-30', 'PO-1', DATE '2026-06-01', 100, 500, "
+            "100, 100, 40, 10)"
+        )
+        resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
+    finally:
+        wh.close()
+    by = _by_name(resp)
+    assert by["roles_resolvable"]["status"] == "warn"
+    assert "listing-only" in by["roles_resolvable"]["detail"]
+    assert "orders_daily.eta" in by["roles_resolvable"]["detail"]
+    assert by["tools_smoke_test"]["status"] == "pass"
+    assert resp.data["overall_status"] == "warn"
+
+
+async def test_datasets_have_data_reports_retired_empties_as_informational(
+    tmp_path: Path,
+) -> None:
+    """Patch #12: an empty retired dataset (feed sunset by Target) must not
+    drive the warn wording — only empty ACTIVE datasets are a warning cause."""
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        wh.execute_sql(
+            "CREATE TABLE sales_weekly_item (tcin BIGINT, sales_date DATE, "
+            "sale_quantity BIGINT)"
+        )
+        wh.execute_sql(
+            "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+            "sales_date DATE, sale_quantity BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO sales_weekly VALUES (1, 5, DATE '2026-07-25', 4)"
+        )
+        resp = await _run_checks(tmp_path=tmp_path, warehouse=wh, settings=s)
+    finally:
+        wh.close()
+    by = _by_name(resp)
+    check = by["datasets_have_data"]
+    # The only empty dataset is retired → pass, with the sunset note.
+    assert check["status"] == "pass"
+    assert "empty-but-retired" in check["detail"]
+    assert "sales_weekly_item" in check["detail"]
+
+
+async def test_cache_status_reports_content_horizon(tmp_path: Path) -> None:
+    """Patch #12: cache_status must surface the content horizon (how far
+    forward loaded plans/forecasts reach), not just snapshot freshness."""
+    from bpd_mcp.schemas import CacheStatusInput
+    from bpd_mcp.tools.admin import cache_status
+
+    s = _settings(tmp_path)
+    s.ensure_dirs()
+    wh = Warehouse(s.db_path)
+    try:
+        wh.execute_sql(
+            "CREATE TABLE po_plan_daily (business_d DATE, tcin BIGINT, "
+            "order_d DATE, receiving_location_id BIGINT, ordered_q BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO po_plan_daily VALUES "
+            "(DATE '2026-07-31', 100, DATE '2026-09-28', 500, 40)"
+        )
+        resp = await cache_status(wh, s, CacheStatusInput(response_format="json"))
+    finally:
+        wh.close()
+    assert resp.ok is True
+    data = resp.data
+    assert str(data["latest_content_date"]) == "2026-09-28"
+    per = {r["dataset"]: r for r in data["per_dataset"]}
+    row = per["po_plan_daily"]
+    assert row["feed_kind"] == "accumulating_snapshots"
+    assert row["status"] == "active"
+    assert str(row["content_max_date"]) == "2026-09-28"
+    assert str(row["max_date"]) == "2026-07-31"

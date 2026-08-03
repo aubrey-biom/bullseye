@@ -207,12 +207,16 @@ class KiteworksClient:
 
         OpenAPI spec confirms the response is an unwrapped array; we walk until
         the page is shorter than `limit`.
+
+        `name_filter` is applied CLIENT-SIDE as a case-insensitive substring
+        match (Patch #12): the Kiteworks `name` query param is exact-match, so
+        sending a substring there returned 0 rows for every real query. We
+        already fetch all pages regardless; filtering locally guarantees the
+        strict-subset invariant against server version drift.
         """
         out: list[dict[str, Any]] = []
         while True:
             params: dict[str, Any] = {"limit": limit, "offset": offset, "mode": mode}
-            if name_filter:
-                params["name"] = name_filter
             if extensions:
                 params["extensions"] = extensions
             if deleted is not None:
@@ -232,6 +236,9 @@ class KiteworksClient:
             if not page or len(page) < limit:
                 break
             offset += limit
+        if name_filter:
+            needle = name_filter.lower()
+            out = [c for c in out if needle in str(c.get("name") or "").lower()]
         return out
 
     async def get_folder(

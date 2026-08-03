@@ -291,3 +291,57 @@ def test_required_roles_datasets_exist_in_registry() -> None:
                 f"REQUIRED_ROLES demands {ds}.{role} but the registry has no "
                 "candidate list for it"
             )
+
+
+def test_feed_kinds_and_date_range_roles_complete_and_consistent() -> None:
+    """Patch #12 drift guards: FEED_KINDS covers every dataset; DATE_RANGE_ROLES
+    references only roles that exist in the registry (validate_roles enforces
+    them at runtime, this enforces them at CI time)."""
+    from typing import get_args
+
+    from bpd_mcp.column_roles import COLUMN_ROLES, DATE_RANGE_ROLES, FEED_KINDS
+    from bpd_mcp.parsers import Dataset
+
+    all_datasets = set(get_args(Dataset))
+    assert set(FEED_KINDS) == all_datasets, (
+        "every dataset needs a feed_kind (and no strays)"
+    )
+    allowed = {
+        "delta_latest_state", "accumulating_snapshots", "period_replace",
+        "append_daily", "keyed_overwrite_mixed", "dimensional",
+    }
+    assert set(FEED_KINDS.values()) <= allowed
+    for ds, roles_map in DATE_RANGE_ROLES.items():
+        assert ds in all_datasets
+        assert set(roles_map) == {"snapshot", "content"}
+        for role in roles_map.values():
+            assert role in COLUMN_ROLES[ds], (
+                f"DATE_RANGE_ROLES demands {ds}.{role} but the registry has "
+                "no candidate list for it"
+            )
+
+
+def test_validate_roles_flags_date_range_roles_as_soft(tmp_path: Path) -> None:
+    """Patch #12 pin (mutation-proof): a populated table missing a role that
+    only DATE_RANGE_ROLES demands must surface as a required=False failure —
+    dropping the DATE_RANGE_ROLES merge from validate_roles breaks this."""
+    from bpd_mcp.column_roles import validate_roles
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        # forecast_weekly WITHOUT any snapshot_date candidate: 'date'/'units'/
+        # 'tcin' (REQUIRED_ROLES) resolve, 'snapshot_date' (DATE_RANGE_ROLES
+        # only) cannot.
+        wh.execute_sql(
+            "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+            "fiscal_week_begin_d VARCHAR, selected_forecast_q BIGINT)"
+        )
+        wh.execute_sql(
+            "INSERT INTO forecast_weekly VALUES (100, 1, '2026-05-03', 5)"
+        )
+        failures = validate_roles(wh)
+        assert [(f["dataset"], f["role"], f["required"]) for f in failures] == [
+            ("forecast_weekly", "snapshot_date", False)
+        ]
+    finally:
+        wh.close()
