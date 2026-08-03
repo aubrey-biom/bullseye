@@ -604,7 +604,22 @@ class Warehouse:
         return None
 
     def list_datasets(self) -> list[dict[str, Any]]:
-        """One row per known dataset table with summary stats."""
+        """One row per known dataset table with summary stats.
+
+        Patch #12: datasets whose snapshot stamp differs from their content
+        horizon (DATE_RANGE_ROLES — forecast/po_plan/orders) report BOTH
+        ranges; `min_date`/`max_date` stay aliased to the snapshot range for
+        compatibility. Ranges aggregate through TRY_CAST(... AS DATE) so
+        VARCHAR date columns compare as dates, not strings. Rows also carry
+        `feed_kind` (delta/snapshot semantics) and `status` (active/retired).
+        """
+        from .column_roles import (
+            DATE_RANGE_ROLES,
+            FEED_KINDS,
+            ColumnNotFound,
+            resolve_column,
+        )
+
         with self._lock:
             tables = {
                 r[0]
@@ -618,23 +633,53 @@ class Warehouse:
             datasets = [
                 d for d in dict.fromkeys(p.dataset for p in PATTERNS) if d in tables
             ]
+            # A dataset is retired only if EVERY pattern feeding it is retired
+            # (sales_weekly has an active weekly pattern + a retired HISTORY
+            # twin — that's active).
+            retired: dict[str, bool] = {}
+            for p in PATTERNS:
+                retired[p.dataset] = retired.get(p.dataset, True) and p.retired
+
+            def _range(ds: str, col: str) -> tuple[Any, Any]:
+                md = self._conn.execute(
+                    f"SELECT MIN(TRY_CAST({quote_ident(col)} AS DATE)), "
+                    f"MAX(TRY_CAST({quote_ident(col)} AS DATE)) "
+                    f"FROM {quote_ident(ds)}"
+                ).fetchone()
+                return _coerce_date(md[0]), _coerce_date(md[1])
+
             results: list[dict[str, Any]] = []
             for ds in datasets:
-                date_col = self.detect_date_column(ds)
                 row_count = self._conn.execute(
                     f"SELECT COUNT(*) FROM {quote_ident(ds)}"
                 ).fetchone()[0]
-                min_date = max_date = None
-                if date_col:
-                    md = self._conn.execute(
-                        f"SELECT MIN({quote_ident(date_col)}), MAX({quote_ident(date_col)}) "
-                        f"FROM {quote_ident(ds)}"
-                    ).fetchone()
-                    # Coerce ISO-formatted text dates to `date` so callers can
-                    # mix-and-match values across datasets that use DATE vs TEXT
-                    # columns (Target ships both).
-                    min_date = _coerce_date(md[0])
-                    max_date = _coerce_date(md[1])
+
+                snapshot_col: str | None = None
+                content_col: str | None = None
+                roles_map = DATE_RANGE_ROLES.get(ds)
+                if roles_map:
+                    try:
+                        snapshot_col = resolve_column(self, ds, roles_map["snapshot"]).name
+                    except ColumnNotFound:
+                        snapshot_col = None
+                    try:
+                        content_col = resolve_column(self, ds, roles_map["content"]).name
+                    except ColumnNotFound:
+                        content_col = None
+                if snapshot_col is None:
+                    snapshot_col = self.detect_date_column(ds)
+                if content_col is None:
+                    content_col = snapshot_col
+
+                snap_min = snap_max = content_min = content_max = None
+                if snapshot_col:
+                    snap_min, snap_max = _range(ds, snapshot_col)
+                if content_col:
+                    if content_col == snapshot_col:
+                        content_min, content_max = snap_min, snap_max
+                    else:
+                        content_min, content_max = _range(ds, content_col)
+
                 file_count, last_loaded = self._conn.execute(
                     "SELECT COUNT(*), MAX(loaded_at) FROM _file_ledger "
                     "WHERE dataset = ? AND status = 'loaded'",
@@ -643,9 +688,15 @@ class Warehouse:
                 results.append(
                     {
                         "dataset": ds,
+                        "feed_kind": FEED_KINDS.get(ds, "unknown"),
+                        "status": "retired" if retired.get(ds) else "active",
                         "row_count": row_count,
-                        "min_date": min_date,
-                        "max_date": max_date,
+                        "date_column": snapshot_col,
+                        "min_date": snap_min,
+                        "max_date": snap_max,
+                        "content_column": content_col,
+                        "content_min_date": content_min,
+                        "content_max_date": content_max,
                         "file_count": file_count,
                         "last_loaded_at": last_loaded,
                     }

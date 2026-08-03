@@ -193,7 +193,22 @@ async def list_datasets(warehouse: Warehouse, params: ListDatasetsInput) -> Tool
     rows = warehouse.list_datasets()
     return make_table_response(
         rows=rows,
-        columns=["dataset", "row_count", "min_date", "max_date", "file_count", "last_loaded_at"],
+        columns=[
+            "dataset", "feed_kind", "status", "row_count",
+            "min_date", "max_date", "content_max_date",
+            "file_count", "last_loaded_at",
+        ],
+        extra={
+            "notes": (
+                "min/max_date = snapshot range (data freshness); "
+                "content_max_date = how far the CONTENT reaches (order_d / "
+                "fiscal week / ETA) — for forward-looking datasets these "
+                "differ by months. feed_kind says whether to query the table "
+                "whole (delta_latest_state), filter to max(business_d) "
+                "(accumulating_snapshots), or neither. status=retired means "
+                "Target sunset the feed; local rows are preserved history."
+            ),
+        },
         title="Loaded BPD datasets",
         fmt=params.response_format,
     )

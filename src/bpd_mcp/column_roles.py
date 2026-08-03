@@ -425,6 +425,53 @@ KNOWN_UNPOPULATED_AT_SOURCE: dict[str, tuple[str, ...]] = {
 }
 
 
+# Snapshot stamp vs content horizon per dataset (Patch #12). For forward-
+# looking datasets, detect_date_column's single answer is the SNAPSHOT stamp
+# (data freshness) — which HIDES how far into the future the content reaches
+# (the §6 trap: forecast_weekly "ends" 2026-07-27 by last_update_d while its
+# fiscal weeks run to 2026-10-18). Values are ROLE names resolved through
+# COLUMN_ROLES at query time. Datasets absent here have snapshot == content.
+DATE_RANGE_ROLES: dict[str, dict[str, str]] = {
+    "forecast_weekly": {"snapshot": "snapshot_date", "content": "date"},
+    "po_plan_daily": {"snapshot": "date", "content": "order_date"},
+    "po_plan_biweekly": {"snapshot": "date", "content": "order_date"},
+    "orders_daily": {"snapshot": "snapshot_date", "content": "eta"},
+}
+
+
+# How each dataset's feed behaves at load time (Patch #12) — the standing
+# answer to "is this a delta or a snapshot?", which three separate incidents
+# had to re-derive from first principles:
+#   delta_latest_state      — per-key replace, no date in the key: the table
+#                             IS the latest state (query it whole; snapshot
+#                             filters return a partial book)
+#   accumulating_snapshots  — full snapshot per business_d coexists forever:
+#                             ALWAYS filter to one business_d
+#   period_replace          — a file is the complete extract of its period(s)
+#   append_daily            — one day per file, days accumulate
+#   keyed_overwrite_mixed   — newer drops overwrite overlapping keys
+#                             (forecast_weekly: neither snapshots nor clean
+#                             latest-state; see forecast_drops)
+#   dimensional             — full-universe last-write-wins snapshot
+FEED_KINDS: dict[str, str] = {
+    "sales_daily": "append_daily",
+    "sales_weekly": "period_replace",
+    "sales_weekly_item": "period_replace",
+    "inventory_daily": "append_daily",
+    "inventory_weekly": "period_replace",
+    "inventory_weekly_item": "period_replace",
+    "gross_margin": "period_replace",
+    "gross_margin_item": "period_replace",
+    "orders_daily": "delta_latest_state",
+    "po_plan_daily": "accumulating_snapshots",
+    "po_plan_biweekly": "accumulating_snapshots",
+    "forecast_weekly": "keyed_overwrite_mixed",
+    "item_attr": "dimensional",
+    "item_attr_extended": "dimensional",
+    "location_attr": "dimensional",
+}
+
+
 def validate_roles(warehouse) -> list[dict[str, Any]]:
     """Check every REQUIRED_ROLES entry against the live schema.
 
@@ -435,8 +482,22 @@ def validate_roles(warehouse) -> list[dict[str, Any]]:
     unresolvable (dataset, role), each carrying the ColumnNotFound diagnostic
     detail (candidates tried, actual columns present).
     """
+    # Patch #12: DATE_RANGE_ROLES entries are validated too — a snapshot or
+    # content role drifting from real Target names would silently degrade the
+    # dataset listings back to single-date reporting. Those are SOFT
+    # (required=False): their only consumers degrade gracefully, so the health
+    # check warns instead of failing (review fix: a hard FAIL claimed
+    # "analytics tools WILL fail" when none would).
+    demanded: dict[str, dict[str, bool]] = {
+        ds: dict.fromkeys(roles, True) for ds, roles in REQUIRED_ROLES.items()
+    }
+    for ds, roles_map in DATE_RANGE_ROLES.items():
+        bucket = demanded.setdefault(ds, {})
+        for role in roles_map.values():
+            bucket.setdefault(role, False)
+
     failures: list[dict[str, Any]] = []
-    for dataset, roles in REQUIRED_ROLES.items():
+    for dataset, roles in demanded.items():
         if not table_exists(warehouse, dataset):
             continue
         _, rows = warehouse.execute_sql(
@@ -444,11 +505,11 @@ def validate_roles(warehouse) -> list[dict[str, Any]]:
         )
         if not rows or rows[0][0] == 0:
             continue
-        for role in roles:
+        for role in sorted(roles):
             try:
                 resolve_column(warehouse, dataset, role)
             except ColumnNotFound as e:
-                failures.append(e.detail)
+                failures.append({**e.detail, "required": roles[role]})
     return failures
 
 

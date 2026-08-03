@@ -76,15 +76,19 @@ async def cache_status(
     # caller can tell "we tried" from "no data at all".
     per_dataset: list[dict[str, Any]] = []
     for r in dataset_rows:
-        date_col = warehouse.detect_date_column(r["dataset"])
         per_dataset.append(
             {
                 "dataset": r["dataset"],
                 "kind": DATASET_KINDS.get(r["dataset"], "unknown"),
+                "feed_kind": r.get("feed_kind"),
+                "status": r.get("status"),
                 "row_count": r["row_count"],
-                "date_column": date_col,
+                "date_column": r.get("date_column"),
                 "min_date": r["min_date"],
                 "max_date": r["max_date"],
+                "content_column": r.get("content_column"),
+                "content_min_date": r.get("content_min_date"),
+                "content_max_date": r.get("content_max_date"),
                 "file_count": r["file_count"],
                 "last_loaded_at": r["last_loaded_at"],
             }
@@ -105,6 +109,16 @@ async def cache_status(
     ]
     tx_min, tx_max = _bounds(transactional_rows)
     all_min, all_max = _bounds(per_dataset)
+    # Patch #12: the content horizon — how far into the FUTURE loaded data
+    # reaches (planned orders, forecast weeks, ETAs). Distinct from freshness.
+    latest_content = max(
+        (
+            r["content_max_date"]
+            for r in transactional_rows
+            if r.get("content_max_date") is not None
+        ),
+        default=None,
+    )
 
     payload = {
         "data_dir": str(settings.data_dir),
@@ -113,9 +127,12 @@ async def cache_status(
         "ledger_files": info["ledger_file_count"],
         "ledger_total_bytes": info["ledger_bytes_total"],
         "datasets_loaded": len(dataset_rows),
-        # Business-data range (transactional datasets only).
+        # Business-data range (transactional datasets only; snapshot-based —
+        # i.e. data FRESHNESS).
         "earliest_data_date": tx_min,
         "latest_data_date": tx_max,
+        # Content horizon: how far forward loaded plans/forecasts/ETAs reach.
+        "latest_content_date": latest_content,
         # All-datasets range (includes dimensional tables).
         "earliest_data_date_including_dimensional": all_min,
         "latest_data_date_including_dimensional": all_max,
@@ -514,16 +531,23 @@ async def _sync_no_orphan_raw_files(
 @_timed
 async def _datasets_have_data(warehouse: Warehouse, **_: Any) -> HealthCheckResult:
     info = warehouse.describe()["tables"]
+    # A dataset is retired only if EVERY pattern feeding it is retired.
+    retired_map: dict[str, bool] = {}
+    for p in PATTERNS:
+        retired_map[p.dataset] = retired_map.get(p.dataset, True) and p.retired
     populated = 0
-    empty = []
+    empty_active: list[str] = []
+    empty_retired: list[str] = []
     # Dedupe: multiple patterns may map to one dataset (HISTORY backfill).
     for ds in dict.fromkeys(p.dataset for p in PATTERNS):
         if ds not in info:
             continue
         if info[ds]["row_count"] > 0:
             populated += 1
+        elif retired_map.get(ds):
+            empty_retired.append(ds)
         else:
-            empty.append(ds)
+            empty_active.append(ds)
     total_known = sum(1 for d in dict.fromkeys(p.dataset for p in PATTERNS) if d in info)
     if total_known == 0:
         return HealthCheckResult(
@@ -531,20 +555,26 @@ async def _datasets_have_data(warehouse: Warehouse, **_: Any) -> HealthCheckResu
             status="warn",
             detail="no dataset tables present — run bpd_sync_new_files",
         )
-    if not empty:
+    retired_note = (
+        f"; empty-but-retired (feed sunset by Target, no data expected): "
+        f"{empty_retired}"
+        if empty_retired
+        else ""
+    )
+    if not empty_active:
         return HealthCheckResult(
             name="datasets_have_data",
             status="pass",
-            detail=f"{populated}/{total_known} dataset(s) populated",
+            detail=f"{populated}/{total_known} dataset(s) populated{retired_note}",
         )
     return HealthCheckResult(
         name="datasets_have_data",
         status="warn",
         detail=(
             f"{populated}/{total_known} dataset(s) populated; "
-            f"empty: {empty} — possible causes: not subscribed, feed sunset "
-            "by Target, or sync has not run yet (check bpd_list_folder_contents "
-            "for the file family)"
+            f"empty active dataset(s): {empty_active} — possible causes: not "
+            "subscribed or sync has not run yet (check bpd_list_folder_contents "
+            f"for the file family){retired_note}"
         ),
     )
 
@@ -619,18 +649,36 @@ async def _roles_resolvable(warehouse: Warehouse, **_: Any) -> HealthCheckResult
             status="pass",
             detail="all required column roles resolve on every populated table",
         )
-    parts = [
-        f"{f['dataset']}.{f['role']} (tried {f['candidates']}; "
-        f"table has {f['actual_columns']})"
-        for f in failures
-    ]
-    return HealthCheckResult(
-        name="roles_resolvable",
-        status="fail",
-        detail=(
+
+    def _fmt(fs: list[dict[str, Any]]) -> str:
+        return "; ".join(
+            f"{f['dataset']}.{f['role']} (tried {f['candidates']}; "
+            f"table has {f['actual_columns']})"
+            for f in fs
+        )
+
+    hard = [f for f in failures if f.get("required", True)]
+    soft = [f for f in failures if not f.get("required", True)]
+    if hard:
+        detail = (
             "unresolvable required column role(s) — the analytics tools that "
             "depend on them WILL fail; add the real column name to "
-            "column_roles.COLUMN_ROLES: " + "; ".join(parts)
+            "column_roles.COLUMN_ROLES: " + _fmt(hard)
+        )
+        if soft:
+            detail += " | listing-only role(s) also unresolvable: " + _fmt(soft)
+        return HealthCheckResult(
+            name="roles_resolvable", status="fail", detail=detail
+        )
+    # Only listing-only (DATE_RANGE_ROLES) roles failed: dataset listings
+    # degrade to single-date reporting but every tool keeps working.
+    return HealthCheckResult(
+        name="roles_resolvable",
+        status="warn",
+        detail=(
+            "listing-only column role(s) unresolvable — bpd_list_datasets/"
+            "bpd_cache_status fall back to single-date reporting for the "
+            "affected dataset(s); no analytics tool fails: " + _fmt(soft)
         ),
     )
 

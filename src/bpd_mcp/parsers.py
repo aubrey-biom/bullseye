@@ -85,6 +85,13 @@ class FilePattern:
     # natural keys exist in a week — producing mixed-generation rows whose
     # totals match neither source.
     replace_scope: tuple[str, ...] | None = None
+    # Patch #12: Target stopped shipping this file family (or it was a
+    # one-off). Retired patterns are SKIPPED by live-sync discovery unless the
+    # dataset is explicitly requested, but stay fully classifiable forever —
+    # with ~2-week source retention, filename classifiability is the only
+    # durable link between an archived zip and its dataset, and the local
+    # reingest/recovery path depends on it. Never hard-delete a pattern.
+    retired: bool = False
 
 
 # --- Filename building blocks ---------------------------------------------------------
@@ -234,6 +241,8 @@ PATTERNS: tuple[FilePattern, ...] = (
             "fiscal_week_end_date", "sale_date",
         ),
         replace_scope=("sales_date",),
+        # Target sunset the *_TCIN rollup family ~mid-May 2026 (Patch #12).
+        retired=True,
     ),
 
     # ---------- inventory (item × location × day | week) ----------
@@ -272,6 +281,8 @@ PATTERNS: tuple[FilePattern, ...] = (
             "fiscal_week_end_d", "inventory_date",
         ),
         replace_scope=("business_d",),
+        # Target sunset the *_TCIN rollup family ~mid-May 2026 (Patch #12).
+        retired=True,
     ),
 
     # ---------- gross margin ----------
@@ -301,6 +312,8 @@ PATTERNS: tuple[FilePattern, ...] = (
             *_pk_item("week_end_date"),
         ),
         replace_scope=("fiscal_week_end_d",),
+        # Target sunset the *_TCIN rollup family ~mid-May 2026 (Patch #12).
+        retired=True,
     ),
 
     # ---------- item dimension ----------
@@ -429,15 +442,18 @@ PATTERNS: tuple[FilePattern, ...] = (
         ),
     ),
 
-    # ---------- HISTORY one-off backfill — retire after May 2026 ----------
+    # ---------- HISTORY one-off backfill (retired Patch #12) ----------
     # Target dropped 207 HISTORY_{SALES,INV,GM}_WEEKLY files (Jan 2025 → May
     # 2026) into the folder on 2026-05-18 as a one-time historical backfill.
     # They route into the EXISTING weekly tables and reuse the siblings' exact
     # natural keys, so re-loads and overlaps with regular weekly files merge
     # idempotently. Header variants unique to the HISTORY generation
     # (`week_end_d`, `fiscal_week_end_date`) are normalized to the canonical
-    # names via CANONICAL_RENAMES before load. Once the backfill has been
-    # ingested and validated, these three patterns can be deleted.
+    # names via CANONICAL_RENAMES before load. The backfill was reingested and
+    # validated against the KMG report (61/62 tie-out, Aug 2026), so these
+    # patterns are now retired=True: excluded from live discovery (the files
+    # left Kiteworks long ago) but classifiable FOREVER — archived HISTORY
+    # zips restored from any disk backup must always be reingestable.
     FilePattern(
         dataset="sales_weekly",
         regex=_pat(r"HISTORY_SALES_WEEKLY"),
@@ -445,6 +461,7 @@ PATTERNS: tuple[FilePattern, ...] = (
         frequency="one-off",
         primary_key_candidates=_SALES_WEEKLY_PK,
         replace_scope=("sales_date",),
+        retired=True,
     ),
     FilePattern(
         dataset="inventory_weekly",
@@ -453,6 +470,7 @@ PATTERNS: tuple[FilePattern, ...] = (
         frequency="one-off",
         primary_key_candidates=_INV_WEEKLY_PK,
         replace_scope=("business_d",),
+        retired=True,
     ),
     FilePattern(
         dataset="gross_margin",
@@ -461,6 +479,7 @@ PATTERNS: tuple[FilePattern, ...] = (
         frequency="one-off",
         primary_key_candidates=_GM_PK,
         replace_scope=("fiscal_week_end_d",),
+        retired=True,
     ),
 )
 

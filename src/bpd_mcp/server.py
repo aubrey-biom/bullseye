@@ -605,6 +605,7 @@ async def bpd_get_inventory_snapshot(
     tcin: int | None = None,
     location_id: int | None = None,
     limit: int = 200,
+    max_staleness_days: int | None = None,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
@@ -615,6 +616,7 @@ async def bpd_get_inventory_snapshot(
             tcin=tcin,
             location_id=location_id,
             limit=limit,
+            max_staleness_days=max_staleness_days,
             response_format=response_format,
         ),
     )
@@ -639,6 +641,7 @@ async def bpd_get_sell_through(
     end_date: _date | None = None,
     tcin: int | None = None,
     location_id: int | None = None,
+    max_staleness_days: int | None = None,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
@@ -649,6 +652,7 @@ async def bpd_get_sell_through(
             end_date=end_date,
             tcin=tcin,
             location_id=location_id,
+            max_staleness_days=max_staleness_days,
             response_format=response_format,
         ),
     )
@@ -701,7 +705,9 @@ async def bpd_get_open_orders(
         "and po_plan_biweekly, each filtered to its LATEST business_d snapshot (the "
         "tables accumulate a full plan snapshot per day). Windows on order_d (the "
         "planned order date) and groups by (tcin, week, source) — daily and biweekly "
-        "plans are reported separately, with per-source totals in `extra`."
+        "plans are reported separately, with per-source totals and snapshot ages in "
+        "`extra`. When the two plans diverge, prefer po_plan_daily for the near "
+        "horizon (fresher snapshot); use po_plan_biweekly only beyond its reach."
     ),
     annotations={
         "readOnlyHint": True,
@@ -754,6 +760,7 @@ async def bpd_get_forecast_vs_actual(
     aggregate: Literal["by_sku_week", "by_sku_location_week", "by_sku"] = "by_sku_week",
     snapshot_policy: Literal["latest_available", "pre_week"] = "latest_available",
     include_unmatched: bool = False,
+    pre_week_min_lead_days: int = 1,
     as_of_date: _date | None = None,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
@@ -767,6 +774,7 @@ async def bpd_get_forecast_vs_actual(
             aggregate=aggregate,
             snapshot_policy=snapshot_policy,
             include_unmatched=include_unmatched,
+            pre_week_min_lead_days=pre_week_min_lead_days,
             as_of_date=as_of_date,
             response_format=response_format,
         ),

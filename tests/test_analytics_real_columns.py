@@ -121,6 +121,13 @@ async def test_get_top_skus_works_with_real_column_names(tmp_path: Path) -> None
     # TCIN 100 = 50 + 30 = 80; TCIN 200 = 12 → TCIN 100 first.
     assert rows[0]["tcin"] == 100
     assert rows[0]["metric_total"] == 80
+    # Patch #12 pins: a no-arg call must say what period it spans, and point
+    # at the other grain's coverage.
+    assert resp.data["effective_start"] == "2026-05-09"
+    assert resp.data["effective_end"] == "2026-05-09"
+    assert resp.data["alternative_source"]["table"] == "sales_daily"
+    assert resp.data["alternative_source"]["min_date"] == "2026-05-04"
+    assert resp.data["alternative_source"]["scope"] == "entire table, unfiltered"
 
 
 async def test_get_inventory_snapshot_works_with_real_column_names(tmp_path: Path) -> None:
@@ -1058,3 +1065,358 @@ async def test_forecast_lag_probe_failure_keeps_drop_classification(
     assert all("error" not in d for d in drops), "classification must survive"
     assert resp.data.get("snapshot_lag") is None
     assert "lag probe failed" in resp.data["snapshot_lag_error"]
+
+
+# --------- Patch #12: live-validated classifier timing + honesty extras ---------
+
+
+async def test_forecast_drops_real_target_publication_timing(tmp_path: Path) -> None:
+    """Live-validated fix: Target's retro weeklies publish EXACTLY 7 days after
+    week-begin and its forward drops publish the MONDAY after the Sunday
+    week-begin. The first classifier's +7d forward tolerance swallowed every
+    retro drop (all 18 live drops read forward_horizon)."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+        "fiscal_week_begin_d VARCHAR, last_update_d DATE, selected_forecast_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO forecast_weekly VALUES "
+        # Retro weekly: week begins Sun 04-19, publishes Sun 04-26 (= begin+7).
+        "(100, 1, '2026-04-19', DATE '2026-04-26', 30), "
+        # Forward drop: weeks begin Sun 07-19..08-02, publishes Mon 07-20 (= min+1).
+        "(100, 1, '2026-07-19', DATE '2026-07-20', 10), "
+        "(100, 1, '2026-07-26', DATE '2026-07-20', 11), "
+        "(100, 1, '2026-08-02', DATE '2026-07-20', 12)"
+    )
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO sales_weekly VALUES (100, 1, DATE '2026-04-25', 28)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_forecast_vs_actual(
+            ro, ForecastVsActualInput(weeks_back=104, response_format="json")
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    kinds = {d["last_update_d"]: d["drop_kind"] for d in resp.data["forecast_drops"]}
+    assert kinds["2026-04-26"] == "weekly_retrospective"
+    assert kinds["2026-07-20"] == "forward_horizon"
+
+
+async def test_pre_week_min_lead_days_matches_publication_reality(
+    tmp_path: Path,
+) -> None:
+    """Target never publishes strictly before the week opens (Monday-after
+    drops), so default pre_week excludes the same-week drop — and
+    pre_week_min_lead_days=-1 deliberately tolerates it."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE forecast_weekly (tcin BIGINT, location_id BIGINT, "
+        "fiscal_week_begin_d VARCHAR, last_update_d DATE, selected_forecast_q BIGINT)"
+    )
+    # Week begins Sun 2026-05-03; snapshot publishes Mon 2026-05-04 (begin+1).
+    wh.execute_sql(
+        "INSERT INTO forecast_weekly VALUES "
+        "(100, 1, '2026-05-03', DATE '2026-05-04', 55)"
+    )
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO sales_weekly VALUES (100, 1, DATE '2026-05-09', 50)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        strict = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104, snapshot_policy="pre_week", response_format="json"
+            ),
+        )
+        tolerant = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104,
+                snapshot_policy="pre_week",
+                pre_week_min_lead_days=-1,
+                response_format="json",
+            ),
+        )
+    finally:
+        wh.close()
+    assert strict.ok and tolerant.ok
+    # Strict: the Monday-after snapshot fails the cutoff → week is actual_only.
+    assert strict.data["rows"] == []
+    assert strict.data["coverage"]["actual_only"]["cells"] == 1
+    assert "snapshot_retention_caveat" in strict.data
+    # Tolerant (-1 day): the same-week Monday drop is accepted.
+    assert tolerant.data["rows"][0]["forecast_units"] == 55
+
+
+async def test_sales_summary_partial_buckets_and_effective_range(
+    tmp_path: Path,
+) -> None:
+    """A month bucket fed by weekly rows starting mid-month must be flagged
+    partial, and the response must say what period it actually covers."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT, sale_amount DOUBLE)"
+    )
+    wh.execute_sql(
+        "INSERT INTO sales_weekly VALUES "
+        # May: first week-end lands the 30th — only two days of May covered.
+        "(100, 1, DATE '2026-05-30', 10, 30.0), "
+        # June: full month of weekly rows.
+        "(100, 1, DATE '2026-06-06', 20, 60.0), "
+        "(100, 1, DATE '2026-06-13', 20, 60.0), "
+        "(100, 1, DATE '2026-06-20', 20, 60.0), "
+        "(100, 1, DATE '2026-06-27', 20, 60.0)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_sales_summary(
+            ro, SalesSummaryInput(grain="month", response_format="json")
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    rows = resp.data["rows"]
+    assert rows[0]["partial_bucket"] is True, "May starts 29 days into the bucket"
+    assert rows[-1]["partial_bucket"] is False or len(rows) == 1
+    assert resp.data["effective_start"] == "2026-05-30"
+    assert resp.data["effective_end"] == "2026-06-27"
+    assert resp.data["source_grain"] == "week"
+    assert "week_straddle_note" in resp.data
+    assert resp.data["alternative_source"] is None  # no sales_daily seeded
+
+
+async def test_inventory_snapshot_staleness_reporting_and_filter(
+    tmp_path: Path,
+) -> None:
+    """The 2,178-stale-pairs problem: 'latest known' carried across feed gaps
+    must be counted, and max_staleness_days must exclude it on request."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE inventory_daily (business_d DATE, tcin BIGINT, "
+        "location_id BIGINT, ending_on_hand_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO inventory_daily VALUES "
+        "(DATE '2026-07-30', 100, 500, 8), "   # current
+        "(DATE '2026-05-19', 100, 501, 44)"     # stale: last seen 72 days earlier
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_inventory_snapshot(
+            ro, InventorySnapshotInput(response_format="json")
+        )
+        filtered = await get_inventory_snapshot(
+            ro,
+            InventorySnapshotInput(max_staleness_days=7, response_format="json"),
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    st = resp.data["staleness"]
+    assert st["window_max_date"] == "2026-07-30"
+    assert st["returned_pairs"] == 2
+    assert st["stale_pairs_over_7d"] == 1
+    assert st["max_staleness_days_returned"] == 72
+    assert "note" in st
+
+    rows = filtered.data["rows"]
+    assert len(rows) == 1 and rows[0]["location_id"] == 500, (
+        "max_staleness_days=7 must exclude the 72-day-old pair"
+    )
+
+
+async def test_upcoming_pos_snapshot_ages_and_divergence_flag(
+    tmp_path: Path,
+) -> None:
+    """The 07-29/07-31 launch-buy incident, encoded: per-source snapshot age
+    plus an explicit divergence note when the two plans straddle >1 day."""
+    from datetime import timedelta
+
+    from bpd_mcp.schemas import UpcomingPosInput
+    from bpd_mcp.tools.query import get_upcoming_pos
+    from bpd_mcp.warehouse import Warehouse
+
+    today = date.today()
+    in_window = (today + timedelta(days=3)).isoformat()
+    daily_snap = (today - timedelta(days=1)).isoformat()
+    biweekly_snap = (today - timedelta(days=4)).isoformat()
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    for table, snap, qty in (
+        ("po_plan_daily", daily_snap, 40),
+        ("po_plan_biweekly", biweekly_snap, 500),
+    ):
+        wh.execute_sql(
+            f"CREATE TABLE {table} (business_d DATE, tcin BIGINT, order_d DATE, "
+            "receiving_location_id BIGINT, ordered_q BIGINT)"
+        )
+        wh.execute_sql(
+            f"INSERT INTO {table} VALUES "
+            f"(DATE '{snap}', 100, DATE '{in_window}', 500, {qty})"
+        )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_upcoming_pos(
+            ro, UpcomingPosInput(weeks_forward=8, response_format="json")
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    rc = resp.data["resolved_columns"]
+    # Tolerate a midnight straddle between fixture setup and the tool's
+    # date.today(); divergence is exact because both ages shift together.
+    assert rc["po_plan_daily"]["snapshot_age_days"] in (1, 2)
+    assert rc["po_plan_biweekly"]["snapshot_age_days"] in (4, 5)
+    assert resp.data["snapshot_divergence_days"] == 3
+    assert "po_plan_daily for the near horizon" in resp.data["divergence_note"]
+
+
+async def test_open_orders_surfaces_over_received_lines(tmp_path: Path) -> None:
+    """Over-received lines (received + cancel > ordered) are excluded from open
+    units — correctly — but must be a labeled count, not a silent filter."""
+    from bpd_mcp.schemas import OpenOrdersInput
+    from bpd_mcp.tools.query import get_open_orders
+
+    wh = _seed_orders_and_plans(tmp_path)
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_open_orders(ro, OpenOrdersInput(response_format="json"))
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    # PO-3 in the fixture: ordered 15, received 20 → open -5.
+    assert resp.data["over_received"] == {"lines": 1, "units_over": 5}
+
+
+async def test_inventory_staleness_anchors_to_as_of_window(tmp_path: Path) -> None:
+    """Adversarial-review fix (major): staleness is measured against the feed's
+    newest date WITHIN the as_of window — anchored to the whole-table max, a
+    historical as_of + max_staleness_days returned zero rows."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE inventory_daily (business_d DATE, tcin BIGINT, "
+        "location_id BIGINT, ending_on_hand_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO inventory_daily VALUES "
+        "(DATE '2026-07-30', 100, 500, 8), "
+        "(DATE '2026-05-19', 100, 501, 44)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_inventory_snapshot(
+            ro,
+            InventorySnapshotInput(
+                as_of=date(2026, 5, 25),
+                max_staleness_days=7,
+                response_format="json",
+            ),
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    rows = resp.data["rows"]
+    # Within the as_of window the 05-19 snapshot IS the freshest — it must
+    # be returned, not filtered against the (out-of-window) 07-30 max.
+    assert len(rows) == 1 and rows[0]["location_id"] == 501
+    assert resp.data["staleness"]["window_max_date"] == "2026-05-19"
+
+
+async def test_sell_through_staleness_filter_excludes_not_fabricates(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix (major): a stale pair filtered by
+    max_staleness_days must be EXCLUDED — under the old LEFT JOIN it came back
+    as on_hand NULL → sell_through_rate 1.0 ('fully sold through')."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    wh.execute_sql(
+        "CREATE TABLE sales_weekly (tcin BIGINT, location_id BIGINT, "
+        "sales_date DATE, sale_quantity BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO sales_weekly VALUES "
+        "(1, 5, DATE '2026-07-25', 40), "
+        "(2, 5, DATE '2026-07-25', 10)"
+    )
+    wh.execute_sql(
+        "CREATE TABLE inventory_daily (business_d DATE, tcin BIGINT, "
+        "location_id BIGINT, ending_on_hand_q BIGINT)"
+    )
+    wh.execute_sql(
+        "INSERT INTO inventory_daily VALUES "
+        # tcin 1's inventory is 30 days stale and heavily overstocked.
+        "(DATE '2026-07-01', 1, 5, 500), "
+        # tcin 2's is current.
+        "(DATE '2026-07-30', 2, 5, 60)"
+    )
+    ro = ReadOnlyView(wh)
+    try:
+        resp = await get_sell_through(
+            ro, SellThroughInput(max_staleness_days=7, response_format="json")
+        )
+    finally:
+        wh.close()
+    assert resp.ok is True, resp.error
+    rows = {r["tcin"]: r for r in resp.data["rows"]}
+    assert 1 not in rows, (
+        "the stale overstocked pair must be excluded, not reported as 100% "
+        "sold through"
+    )
+    assert rows[2]["on_hand"] == 60
+
+
+async def test_pre_week_min_lead_days_requires_pre_week_policy(
+    tmp_path: Path,
+) -> None:
+    """Adversarial-review fix: a non-default lead with the wrong policy (or an
+    as_of_date override) is a hard error, never a silent no-op."""
+    wh = _seed_real_columns(tmp_path)
+    ro = ReadOnlyView(wh)
+    try:
+        wrong_policy = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104, pre_week_min_lead_days=7, response_format="json"
+            ),
+        )
+        with_as_of = await get_forecast_vs_actual(
+            ro,
+            ForecastVsActualInput(
+                weeks_back=104,
+                snapshot_policy="pre_week",
+                pre_week_min_lead_days=7,
+                as_of_date=date(2026, 5, 3),
+                response_format="json",
+            ),
+        )
+    finally:
+        wh.close()
+    assert wrong_policy.ok is False
+    assert wrong_policy.error.code == "INVALID_ARGUMENT"
+    assert with_as_of.ok is False
+    assert with_as_of.error.code == "INVALID_ARGUMENT"

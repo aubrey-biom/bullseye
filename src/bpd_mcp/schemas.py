@@ -66,7 +66,11 @@ class ListFolderContentsInput(_BaseModel):
     folder_id: str = Field(description="UUID (or numeric string) of the folder to list.")
     name_contains: str | None = Field(
         default=None,
-        description="Optional name filter passed through to Kiteworks.",
+        description=(
+            "Case-insensitive substring filter on file/folder names, applied "
+            "CLIENT-SIDE (Patch #12 — Kiteworks' `name` param is exact-match "
+            "and must never be used for substring queries)."
+        ),
     )
     extensions: str | None = Field(
         default=None,
@@ -272,6 +276,18 @@ class InventorySnapshotInput(_BaseModel):
     tcin: int | None = None
     location_id: int | None = None
     limit: int = Field(default=200, ge=1, le=10_000)
+    max_staleness_days: int | None = Field(
+        default=None,
+        ge=0,
+        le=365,
+        description=(
+            "Exclude (tcin, location) pairs whose latest snapshot is more than "
+            "this many days older than the table's newest date. The tool "
+            "carries forward 'latest known' per pair, so daily-feed gaps can "
+            "surface weeks-old on-hand as if current (Patch #12); extra."
+            "staleness reports how much of the result is stale either way."
+        ),
+    )
     response_format: ResponseFormat = "markdown"
 
 
@@ -280,6 +296,17 @@ class SellThroughInput(_BaseModel):
     end_date: _date | None = None
     tcin: int | None = None
     location_id: int | None = None
+    max_staleness_days: int | None = Field(
+        default=None,
+        ge=0,
+        le=365,
+        description=(
+            "Exclude inventory pairs whose latest snapshot is more than this "
+            "many days older than the inventory table's newest date — "
+            "weeks-of-supply computed from 10-week-old on-hand is misleading "
+            "(Patch #12)."
+        ),
+    )
     response_format: ResponseFormat = "markdown"
 
 
@@ -363,6 +390,20 @@ class ForecastVsActualInput(_BaseModel):
             "Also return forecast-only / actual-only rows (with the missing "
             "side NULL, never fabricated as 0). Unmatched volume is always "
             "counted in extra.coverage regardless."
+        ),
+    )
+    pre_week_min_lead_days: int = Field(
+        default=1,
+        ge=-6,
+        le=91,
+        description=(
+            "Only with snapshot_policy='pre_week': minimum days the snapshot "
+            "must precede each week's begin. Default 1 = strictly before the "
+            "week starts. Target's live forward drops publish the Monday "
+            "AFTER the Sunday week-begin, so 1 excludes the same-week drop by "
+            "design; use 7 for a full-week lead ('their prediction a week "
+            "out'), or -1 to tolerate the Monday-after drop (leaks one day of "
+            "actuals into 'pre-week')."
         ),
     )
     as_of_date: _date | None = Field(

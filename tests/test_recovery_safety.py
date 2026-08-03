@@ -776,3 +776,74 @@ async def test_sync_dimensional_falls_back_when_newest_download_is_corrupt(
         assert str(rows[0][0]) == "2026-07-20"
     finally:
         wh.close()
+
+
+# ---------- retired feeds (Patch #12) ----------
+
+
+@respx.mock
+async def test_sync_skips_retired_feeds_unless_explicitly_requested(
+    tmp_path: Path,
+) -> None:
+    """A retired file family reappearing in the folder is skipped with an
+    explanatory note; naming its dataset in `datasets` loads it deliberately."""
+    s = _settings(tmp_path)
+    hist_name = "BV_139440_HISTORY_SALES_WEEKLY_01032026_KW.zip"
+    reg_name = "BV_139440_WEEKLY_SALES_TCIN_LOC_04252026_KW.zip"
+    _mock_kiteworks(
+        [
+            {
+                "id": "HIST1",
+                "name": hist_name,
+                "type": "f",
+                "parentId": "F1",
+                "size": 100,
+                "fingerprint": "fp-h",
+            },
+            {
+                "id": "REG1",
+                "name": reg_name,
+                "type": "f",
+                "parentId": "F1",
+                "size": 100,
+                "fingerprint": "fp-r",
+            },
+        ]
+    )
+    reg_zip = tmp_path / "reg.zip"
+    _zip(reg_zip, f"{SALES_WEEKLY_HDR}\n{_sales_row('2026-04-25')}\n")
+    respx.get(f"{BASE}/rest/files/REG1/content").mock(
+        return_value=httpx.Response(200, content=reg_zip.read_bytes())
+    )
+    hist_zip = tmp_path / "hist.zip"
+    _zip(hist_zip, f"{SALES_WEEKLY_HDR}\n{_sales_row('2026-01-03')}\n")
+    respx.get(f"{BASE}/rest/files/HIST1/content").mock(
+        return_value=httpx.Response(200, content=hist_zip.read_bytes())
+    )
+    reg_zip.unlink()
+    hist_zip.unlink()
+
+    wh = Warehouse(s.db_path)
+    try:
+        async with httpx.AsyncClient() as http:
+            auth = AuthManager(s, http, bundle=_bundle())
+            client = KiteworksClient(s, auth, http)
+            # Default discovery: the retired HISTORY file is skipped with a note.
+            r1 = await sync_new_files(client, wh, s, triggered_by="t")
+            by_name = {o.file_name: o for o in r1.outcomes}
+            assert by_name[reg_name].status == "loaded"
+            assert by_name[hist_name].status == "skipped"
+            assert "retired feed" in (by_name[hist_name].error or "")
+
+            # Explicitly requesting the dataset loads the retired file too.
+            r2 = await sync_new_files(
+                client, wh, s, datasets={"sales_weekly"}, triggered_by="t"
+            )
+            by_name2 = {o.file_name: o for o in r2.outcomes}
+            assert by_name2[hist_name].status == "loaded"
+        _, weeks = wh.execute_sql(
+            "SELECT COUNT(DISTINCT sales_date) FROM sales_weekly"
+        )
+        assert weeks[0][0] == 2
+    finally:
+        wh.close()

@@ -984,3 +984,41 @@ def test_apply_canonical_renames_never_clobbers_and_noops() -> None:
     df = pl.DataFrame({"week_end_d": ["a"], "tcin": [1]})
     out = apply_canonical_renames("sales_daily", df)
     assert out.columns == df.columns
+
+
+def test_retired_patterns_stay_classifiable_forever() -> None:
+    """Patch #12: retirement excludes a pattern from live discovery but must
+    NEVER break classification — with ~2-week source retention, filename
+    classifiability is the only durable link between an archived zip and its
+    dataset, and the recovery path depends on it."""
+    from bpd_mcp.parsers import PATTERNS, classify_filename
+
+    retired_samples = {
+        "BV_139440_WEEKLY_SALES_TCIN_05162026_KW.zip": "sales_weekly_item",
+        "BV_139440_WEEKLY_INV_TCIN_05162026_KW.zip": "inventory_weekly_item",
+        "BV_139440_WEEKLY_GM_TCIN_05162026_KW.zip": "gross_margin_item",
+        "BV_139440_HISTORY_SALES_WEEKLY_01032026_KW.zip": "sales_weekly",
+        "BV_139440_HISTORY_INV_WEEKLY_01032026_KW.zip": "inventory_weekly",
+        "BV_139440_HISTORY_GM_WEEKLY_01032026_KW.zip": "gross_margin",
+    }
+    for name, expected_ds in retired_samples.items():
+        parsed = classify_filename(name)
+        assert parsed is not None, f"{name} must classify"
+        assert parsed.pattern.dataset == expected_ds
+        assert parsed.pattern.retired is True
+
+    # Exactly these six patterns are retired — a drift guard both ways.
+    retired = {(p.dataset, p.regex.pattern) for p in PATTERNS if p.retired}
+    assert len(retired) == 6
+    retired_datasets = {d for d, _ in retired}
+    assert retired_datasets == {
+        "sales_weekly_item", "inventory_weekly_item", "gross_margin_item",
+        "sales_weekly", "inventory_weekly", "gross_margin",
+    }
+    # The weekly actives must NOT be retired (they share datasets with the
+    # retired HISTORY twins).
+    for p in PATTERNS:
+        if "HISTORY" not in p.regex.pattern and p.dataset in (
+            "sales_weekly", "inventory_weekly", "gross_margin"
+        ):
+            assert p.retired is False

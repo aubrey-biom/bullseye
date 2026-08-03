@@ -102,7 +102,7 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | Tool                       | Purpose                                                              |
 | -------------------------- | -------------------------------------------------------------------- |
 | `bpd_list_top_folders`     | List Kiteworks top-level folders. Use once to find your BPID folder. |
-| `bpd_list_folder_contents` | Paginated children of a folder. Supports `name_contains`, `extensions`. |
+| `bpd_list_folder_contents` | Paginated children of a folder. `name_contains` is a case-insensitive substring filter applied client-side (Patch #12 — Kiteworks' `name` param is exact-match and returned 0 rows for every substring query); `extensions` passes through. |
 | `bpd_get_file_metadata`    | Size, fingerprint, dates, parent.                                    |
 | `bpd_search_files`         | Wraps `/rest/query` for ad-hoc filename / content search.            |
 
@@ -113,7 +113,7 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | `bpd_sync_new_files`  | Discover new BPD zips → download → parse → load. Idempotent. Supports `dry_run`. Takes a pre-sync backup. |
 | `bpd_refresh_dataset` | Re-load a single dataset. `full=true` is **destructive** (see [Backups & recovery](#backups-destructive-op-guardrails--recovery-patch-9)): requires `confirm_destructive` with the exact phrase, takes a mandatory pre-delete backup, and refuses outright when it would lose history Kiteworks can't re-serve. |
 | `bpd_reingest_local`  | **Recovery tool (Patch #9).** Load zips already in `raw/` through the normal pipeline — no downloads, nothing deleted. Skips already-loaded files; supports `dry_run` and a `datasets` filter. Idempotent. |
-| `bpd_list_datasets`   | Row count, min/max data date, file count, last-loaded time per dataset.       |
+| `bpd_list_datasets`   | Per dataset: row count, `feed_kind` (delta vs snapshot semantics), `status` (active/retired), snapshot range (`min/max_date` = freshness) AND content range (`content_max_date` = how far order_d / fiscal weeks / ETAs reach — months past freshness for forward-looking feeds), file count, last-loaded time. |
 
 ### Query
 
@@ -121,10 +121,10 @@ accepts a `response_format` of `markdown` (default) or `json`.
 | ---------------------------- | --------------------------------------------------------------------------- |
 | `bpd_run_sql`                | Arbitrary DuckDB SQL. **Read-only enforced at the engine layer** (separate `read_only=True` connection on a snapshot copy of the DB) AND at the validator (multi-statement and DDL/DML tokens rejected, comment-cloaked included). Wraps the result in `LIMIT N`. |
 | `bpd_describe_schema`        | All tables, columns, types. Also exposed as MCP resource `bpd://schema`.    |
-| `bpd_get_sales_summary`      | Sum units (and dollars when available) by `day`/`week`/`month` with optional filters. |
-| `bpd_get_top_skus`           | Top-N SKUs by units or dollars over a date range.                           |
-| `bpd_get_inventory_snapshot` | Latest known on-hand per TCIN × location at or before a date.               |
-| `bpd_get_sell_through`       | Joins sales + latest inventory to compute weeks-of-supply + sell-through.   |
+| `bpd_get_sales_summary`      | Sum units (and dollars when available) by `day`/`week`/`month` with optional filters. Echoes the effective date range covered, flags partial boundary buckets, and reports the other sales table's coverage (`extra.alternative_source`). |
+| `bpd_get_top_skus`           | Top-N SKUs by units or dollars over a date range. A no-arg call spans all loaded history — the title + `extra` now say exactly what period that is. |
+| `bpd_get_inventory_snapshot` | Latest known on-hand per TCIN × location at or before a date. `extra.staleness` counts pairs carried forward across feed gaps (>7 days older than the table max); `max_staleness_days` excludes them. |
+| `bpd_get_sell_through`       | Joins sales + latest inventory to compute weeks-of-supply + sell-through. `max_staleness_days` drops inventory pairs whose latest snapshot is stale — WOS from 10-week-old on-hand is misleading. |
 
 ### S&OP analytics (May 2026 patch)
 
@@ -215,7 +215,7 @@ the table's column types, runs DELETE+INSERT in ONE transaction (a failed
 INSERT rolls back its DELETE), and `ensure_data_table` widens tables via
 ALTER ADD COLUMN when a generation carries extra columns.
 
-### HISTORY backfill (one-off — retire after ingested)
+### HISTORY backfill (one-off — retired in Patch #12, classifiable forever)
 
 Target dropped 207 `HISTORY_{SALES,INV,GM}_WEEKLY` files (Jan 2025 → May
 2026) as a one-time backfill. Three catalog patterns route them into the
