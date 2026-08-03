@@ -1235,6 +1235,7 @@ async def test_inventory_snapshot_staleness_reporting_and_filter(
     assert resp.ok is True, resp.error
     st = resp.data["staleness"]
     assert st["window_max_date"] == "2026-07-30"
+    assert st["feed_lag_days_vs_as_of"] == (date.today() - date(2026, 7, 30)).days
     assert st["returned_pairs"] == 2
     assert st["stale_pairs_over_7d"] == 1
     assert st["max_staleness_days_returned"] == 72

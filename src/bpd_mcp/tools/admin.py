@@ -764,9 +764,11 @@ async def _tools_smoke_test(
             status="warn",
             detail=f"all {len(skipped)} dataset tools skipped — no data loaded yet",
         )
-    detail = f"{len(invoked)} tool(s) invoked ok"
+    # Name the invoked tools (Patch #13): the bare count kept prompting
+    # "is <tool X> actually in the smoke list?" questions.
+    detail = f"{len(invoked)} tool(s) invoked ok: {invoked}"
     if skipped:
-        detail += f", {len(skipped)} skipped (no data): {skipped}"
+        detail += f"; {len(skipped)} skipped (no data): {skipped}"
     return HealthCheckResult(name="tools_smoke_test", status="pass", detail=detail)
 
 

@@ -469,6 +469,9 @@ async def test_health_check_smoke_and_roles_pass_on_real_columns(
     by = _by_name(resp)
     assert by["roles_resolvable"]["status"] == "pass"
     assert by["tools_smoke_test"]["status"] == "pass"
+    # Patch #13: the invoked tools are named, ending the "is the forecast
+    # tool actually in the smoke list?" question for good.
+    assert "bpd_get_forecast_vs_actual" in by["tools_smoke_test"]["detail"]
     assert by["known_unpopulated_columns"]["status"] == "pass"
 
 

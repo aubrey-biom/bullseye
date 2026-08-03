@@ -1043,15 +1043,32 @@ async def reingest_local_files(
         except Exception as e:
             logger.warning("auto_backup_failed", error=str(e))
 
+    # Patch #13: re-processing a file that already has a ledger row must
+    # UPDATE that row, not append a 'local:' shadow under a different file_id
+    # (the ledger PK) — shadows inflated per-dataset file counts by one per
+    # re-processed file. Prefer the most recently loaded non-local id. The
+    # Kiteworks fingerprint is reused ONLY from a status='loaded' row: a
+    # failed-download row stores the REMOTE fingerprint of bytes that never
+    # reached disk, and stamping it onto a reingest of the older on-disk zip
+    # would make live sync skip the real file forever (review fix: major).
+    _, ledger_rows = warehouse.execute_sql(
+        "SELECT file_name, file_id, fingerprint, status FROM _file_ledger "
+        "ORDER BY (file_id LIKE 'local:%'), loaded_at DESC NULLS LAST"
+    )
+    known_rows: dict[str, tuple[str, Any]] = {}
+    for fname, fid, fp, status in ledger_rows:
+        known_rows.setdefault(fname, (fid, fp if status == "loaded" else None))
+
     async def _load_local(parsed: Any, zp: Path) -> FileOutcome:
+        file_id, fingerprint = known_rows.get(zp.name, (f"local:{zp.name}", None))
         outcome = await _parse_and_load_zip(
             warehouse,
             parsed=parsed,
             zip_path=zp,
-            file_id=f"local:{zp.name}",
+            file_id=file_id,
             name=zp.name,
             folder_id="local",
-            fingerprint=None,
+            fingerprint=fingerprint,
             bytes_written=zp.stat().st_size,
         )
         result.outcomes.append(outcome)

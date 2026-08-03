@@ -237,3 +237,29 @@ def test_list_datasets_marks_fully_retired_datasets(tmp_path) -> None:
         assert rows["sales_weekly"]["status"] == "active"
     finally:
         wh.close()
+
+
+def test_detect_date_column_skips_all_null_columns(tmp_path) -> None:
+    """Live-found (item_attr_extended): the first DATE-typed column was
+    entirely NULL, so every listing reported a null date range while a
+    populated candidate existed. All-NULL columns lose; if nothing has
+    values, fall back to the old pick."""
+    from bpd_mcp.warehouse import Warehouse
+
+    wh = Warehouse(tmp_path / "bpd.duckdb")
+    try:
+        wh.execute_sql(
+            "CREATE TABLE item_attr_extended ("
+            "tcin BIGINT, launch_date DATE, processed_ct_date DATE)"
+        )
+        wh.execute_sql(
+            "INSERT INTO item_attr_extended VALUES "
+            "(100, NULL, DATE '2026-07-25'), (200, NULL, DATE '2026-07-25')"
+        )
+        assert wh.detect_date_column("item_attr_extended") == "processed_ct_date"
+
+        # Nothing has values → fall back to the ordinal-first typed column.
+        wh.execute_sql("UPDATE item_attr_extended SET processed_ct_date = NULL")
+        assert wh.detect_date_column("item_attr_extended") == "launch_date"
+    finally:
+        wh.close()

@@ -72,6 +72,47 @@ CREATE TABLE IF NOT EXISTS _schema_registry (
 _MIGRATIONS = (
     "ALTER TABLE _file_ledger ADD COLUMN IF NOT EXISTS error_message TEXT",
     "ALTER TABLE _file_ledger ADD COLUMN IF NOT EXISTS parse_method TEXT",
+    # Patch #13: merge 'local:<name>' shadow rows created when a reingest
+    # re-processed a file that already had a Kiteworks-id ledger row (the
+    # ledger PK is file_id, so the re-load appended instead of updating —
+    # inflating file counts by one per re-processed file). Copy the shadow's
+    # newer load state onto the original row, then drop the shadow. Both
+    # statements are idempotent: once no shadows remain, they no-op.
+    # Merge rules: a LOADED shadow newer than the original wins outright; a
+    # FAILED shadow only overwrites a non-loaded original (both by recency) —
+    # a loaded original keeps 'loaded' because the data table still holds its
+    # rows (failed re-processing is transactional and rolled back). Duplicate
+    # non-local rows sharing a file_name are an anomalous pre-existing state;
+    # the merge stamps each of them (dataset-scoped) rather than guessing.
+    """
+    UPDATE _file_ledger AS o
+    SET loaded_at = l.loaded_at,
+        downloaded_at = l.downloaded_at,
+        row_count = l.row_count,
+        bytes = l.bytes,
+        status = l.status,
+        error_message = l.error_message,
+        parse_method = l.parse_method
+    FROM _file_ledger AS l
+    WHERE l.file_id = 'local:' || o.file_name
+      AND o.file_id NOT LIKE 'local:%'
+      AND o.dataset = l.dataset
+      AND (
+            (l.loaded_at IS NOT NULL
+             AND (o.loaded_at IS NULL OR l.loaded_at > o.loaded_at))
+         OR (l.loaded_at IS NULL AND o.loaded_at IS NULL
+             AND l.downloaded_at > o.downloaded_at)
+      )
+    """,
+    """
+    DELETE FROM _file_ledger
+    WHERE file_id LIKE 'local:%'
+      AND EXISTS (
+          SELECT 1 FROM _file_ledger AS o
+          WHERE o.file_name = _file_ledger.file_name
+            AND o.file_id NOT LIKE 'local:%'
+      )
+    """,
 )
 
 
@@ -571,37 +612,56 @@ class Warehouse:
         if not all_cols:
             return None
 
-        # Tier 1: typed DATE/TIMESTAMP.
-        for name, dtype in all_cols:
-            t = str(dtype).upper()
-            if t.startswith("DATE") or t.startswith("TIMESTAMP"):
-                return name
+        # Patch #13: an all-NULL column must not win — item_attr_extended's
+        # first DATE-typed column (launch_date) is entirely NULL, which made
+        # every listing report a null date range while populated candidates
+        # existed. First pass demands values; second pass (nothing has values)
+        # falls back to the original behavior.
+        def _has_values(name: str) -> bool:
+            try:
+                with self._lock:
+                    n = self._conn.execute(
+                        f"SELECT COUNT({quote_ident(name)}) "
+                        f"FROM {quote_ident(table)}"
+                    ).fetchone()[0]
+                return bool(n)
+            except Exception:
+                return True  # never let the probe break detection
 
-        # Tier 2: suffix-style date names.
-        for name, _ in all_cols:
-            low = name.lower()
-            if low.endswith(("_date", "_dt", "_d")):
-                return name
+        def _pick(require_values: bool) -> str | None:
+            def ok(name: str) -> bool:
+                return _has_values(name) if require_values else True
 
-        # Tier 3: contains a date-like token.
-        DATE_TOKENS = ("date", "week", "period", "as_of", "effective")
-        for name, _ in all_cols:
-            low = name.lower()
-            if any(tok in low for tok in DATE_TOKENS):
-                return name
+            # Tier 1: typed DATE/TIMESTAMP.
+            for name, dtype in all_cols:
+                t = str(dtype).upper()
+                if (t.startswith("DATE") or t.startswith("TIMESTAMP")) and ok(name):
+                    return name
+            # Tier 2: suffix-style date names.
+            for name, _ in all_cols:
+                low = name.lower()
+                if low.endswith(("_date", "_dt", "_d")) and ok(name):
+                    return name
+            # Tier 3: contains a date-like token.
+            date_tokens = ("date", "week", "period", "as_of", "effective")
+            for name, _ in all_cols:
+                low = name.lower()
+                if any(tok in low for tok in date_tokens) and ok(name):
+                    return name
+            # Tier 4: per-dataset registry. The COLUMN_ROLES table knows
+            # canonical date columns per dataset; consult it last (lowest
+            # priority) so the generic heuristic above wins for unknown tables.
+            from .column_roles import COLUMN_ROLES
 
-        # Tier 4: per-dataset registry. The COLUMN_ROLES table knows canonical
-        # date columns per dataset; consult it last (lowest priority) so the
-        # generic heuristic above wins for unknown tables.
-        from .column_roles import COLUMN_ROLES
+            candidates = COLUMN_ROLES.get(table, {}).get("date", [])
+            by_lower = {n.lower(): n for n, _ in all_cols}
+            for candidate in candidates:
+                real = by_lower.get(candidate.lower())
+                if real is not None and ok(real):
+                    return real
+            return None
 
-        candidates = COLUMN_ROLES.get(table, {}).get("date", [])
-        present = {n.lower() for n, _ in all_cols}
-        by_lower = {n.lower(): n for n, _ in all_cols}
-        for candidate in candidates:
-            if candidate.lower() in present:
-                return by_lower[candidate.lower()]
-        return None
+        return _pick(require_values=True) or _pick(require_values=False)
 
     def list_datasets(self) -> list[dict[str, Any]]:
         """One row per known dataset table with summary stats.

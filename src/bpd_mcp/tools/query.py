@@ -541,6 +541,12 @@ async def get_inventory_snapshot(
     staleness: dict[str, Any] = {
         "window_max_date": str(window_max) if window_max else None,
         "as_of": as_of.isoformat(),
+        # Staleness is per-pair vs the feed's newest in-window day; feed lag
+        # (as_of vs that day) is a separate number — surfaced so "0 days
+        # stale" next to a newer as_of can't read as same-day data.
+        "feed_lag_days_vs_as_of": (
+            (as_of - window_max).days if window_max is not None else None
+        ),
         "max_staleness_days_filter": params.max_staleness_days,
     }
     if window_max is not None and dict_rows:
