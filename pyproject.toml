@@ -36,6 +36,7 @@ dev = [
 [project.scripts]
 bpd-mcp = "bpd_mcp.__main__:main"
 bpd-bootstrap = "scripts.bootstrap_auth:main"
+bpd-sync = "bpd_mcp.cli_sync:main"
 
 [build-system]
 requires = ["hatchling"]

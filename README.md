@@ -421,6 +421,52 @@ runbook above to catch up.
 
 ---
 
+## Scheduled daily sync (`bpd-sync`, Patch #15)
+
+The warehouse on this Mac is the **system of record** and the only archive of
+history older than Kiteworks' ~2-week retention — keeping it fresh should not
+depend on remembering to open Claude Desktop. `bpd-sync` is the same
+discover → download → parse → load pipeline as the `bpd_sync_new_files` MCP
+tool, with no LLM in the loop.
+
+```bash
+uv run bpd-sync                       # sync everything, then health-check
+uv run bpd-sync --dry-run             # report what would load; no writes
+uv run bpd-sync --datasets sales_weekly
+```
+
+Install it as a daily macOS LaunchAgent (dry-runs first, then schedules):
+
+```bash
+./scripts/install_launchd.sh          # 07:05 local
+./scripts/install_launchd.sh 6 30     # 06:30 local
+./scripts/install_launchd.sh --uninstall
+```
+
+Exit codes — the contract a scheduler consumes:
+
+| code | meaning |
+| ---- | ------- |
+| `0`  | success (everything loaded or already current) |
+| `1`  | sync ran but one or more files failed to load (named on stderr) |
+| `2`  | sync fine; post-sync health check reported `overall=fail` |
+| `3`  | fatal (auth/config/network/unexpected) |
+| `75` | warehouse locked by another process — run skipped |
+
+**About exit 75:** DuckDB allows a single writer, so when Claude Desktop is
+open its MCP server already holds the lock. That is expected, not an error —
+the run retries (`--lock-retries`, default 3 × 60s) and then skips. Syncs are
+idempotent and restatement-aware, so a skipped run costs nothing; the next one
+picks the work up. Logs land in `~/.bpd-mcp/logs/bpd-sync.{out,err}.log`, and
+every run is recorded in `_sync_log` with `triggered_by='bpd-sync-cli'` — which
+distinguishes scheduled runs from interactive ones in the audit trail.
+
+No credentials live in the plist: `bpd-sync` reads the repo `.env` and the
+cached refresh token at `~/.bpd-mcp/tokens.json` (0600), refreshing
+non-interactively and falling back to the password grant if needed.
+
+---
+
 ## Security model (§15)
 
 * **Token file is 0600.** The server refuses to start if perms are looser.
@@ -472,6 +518,7 @@ Coverage requirements (§13):
 * `tests/test_health_check.py` — every health check has pass + fail tests.
 * `tests/test_audit_drift_guards.py` — pin parallel sources of truth (PATTERNS ↔ KnownDataset, EXPECTED_LEDGER_COLUMNS ↔ DDL, EXPECTED_TOOL_COUNT ↔ registered tools).
 * `tests/test_tools_query.py` — sales_summary math + markdown/json toggle.
+* `tests/test_cli_sync.py` — `bpd-sync` exit-code contract, cross-process DuckDB lock premise, launchd template/installer consistency.
 * `tests/test_recovery_safety.py` — Patch #9: backups + retention, confirm-phrase gate, would-lose-history refusal, full-refresh happy path, local reingest (recovery, idempotency, ordering), raw-dir eviction protection; Patch #10: stale-dimension guard (reingest + live sync).
 * `tests/test_column_roles.py` — resolver behavior + Patch #10: every REQUIRED_ROLES entry resolves against real Target headers (executable "the lists match reality" claim); known-unpopulated columns banned from candidate lists.
 
