@@ -1,0 +1,37 @@
+{
+  "_comment": "KMG-published reference data that is NOT derivable from BigQuery: $PSPW goals, POG-authorized door counts, and the short display names used in leadership reporting. BigQuery's item_description is unusable for reporting (three different dispensers all read 'Biom Refillable Plant-Based Wi...'), and inventory-derived door counts overstate POG authorization (1,726 vs KMG's 1,598), which understates $PSPW. Update all three whenever KMG republishes; the brief prints `as_of` so readers know the vintage.",
+  "source": "KMG JulW4'26 POS report",
+  "as_of": "2026-08-03",
+
+  "assortment": {
+    "003-02-5627": { "name": "Disinf Refill 180ct Var",   "goal_pspw": 51.96, "pog_doors": 1598 },
+    "003-02-1080": { "name": "Dispenser - Eucalyptus",    "goal_pspw": 19.99, "pog_doors": 1599 },
+    "007-07-8361": { "name": "Baby Refill 720ct",         "goal_pspw": 87.48, "pog_doors": 1469 },
+    "003-02-0228": { "name": "Dispenser - Tan",           "goal_pspw": 19.99, "pog_doors": 1589 },
+    "003-02-1327": { "name": "Dispenser - White",         "goal_pspw": 19.99, "pog_doors": 1599 },
+    "003-02-5488": { "name": "AP Refill 180ct Variety",   "goal_pspw": 16.24, "pog_doors": 1598 },
+    "007-07-0096": { "name": "Baby Welcome Kit - White",  "goal_pspw": 52.48, "pog_doors": 1499 },
+    "003-02-5042": { "name": "Disinf Refill 60ct Citrus", "goal_pspw": 34.93, "pog_doors": 1598 },
+    "007-07-1897": { "name": "Baby Kit - Seafoam Grn",    "goal_pspw": null,  "pog_doors": 1387 },
+    "007-07-9942": { "name": "Baby Refill 240ct",         "goal_pspw": 55.96, "pog_doors": 1496 },
+    "253-04-3809": { "name": "Mini Disp w/HS 40ct Bone",  "goal_pspw": 22.49, "pog_doors": 833  },
+    "003-02-2154": { "name": "Dispenser - Brushed SS",    "goal_pspw": 12.50, "pog_doors": 1597 },
+    "003-02-3616": { "name": "AP Refill 60ct Santal",     "goal_pspw": 7.49,  "pog_doors": 1599 },
+    "003-02-4440": { "name": "AP Refill 60ct Frag Free",  "goal_pspw": 7.49,  "pog_doors": 1599 },
+    "003-02-8568": { "name": "Disinf Refill 60ct Alpine", "goal_pspw": 34.93, "pog_doors": 1598 },
+    "007-07-5306": { "name": "Baby Kit - Lilac",          "goal_pspw": null,  "pog_doors": 1387 },
+    "007-07-3543": { "name": "Baby Refill 60ct",          "goal_pspw": 15.96, "pog_doors": 1493 },
+    "253-04-0088": { "name": "HS Wipes 40ct Santal",      "goal_pspw": 11.97, "pog_doors": 833  },
+    "003-02-6532": { "name": "AP Refill 60ct Neroli",     "goal_pspw": 7.49,  "pog_doors": 1599 },
+    "253-04-0086": { "name": "Body Go-Pack XL 30ct",      "goal_pspw": 11.96, "pog_doors": 367  }
+  },
+  "_assortment_note": "These 20 DPCIs ARE the goaled assortment (18 with a published goal + the two Baby Kits KMG lists without one). $PSPW/UPSPW totals sum across these only.",
+
+  "excluded": {
+    "253-04-9259": { "name": "HS Go-Pack 20ct Santal", "pog_doors": 198, "reason": "KMG publishes no $PSPW goal for the 20ct travel go-pack" },
+    "003-02-6264": { "name": "Dispenser - Seafoam",    "pog_doors": null, "reason": "online-only" },
+    "003-02-7872": { "name": "Dispenser - Black",      "pog_doors": null, "reason": "online-only" },
+    "003-02-0381": { "name": "Dispenser - Hunter Grn", "pog_doors": null, "reason": "online-only" },
+    "003-02-9612": { "name": "Dispenser - Terracotta", "pog_doors": null, "reason": "de-listed (3 doors)" }
+  }
+}
