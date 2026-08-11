@@ -389,9 +389,9 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         else:
             break
 
-    head = f"🎯 *Target POS — {_fiscal_label(wk)}* (w/e {wk:%a %b %-d})"
+    head = f"🎯 **Target POS — {_fiscal_label(wk)}** (w/e {wk:%a %b %-d})"
     lead = (
-        f"{'*Record week.* ' if is_record else ''}"
+        f"{'**Record week.** ' if is_record else ''}"
         f"${cur.amt / 1000:,.1f}K, {_pct(cur.amt, series[1].amt if len(series) > 1 else None)} WoW"
     )
     if streak >= 2:
@@ -450,9 +450,16 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         [s for s in skus if s.prev_amt and s.in_assortment and s.amt < s.prev_amt],
         key=lambda s: s.amt / s.prev_amt,
     )[:3]
+    # In-stock flags cover every SKU KMG knows that is actually selling — NOT
+    # just the goaled assortment. HS Go-Pack 20ct carries no published $PSPW
+    # goal, so scoping this to the assortment hid it breaching the 5.0% OOS goal
+    # at 6.4% on $5.1K of sales. Lacking a goal is a reason to leave a SKU out of
+    # the goal math, not out of the in-stock flags. The sales floor keeps the
+    # de-listed tail (Terracotta: 80% OOS on 2 units) from crowding the list.
     worst_oos = sorted(
-        [s for s in skus if s.oos is not None and s.in_assortment], key=lambda s: -s.oos
-    )[:2]
+        [s for s in skus if s.oos is not None and s.known and (s.amt or 0) >= NEW_SKU_MIN],
+        key=lambda s: -s.oos,
+    )[:3]
 
     wos = inv[wk].eoh_ow / cur.units if wk in inv and cur.units else None
     wos_4ago = (
@@ -461,22 +468,22 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         else None
     )
 
-    working = ["✅ *What's working*"]
+    working = ["✅ **What's working**"]
     mix_tot = sum(m.amt for m in mix)
     for m in mix:
         if m.grp == "Baby":
             working.append(
-                f"• *Baby is now {m.amt / mix_tot * 100:.0f}% of Target revenue* "
+                f"• **Baby is now {m.amt / mix_tot * 100:.0f}% of Target revenue** "
                 f"(${m.amt / 1000:,.1f}K)."
             )
     if wk in inv:
         working.append(
-            f"• *In-stock execution:* OOS {inv[wk].oos:.2f}% vs 5.0% goal, "
+            f"• **In-stock execution:** OOS {inv[wk].oos:.2f}% vs 5.0% goal, "
             f"WIP {inv[wk].wip:.1f}% vs 94% goal."
         )
     if wos and wos_4ago and wos < wos_4ago:
         working.append(
-            f"• *Inventory is unwinding* — WOS {wos_4ago:.1f} → {wos:.1f} wks "
+            f"• **Inventory is unwinding** — WOS {wos_4ago:.1f} → {wos:.1f} wks "
             "over four weeks with sales rising."
         )
     if above:
@@ -490,21 +497,21 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             + "."
         )
 
-    watch = ["⚠️ *What to watch*"]
+    watch = ["⚠️ **What to watch**"]
     promo_now = cur.promo_amt / cur.amt * 100 if cur.amt else 0
     promo_then = (
         series[3].promo_amt / series[3].amt * 100 if len(series) > 3 and series[3].amt else None
     )
     if promo_then and promo_now - promo_then > 15:
         watch.append(
-            f"• *Promo-assisted growth.* Promo penetration {promo_then:.0f}% → "
+            f"• **Promo-assisted growth.** Promo penetration {promo_then:.0f}% → "
             f"{promo_now:.0f}% over four weeks — read the step-up as event-driven, "
             "not a new baseline."
         )
     for s in below:
         s_wos = s.eoh_ow / s.units if s.eoh_ow and s.units else None
         watch.append(
-            f"• *{s.name}* — {s.pct_goal:.0f}% to goal (${s.pspw:.2f} vs "
+            f"• **{s.name}** — {s.pct_goal:.0f}% to goal (${s.pspw:.2f} vs "
             f"${s.goal:.2f})" + (f", {s_wos:.1f} wks supply." if s_wos else ".")
         )
     if decliners:
@@ -524,7 +531,7 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     newcomers = [s for s in listed if not s.known]
     if newcomers:
         watch.append(
-            "• *Unrecognised DPCI selling:* "
+            "• **Unrecognised DPCI selling:** "
             + ", ".join(f"{s.dpci} ({s.descr or '—'}) ${s.amt:,.0f}" for s in newcomers)
             + " — not in the KMG assortment file; confirm whether it needs a "
             "$PSPW goal."
@@ -578,7 +585,7 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             metric_table,
             "\n".join(working),
             "\n".join(watch),
-            "*Top 5 SKUs — $ and % to $PSPW goal*",
+            "**Top 5 SKUs — $ and % to $PSPW goal**",
             top5_table,
             mix_line,
             foot,
@@ -601,7 +608,7 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             ]
         )
     reply1 = (
-        f"*Full SKU detail — {_fiscal_label(wk)} (1 of 2): velocity & goal attainment*\n"
+        f"**Full SKU detail — {_fiscal_label(wk)} (1 of 2): velocity & goal attainment**\n"
         "```\n" + _table(r1, "llrrrrrr") + "\n```"
     )
 
@@ -621,7 +628,7 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             ]
         )
     reply2 = (
-        f"*Full SKU detail — {_fiscal_label(wk)} (2 of 2): units, in-stock & cover*\n"
+        f"**Full SKU detail — {_fiscal_label(wk)} (2 of 2): units, in-stock & cover**\n"
         "```\n" + _table(r2, "llrrrrrr") + "\n```"
     )
 
@@ -636,9 +643,9 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
         span = f"{d['sales_through']:%a %b %-d}"
 
     lines = [
-        f"🎯 *Target POS — week so far* ({span})",
+        f"🎯 **Target POS — week so far** ({span})",
         "",
-        f"*{w['days']} day{'' if w['days'] == 1 else 's'} in:* ${cur.amt:,.0f} · "
+        f"**{w['days']} day{'' if w['days'] == 1 else 's'} in:** ${cur.amt:,.0f} · "
         f"{int(cur.units):,} units",
         f"  vs the same days last week: {_pct(cur.amt, prev.amt if prev else None)} on "
         f"dollars, {_pct(cur.units, prev.units if prev else None)} on units",
@@ -654,7 +661,7 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
             f"{'has' if w['days'] == 1 else 'have'} landed in BigQuery — read this "
             "as directional."
         )
-    lines += ["", "*Movers so far this week* (vs the same days last week):"]
+    lines += ["", "**Movers so far this week** (vs the same days last week):"]
     movers = sorted(
         [s for s in skus if s.prev_amt and s.amt and s.in_assortment],
         key=lambda s: -abs(s.amt - s.prev_amt),
@@ -666,12 +673,21 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
             f"({m.amt - m.prev_amt:+,.0f}, {_pct(m.amt, m.prev_amt)})"
         )
 
-    # Scoped to the goaled assortment: the residual tail (de-listed Terracotta,
-    # unnamed test DPCIs) sits at 75-100% OOS on a handful of units and would
-    # crowd out the flags anyone can act on.
-    flags = [s for s in skus if s.oos is not None and s.oos > 2 and s.in_assortment]
+    # Every KMG-known SKU that is actually selling, not just the goaled ones — a
+    # SKU without a published $PSPW goal can still breach the in-stock goal. The
+    # sales floor keeps out the residual tail (de-listed Terracotta, unnamed test
+    # DPCIs), which sits at 75-100% OOS on a handful of units and would crowd out
+    # the flags anyone can act on.
+    flags = [
+        s
+        for s in skus
+        if s.oos is not None
+        and s.oos > 2
+        and s.known
+        and (s.amt or 0) >= NEW_SKU_MIN / 2  # partial week — lower bar
+    ]
     if flags:
-        lines += ["", "⚠️ *In-stock flags* (OOS > 2%):"]
+        lines += ["", "⚠️ **In-stock flags** (OOS > 2%):"]
         for s in sorted(flags, key=lambda s: -s.oos)[:4]:
             lines.append(f"  {s.name} — OOS {s.oos:.1f}%, WIP {s.wip:.1f}%")
 

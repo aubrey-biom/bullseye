@@ -227,12 +227,44 @@ def test_record_week_survives_float_summation_order() -> None:
     amt = 391_030.3600000058
     out = pos_brief.render_weekly(_render_input(amt, record_high=391_030.3600000059))
     assert out["main"].startswith("🎯")
-    assert "*Record week.*" in out["main"]
+    assert "**Record week.**" in out["main"]
 
 
 def test_a_week_below_the_high_is_not_called_a_record() -> None:
     out = pos_brief.render_weekly(_render_input(370_753.0, record_high=391_030.0))
-    assert "*Record week.*" not in out["main"]
+    assert "Record week" not in out["main"]
+
+
+def test_emphasis_is_standard_markdown_not_slack_mrkdwn() -> None:
+    """The delivery path parses standard markdown, where a single asterisk is
+    italic. Emitting Slack's native `*bold*` posts every header as italics."""
+    main = pos_brief.render_weekly(_render_input(391_030.0, record_high=391_030.0))["main"]
+    for heading in ("**Target POS", "**What's working**", "**What to watch**"):
+        assert heading in main
+    stripped = main.replace("**", "")
+    assert "*" not in stripped, "a single-asterisk emphasis marker survived"
+
+
+def test_ungoaled_sku_still_reaches_the_in_stock_flags() -> None:
+    """HS Go-Pack 20ct carries no published $PSPW goal, so scoping the flags to
+    the goaled assortment hid it breaching the 5.0% OOS goal at 6.4% on $5.1K of
+    sales. Lacking a goal keeps a SKU out of the goal math, not out of the
+    in-stock flags — while the de-listed tail stays suppressed on volume."""
+    d = _render_input(391_030.0, record_high=391_030.0)
+    ungoaled = pos_brief._annotate([_sku("003-02-7872", amt=5_143.0, units=2_174.0)], CFG)[0]
+    ungoaled.prev_amt, ungoaled.eoh_ow = 5_050.0, 6_678.0
+    ungoaled.wip, ungoaled.oos = 93.6, 6.42
+
+    delisted = pos_brief._annotate([_sku("999-99-9999", amt=28.0, units=2.0, doors=3)], CFG)[0]
+    delisted.prev_amt, delisted.eoh_ow = 20.0, 44.0
+    delisted.wip, delisted.oos = 20.0, 80.0
+
+    d["skus"] = [*d["skus"], ungoaled, delisted]
+    flag_line = next(
+        ln for ln in pos_brief.render_weekly(d)["main"].splitlines() if "Highest OOS" in ln
+    )
+    assert "Dispenser - Black 6.4%" in flag_line
+    assert "80.0%" not in flag_line
 
 
 def test_render_reports_the_short_week_it_dropped() -> None:
