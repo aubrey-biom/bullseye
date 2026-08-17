@@ -17,6 +17,21 @@ biom_raw  →  biom_core  →  biom_marts  →  biom_canvas
 
 Six source systems feed this warehouse: **Shopify** (DTC storefront), **Loop** (subscriptions), **Malomo** (shipment tracking), **Target/BPD** (primary retail revenue channel — bigger than Shopify), **Google Ads**, **Meta Ads**.
 
+### The other datasets are readable. That is not an invitation.
+
+Twelve datasets are visible, not four. `biom_canvas` (41 objects) is still where answers come from — the rest are readable so you can *debug lineage* when a canvas number looks wrong, and for nothing else. If you find yourself composing a business answer out of `biom_raw`, stop: either the canvas table you want exists and you missed it, or there is a modelling gap worth raising rather than routing around.
+
+| dataset | objects | what it's for |
+|---|---|---|
+| `biom_canvas` | 41 | **the answer layer** — query this |
+| `biom_raw` / `biom_core` / `biom_marts` | 33 / 14 / 5 | lineage debugging only |
+| `bpd_raw` / `bpd_curated` / `bpd_meta` | 18 / 5 / 1 | Target staging; `bpd_curated` is deprecated (Rule 10, Section 5) |
+| `biom_identity` | 6 | identity resolution inputs |
+| `biom_admin` | 13 | warehouse admin |
+| `meta_raw` | 4 | Meta Ads staging |
+| `biom_google_ads_raw` | 190 | Google Ads staging — 95 views, easy to get lost |
+| `biom_monitoring` | 1,767 | pipeline run telemetry. **Not business data.** Do not browse. |
+
 ---
 
 ## 1. THE RULES — Read This Section First, Every Time
@@ -104,6 +119,27 @@ Never use `bpd_curated.sales_all` (grain-overlap issues, deprecated) or any `bpd
 
 ### Rule 11 — Use Central Time for Shopify revenue reconciliation
 All locked Shopify revenue anchors (Section 6) use America/Chicago. `fct_orders.order_created_datetime_ct` is pre-converted — use it, not the UTC column, when comparing to a locked anchor figure.
+
+### Rule 12 — Customer identifiers are locked. `SELECT *` fails on two tables.
+Five columns sit behind the `biom-pii / direct-identifier` policy tag and are unreadable without the Fine-Grained Reader role, which the Claude Code service account deliberately does not hold:
+
+| table | columns |
+|---|---|
+| `dim_customer` | `email`, `first_name`, `last_name`, `phone` |
+| `bdg_customer_identity` | `normalized_email` |
+
+```sql
+-- FAILS: 403 "User has neither fine-grained reader nor masked reader"
+SELECT * FROM `biom-reporting-s26.biom_canvas.dim_customer` WHERE is_current
+-- WORKS: name the columns you need
+SELECT customer_id, created_at FROM `biom-reporting-s26.biom_canvas.dim_customer` WHERE is_current
+```
+
+That error reads like a broken connection or a missing dataset grant. It is neither — it means a tagged column was selected, usually by a `SELECT *` nobody thought about.
+
+**This costs you nothing analytically.** `customer_id` is the join key for every cohort, repurchase, LTV, and cross-sell question in this warehouse; `vw_repurchase_base` is built entirely on it. No analysis here needs a name, an email, or a phone number. If you genuinely need to reach a specific customer, that lookup belongs in Shopify admin, not in a SQL result set.
+
+Applies to whoever runs the query, not to the warehouse: a human with `bigquery.admin` **plus** Fine-Grained Reader sees these columns normally.
 
 ---
 
@@ -269,6 +305,20 @@ JOIN dim_product p ON CAST(fct_orders.variant_id AS STRING) = p.product_key AND 
 - Refill limited offers, travel packs, holiday variants
 
 An analysis keyed **only** on the `dim_product` join silently drops all of these — massively undercounting dispensers and kits. **Rule: for product/category/dispenser analysis, use a two-tier resolver** — authoritative `dim_product` taxonomy when the join succeeds; a `product_title` pattern fallback when `variant_id IS NULL`.
+
+**Prefer `vw_order_line_sku_resolved` over hand-rolling that resolver** (added since this section was written; verified live 2026-08-17). It carries the resolution already done, plus a `resolution_method` column saying *how* each line was resolved, so coverage is measurable instead of assumed. 233,440 lines:
+
+| `resolution_method` | lines | unresolved | gross |
+|---|---|---|---|
+| `DIRECT_VARIANT_ID` | 163,035 | 0 | $5.12M |
+| `NO_PATH` | 25,570 | **25,570** | **$1.05M** |
+| `SKU_HISTORY_FALLBACK` | 17,276 | 0 | $573K |
+| `DEAD_VARIANT` | 16,193 | 0 | $572K |
+| `SKU_HISTORY_DATED` | 8,674 | 0 | $217K |
+| `NON_PRODUCT` | 2,067 | 2,067 | $2.8K |
+| `SKU_HISTORY_BACKDATED` / `_NULLSKU` / `AMBIGUOUS` | 625 | 1 | $18K |
+
+**It narrows the problem, it does not erase it.** Of the 53,999 keyless lines it rescues 26,595 — 49%. `NO_PATH` still holds 25,570 lines and **$1.05M of gross that resolves to no variant at all**. Any total built off `resolved_variant_id` is therefore short by roughly that much: state it, or reconcile against an unresolved total, but do not present the resolved figure as complete. `NON_PRODUCT` is the §9.3 exclusion set, already labelled for you.
 
 ### 9.3 — Non-product line items to exclude
 Present as `fct_orders` lines but not sellable products (≈$0 or trivial gross): titles `Carbon Neutral Offset`, `Checkout+`, `20% CashBack` (and any `%CashBack%`), and gift-with-purchase `%GWP%` (e.g. `Hydrangea Dispenser GWP`). Filter these out of product/revenue-mix work.

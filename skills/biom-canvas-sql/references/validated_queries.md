@@ -85,3 +85,66 @@ ORDER BY dispenser_cohort;
 - **Confound (must state to VMG):** the dispenser-cohort gap is correlation with tenure and total spend baked in — dispenser buyers are earlier/heavier customers. To neutralize, add `COUNT(DISTINCT order_id)` per customer as a control and show the category lift holds *within* order-count bands.
 - **Cohort trend:** for "categories per customer is rising," hold the customer set fixed (same-cohort carry-forward). Baby (~Mar 2026) and Body (~May 2026) launching will mechanically lift an all-customer number.
 - Guests are excluded (no `customer_id`). Consider `bdg_customer_identity` → `identity_key` if cross-channel identity matters.
+
+---
+
+## Warehouse inventory — what exists, and how stale is the schema map?
+**Validated:** 2026-08-17 · **Answers:** "what datasets/objects can I actually reach, and does the skill still describe them?"
+
+Run this before trusting `schema_map.md`. It caught the map sitting at 36 objects while `biom_canvas` held 41.
+
+```sql
+SELECT table_schema, COUNT(*) AS objects, COUNTIF(table_type = 'VIEW') AS views
+FROM `biom-reporting-s26.region-us-central1.INFORMATION_SCHEMA.TABLES`
+GROUP BY 1 ORDER BY objects DESC
+```
+
+**Gotchas:**
+- **The region qualifier is mandatory.** `` `biom-reporting-s26`.INFORMATION_SCHEMA.TABLES `` returns **zero rows with no error** — the default US multi-region has none of these datasets. Same for the Python client: pass `location="us-central1"`.
+- Expect 12 datasets. `biom_monitoring` (1,767 objects) is pipeline telemetry, not business data.
+- To find undocumented objects, diff the live `table_name` set against the text of `schema_map.md` — that is how the five missing objects surfaced.
+
+---
+
+## Repurchase distribution — orders per customer, PII-free
+**Validated:** 2026-08-17 · **Answers:** "what share of customers ever order more than once?"
+
+Demonstrates that customer analysis needs no identifier columns (Rule 12): `customer_id` alone carries it.
+
+```sql
+WITH per_cust AS (
+  SELECT customer_id, COUNT(DISTINCT order_id) AS orders
+  FROM `biom-reporting-s26.biom_canvas.fct_orders`
+  WHERE is_current AND customer_id IS NOT NULL
+  GROUP BY 1
+)
+SELECT IF(orders = 1, '1 order', IF(orders <= 3, '2-3 orders', '4+ orders')) AS band,
+       COUNT(*) AS customers
+FROM per_cust GROUP BY 1 ORDER BY 1
+```
+
+**Result (2026-08-17):** 1 order 25,893 (51.9%) · 2–3 orders 13,029 (26.1%) · 4+ orders 11,016 (22.1%) · total 49,938.
+
+**Gotchas:**
+- This is **all channels and no contaminant filter** — a raw shape, not a reportable repurchase rate. For anything external, scope `order_source` to core D2C (§9.4) and strip ShopMy $0 gifting and $1 PR samples first, or the denominator is inflated by orders that were never purchases.
+- 49,938 customers here vs 142,417 `customer_id`s in `dim_customer`: most customer records have no attributable order line. Do not treat `dim_customer` row count as a customer base.
+- `vw_repurchase_base` already models this properly (first/second order dates, 60-day windows, acquisition channel). Prefer it for real analysis; the above is a sanity shape.
+
+---
+
+## Keyless order lines — how much revenue resolves to no variant?
+**Validated:** 2026-08-17 · **Answers:** "how complete is any variant-keyed product total?" (§9.2)
+
+```sql
+SELECT resolution_method, COUNT(*) AS lines,
+       COUNTIF(resolved_variant_id IS NULL) AS unresolved,
+       ROUND(SUM(gross_using_line_price), 0) AS gross
+FROM `biom-reporting-s26.biom_canvas.vw_order_line_sku_resolved`
+GROUP BY 1 ORDER BY lines DESC
+```
+
+**Result (2026-08-17):** 233,440 lines. `NO_PATH` = 25,570 lines / **$1.05M gross that resolves to no variant.** Of 53,999 keyless lines the view rescues 26,595 (49%).
+
+**Gotchas:**
+- Run this before quoting any variant-keyed product/category total — it tells you what the total is missing. Roughly $1.05M is unattributable, so a resolved figure is a floor, not the whole.
+- `NON_PRODUCT` (2,067 lines) is the §9.3 exclusion set, pre-labelled.

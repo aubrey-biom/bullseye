@@ -1,10 +1,78 @@
 # BigQuery Setup Guide — BIOM CANVAS
-**For:** New team member connecting to BIOM's data warehouse for the first time
 **Project:** `biom-reporting-s26` · **Region:** `us-central1` · **Primary dataset:** `biom_canvas`
 
-This guide gets you from "nothing installed" to "running queries against `biom_canvas` from your Mac terminal." Follow it in order.
+**Two environments connect two different ways. Pick yours:**
+
+- **Claude Code** (web or cloud session) — a service account is already wired up.
+  Nothing to install, no browser login. **Read Part A, skip Part B entirely.**
+- **Your own Mac terminal** — browser login as yourself. **Part B.**
 
 ---
+
+# Part A — Claude Code (service account)
+
+There is no `gcloud` and no `bq` CLI in a Code container, and no browser to log
+in with. Auth comes from the `GCP_SA_KEY_B64` environment variable — a
+base64-encoded key for
+`claude-code-bq-readonly@biom-reporting-s26.iam.gserviceaccount.com` — and
+queries go through the BigQuery Python client.
+
+```python
+import base64, os
+from pathlib import Path
+from google.cloud import bigquery
+
+if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    b64 = os.environ["GCP_SA_KEY_B64"]
+    dest = Path.home() / ".config" / "gcloud" / "biom-bq-sa.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(base64.b64decode(b64))
+    dest.chmod(0o600)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(dest)
+
+client = bigquery.Client(project="biom-reporting-s26", location="us-central1")
+sql = "SELECT COUNT(*) n FROM `biom-reporting-s26.biom_canvas.fct_orders` WHERE is_current"
+print(list(client.query(sql).result())[0].n)
+```
+
+**`location="us-central1"` is not optional.** Omit it and the client defaults to
+the US multi-region, where `INFORMATION_SCHEMA` returns **zero rows** — which
+reads like an empty warehouse rather than a wrong region, and has already cost
+real time here.
+
+The same trap in SQL: region-qualified metadata views need the region in the path.
+
+```sql
+-- returns nothing (wrong region, no error)
+SELECT schema_name FROM `biom-reporting-s26`.INFORMATION_SCHEMA.SCHEMATA
+-- correct
+SELECT schema_name FROM `biom-reporting-s26.region-us-central1.INFORMATION_SCHEMA.SCHEMATA`
+```
+
+### What this credential can and cannot do
+
+- **Reads** every dataset in the project — 12 of them, not only `biom_canvas`.
+- **Writes** nothing, anywhere. It holds `dataViewer` + `jobUser` and no more.
+- **Cannot read customer identifiers.** See Rule 12 in `database_reference.md`.
+- **Cannot list jobs** (`bigquery.jobs.listAll` is not granted), so
+  `INFORMATION_SCHEMA.JOBS_BY_PROJECT` is unavailable — a human with
+  `bigquery.admin` has to run job-history queries.
+
+### No `bq` CLI here
+
+Wherever this skill shows `bq query`, the Code equivalent is
+`client.query(sql).result()`. Two `bq` conveniences need replacing by hand:
+
+| `bq` flag | Python equivalent |
+|---|---|
+| `--dry_run` | `bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)`, then read `job.total_bytes_processed` |
+| `--max_rows=N` | not needed — iterating `.result()` pages through everything |
+
+---
+
+# Part B — Your own Mac terminal
+
+*(Skip all of Part B in Claude Code.)*
 
 ## Step 1 — Install the Google Cloud CLI
 

@@ -1,6 +1,6 @@
 ---
 name: biom-canvas-sql
-description: Write, debug, and run SQL against Biom's BigQuery data warehouse (the CANVAS project, biom-reporting-s26) using the bq CLI. Use this whenever the user asks any question that needs Biom business data — revenue, orders, units, AOV, customers, retention or repurchase, Loop subscriptions, cross-sell across categories, dispenser conversion, or Target/BPD retail sell-through and velocity — even if they do not say the words SQL, query, or BigQuery, and even if they just paste bq output and ask what it means. Also use when connecting to the warehouse for the first time, checking query cost, or reconciling a figure against locked revenue anchors. This skill carries the warehouse's correctness rules (is_current filtering, SUM-safe money columns, join keys, the certified biom_canvas layer, net-revenue source, product taxonomy). Consult it before writing any Biom query, because almost every past mistake on this platform traces to skipping one of these rules.
+description: Write, debug, and run SQL against Biom's BigQuery data warehouse (the CANVAS project, biom-reporting-s26). Use this whenever the user asks any question that needs Biom business data — revenue, orders, units, AOV, customers, retention or repurchase, Loop subscriptions, cross-sell across categories, dispenser conversion, media and ad performance, or Target/BPD retail sell-through and velocity — even if they do not say the words SQL, query, or BigQuery, and even if they just paste query output and ask what it means. In Claude Code a read-only service account already reaches the whole warehouse, so a plain-language question can go straight to a verified result and on to a deliverable (Excel, deck, artifact) with no SQL file written first. Also use when connecting for the first time, checking query cost, or reconciling a figure against locked revenue anchors. This skill carries the warehouse's correctness rules (is_current filtering, SUM-safe money columns, join keys, the certified biom_canvas layer, net-revenue source, product taxonomy, and the customer-identifier columns that are deliberately unreadable). Consult it before writing any Biom query, because almost every past mistake on this platform traces to skipping one of these rules.
 ---
 
 # Biom CANVAS SQL
@@ -48,12 +48,19 @@ These are the highest-frequency failure modes. The full rule set is reference Se
 9. **Keyless lines** — if the query classifies products, is it handling the ~54K `fct_orders` lines where `variant_id IS NULL`? These include *active* flagship kits and dispensers that never join to `dim_product` — a join-only classification silently drops them. Use the two-tier resolver (taxonomy join + `product_title` fallback) and exclude non-product titles. See reference Section 9.
 10. **Channel scope** — if the question is about D2C customers, is `order_source` filtered to core D2C (`web` + `subscription_contract*`), excluding wholesale/marketplace/POS? See reference Section 9.4.
 11. **Time zone** — Central Time (`order_created_datetime_ct`) when reconciling Shopify revenue to a locked anchor?
+12. **No `SELECT *` on `dim_customer` / `bdg_customer_identity`** — five identifier columns are policy-tagged and unreadable, so a star select 403s with a message that looks like a broken connection. Name your columns; `customer_id` is what the analysis needs anyway (Rule 12).
 
 ---
 
-## bq CLI mechanics
+## Running the query
 
-Connection/setup lives in `references/setup_guide.md`. Everyday query form:
+Connection/setup lives in `references/setup_guide.md` — **Part A for Claude Code, Part B for a Mac terminal.** They authenticate differently and there is no `bq` CLI in Code.
+
+**In Claude Code** the service account already reaches all 12 datasets, so there is no compose-here-run-there step: go from the question to `client.query(sql).result()` in one move, then straight into whatever the deliverable is (Excel via the `xlsx` skill, a deck via `pptx`, a hosted page via an artifact). Writing a `.sql` file first is only worth it when the query is something to keep and re-run.
+
+Easier access raises the stakes on step 3, not lowers them. A wrong number now arrives faster and with more polish on it.
+
+**On a Mac terminal:**
 
 ```bash
 bq query --nouse_legacy_sql --project_id=biom-reporting-s26 '
@@ -80,6 +87,6 @@ bq query --nouse_legacy_sql --project_id=biom-reporting-s26 '
 Two-file split: **judgment** (curated, partial coverage, authoritative) vs **structure** (complete, regenerable, drifts).
 
 - **`references/database_reference.md`** — the judgment layer: Section 1 rules, core tables + keys, bridges, product taxonomy, non-certified traps, locked anchors, SCD2 columns, join-key cheat sheet, and Section 9 order-line classification + channel scoping (join key, keyless-line trap, non-product exclusions, `order_source` taxonomy). **Read Section 1 before every query; read Section 9 before any product/category/channel query.**
-- **`references/schema_map.md`** — the structure layer: complete column-level inventory of all 36 `biom_canvas` objects (types, partition/cluster keys, and full view SELECT logic). Consult when you need exact column names/types or a view's derivation. Objects flagged 🆕 there exist but aren't yet annotated in `database_reference.md` — verify grain/quirks live before relying on them. Regenerate with `scripts/refresh_schema.sh` (it drifts).
+- **`references/schema_map.md`** — the structure layer: complete column-level inventory of all 41 `biom_canvas` objects (types, partition/cluster keys, and full view SELECT logic). Consult when you need exact column names/types or a view's derivation. Objects flagged 🆕 there exist but aren't yet annotated in `database_reference.md` — verify grain/quirks live before relying on them. **It drifts, and silently:** it sat at 36 objects while the warehouse had 41, so five objects — including `vw_order_line_sku_resolved`, which supersedes a hand-rolled recipe in Section 9 — were invisible to anyone reading only this skill. Regenerate with `python scripts/refresh_schema.py` (works in Code and on a laptop; `refresh_schema.sh` is the older `bq`-only version and does not run in Code).
 - **`references/setup_guide.md`** — one-time connection: gcloud install, the two required logins, project set, verification, CLI gotchas.
 - **`references/validated_queries.md`** — a growing library of queries already run and checked. Check here first before writing a new query from scratch — the answer may already exist. Deposit each validated query here.

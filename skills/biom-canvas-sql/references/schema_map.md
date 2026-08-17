@@ -1,14 +1,14 @@
 # Biom CANVAS — Structural Schema Map
 **Project:** `biom-reporting-s26` · **Dataset:** `biom_canvas` · **Region:** `us-central1`
-**Generated:** 2026-07-22 from `INFORMATION_SCHEMA` · **Objects:** 29 base tables, 7 views · **Columns:** 889
+**Generated:** 2026-08-17 from `INFORMATION_SCHEMA` · **Objects:** 30 base tables, 11 views · **Columns:** 954
 
-> **This file is STRUCTURE, regenerable on demand — not hand-curated truth.** It goes stale as the warehouse changes (tables were modified same-day during setup). Regenerate with `scripts/refresh_schema.sh`. For grain, join keys, quirks, SUM-safe columns, and the correctness rules, see **`database_reference.md`** — that is the judgment layer. Objects flagged 🆕 appear in the live warehouse but are **not yet annotated** in `database_reference.md`: their structure is below but their grain/quirks are unverified — confirm before relying on them.
+> **This file is STRUCTURE, regenerable on demand — not hand-curated truth.** It goes stale as the warehouse changes. Regenerate with `python scripts/refresh_schema.py`. For grain, join keys, quirks, SUM-safe columns, and the correctness rules, see **`database_reference.md`** — that is the judgment layer. Objects flagged 🆕 appear in the live warehouse but are **not yet annotated** in `database_reference.md`: their structure is below but their grain/quirks are unverified — confirm before relying on them.
 
 ## Contents
 
-**Base tables:** `bdg_customer_identity`, `bdg_order_subscription`, `bdg_product_channel`, `dim_ad_group` 🆕, `dim_ad_meta` 🆕, `dim_adset_meta` 🆕, `dim_campaign` 🆕, `dim_campaign_meta` 🆕, `dim_channel` 🆕, `dim_customer`, `dim_date` 🆕, `dim_location`, `dim_product`, `dim_product_variant`, `dim_subscription_plan` 🆕, `fct_ad_performance` 🆕, `fct_delivery`, `fct_inventory` 🆕, `fct_keyword_performance` 🆕, `fct_meta_performance` 🆕, `fct_orders`, `fct_refunds`, `fct_revenue`, `fct_shopping_performance` 🆕, `fct_subscription_events` 🆕, `fct_subscriptions`, `fct_target_gross_margin` 🆕, `fct_target_inventory`, `fct_target_sales`
+**Base tables:** `bdg_customer_identity`, `bdg_order_subscription`, `bdg_product_channel`, `dim_ad_group` 🆕, `dim_ad_meta` 🆕, `dim_adset_meta` 🆕, `dim_campaign` 🆕, `dim_campaign_meta` 🆕, `dim_channel`, `dim_customer`, `dim_date`, `dim_location`, `dim_product`, `dim_product_discontinued` 🆕, `dim_product_variant`, `dim_subscription_plan`, `fct_ad_performance` 🆕, `fct_delivery`, `fct_inventory`, `fct_keyword_performance` 🆕, `fct_meta_performance` 🆕, `fct_orders`, `fct_refunds`, `fct_revenue`, `fct_shopping_performance` 🆕, `fct_subscription_events`, `fct_subscriptions`, `fct_target_gross_margin`, `fct_target_inventory`, `fct_target_sales`
 
-**Views:** `vw_repurchase_base`, `vw_revenue_subscriptions`, `vw_shopify_category_geo_detail` 🆕, `vw_shopify_sku_order_financial_detail` 🆕, `vw_target_week_store` 🆕, `vw_target_week_tcin` 🆕, `vw_variant_sku_journey` 🆕
+**Views:** `vw_inventory_oos` 🆕, `vw_media_delivery_status` 🆕, `vw_mmm_phase3_weekly_dataset` 🆕, `vw_order_line_sku_resolved` 🆕, `vw_repurchase_base`, `vw_revenue_subscriptions`, `vw_shopify_category_geo_detail`, `vw_shopify_sku_order_financial_detail`, `vw_target_week_store`, `vw_target_week_tcin`, `vw_variant_sku_journey`
 
 ---
 
@@ -76,8 +76,9 @@
 | 15 | `created_at` | TIMESTAMP |  |
 | 16 | `updated_at` | TIMESTAMP |  |
 
-### `dim_ad_group` 🆕 *structure only*
+### `dim_ad_group` 🆕
 **Clustered:** `is_current, ad_group_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -103,8 +104,9 @@
 | 20 | `created_at` | TIMESTAMP |  |
 | 21 | `updated_at` | TIMESTAMP |  |
 
-### `dim_ad_meta` 🆕 *structure only*
+### `dim_ad_meta` 🆕
 **Clustered:** `is_current, ad_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -124,8 +126,9 @@
 | 14 | `created_at` | TIMESTAMP |  |
 | 15 | `updated_at` | TIMESTAMP |  |
 
-### `dim_adset_meta` 🆕 *structure only*
+### `dim_adset_meta` 🆕
 **Clustered:** `is_current, adset_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -150,8 +153,9 @@
 | 19 | `created_at` | TIMESTAMP |  |
 | 20 | `updated_at` | TIMESTAMP |  |
 
-### `dim_campaign` 🆕 *structure only*
+### `dim_campaign` 🆕
 **Clustered:** `is_current, campaign_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -180,8 +184,9 @@
 | 23 | `created_at` | TIMESTAMP |  |
 | 24 | `updated_at` | TIMESTAMP |  |
 
-### `dim_campaign_meta` 🆕 *structure only*
+### `dim_campaign_meta` 🆕
 **Clustered:** `is_current, campaign_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -205,7 +210,8 @@
 | 18 | `created_at` | TIMESTAMP |  |
 | 19 | `updated_at` | TIMESTAMP |  |
 
-### `dim_channel` 🆕 *structure only*
+### `dim_channel`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -249,7 +255,8 @@
 | 24 | `ship_zip` | STRING | ✓ |
 | 25 | `ship_country_code` | STRING | ✓ |
 
-### `dim_date` 🆕 *structure only*
+### `dim_date`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -277,6 +284,8 @@
 | 22 | `month_end_date` | DATE | ✓ |
 | 23 | `quarter_end_date` | DATE | ✓ |
 | 24 | `year_end_date` | DATE | ✓ |
+| 25 | `event_name` | STRING | ✓ |
+| 26 | `event_type` | STRING | ✓ |
 
 ### `dim_location`
 **Clustered:** `is_current, location_id`
@@ -353,6 +362,24 @@
 | 29 | `product_category` | STRING | ✓ |
 | 30 | `product_sub_category` | STRING | ✓ |
 
+### `dim_product_discontinued` 🆕
+*Judgment/quirks: see `database_reference.md`.*
+
+| # | column | type | null |
+|---|---|---|---|
+| 1 | `sku` | STRING | ✓ |
+| 2 | `product_title` | STRING | ✓ |
+| 3 | `product_category` | STRING | ✓ |
+| 4 | `sku_prefix_class` | STRING | ✓ |
+| 5 | `is_confirmed_deleted` | BOOL | ✓ |
+| 6 | `is_active_gap` | BOOL | ✓ |
+| 7 | `first_order_date` | DATE | ✓ |
+| 8 | `last_order_date` | DATE | ✓ |
+| 9 | `lifetime_order_count` | INT64 | ✓ |
+| 10 | `lifetime_customer_count` | INT64 | ✓ |
+| 11 | `lifetime_gross_revenue` | NUMERIC | ✓ |
+| 12 | `warehouse_loaded_at` | TIMESTAMP | ✓ |
+
 ### `dim_product_variant`
 **Clustered:** `is_current, variant_id`
 *Judgment/quirks: see `database_reference.md`.*
@@ -380,8 +407,9 @@
 | 19 | `created_at` | TIMESTAMP |  |
 | 20 | `updated_at` | TIMESTAMP |  |
 
-### `dim_subscription_plan` 🆕 *structure only*
+### `dim_subscription_plan`
 **Clustered:** `is_current, selling_plan_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -398,8 +426,9 @@
 | 11 | `created_at` | TIMESTAMP |  |
 | 12 | `updated_at` | TIMESTAMP |  |
 
-### `fct_ad_performance` 🆕 *structure only*
+### `fct_ad_performance` 🆕
 **Partitioned:** `date` · **Clustered:** `campaign_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -457,8 +486,9 @@
 | 29 | `created_at` | TIMESTAMP |  |
 | 30 | `updated_at` | TIMESTAMP |  |
 
-### `fct_inventory` 🆕 *structure only*
+### `fct_inventory`
 **Clustered:** `is_current, inventory_item_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -486,8 +516,9 @@
 | 22 | `created_at` | TIMESTAMP |  |
 | 23 | `updated_at` | TIMESTAMP |  |
 
-### `fct_keyword_performance` 🆕 *structure only*
+### `fct_keyword_performance` 🆕
 **Partitioned:** `date` · **Clustered:** `campaign_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -508,8 +539,9 @@
 | 15 | `row_id` | STRING |  |
 | 16 | `loaded_at` | TIMESTAMP |  |
 
-### `fct_meta_performance` 🆕 *structure only*
+### `fct_meta_performance` 🆕
 **Partitioned:** `date_start` · **Clustered:** `ad_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -637,8 +669,9 @@
 | 28 | `created_at` | TIMESTAMP |  |
 | 29 | `updated_at` | TIMESTAMP |  |
 
-### `fct_shopping_performance` 🆕 *structure only*
+### `fct_shopping_performance` 🆕
 **Partitioned:** `date` · **Clustered:** `campaign_id`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -667,8 +700,9 @@
 | 23 | `row_id` | STRING |  |
 | 24 | `loaded_at` | TIMESTAMP |  |
 
-### `fct_subscription_events` 🆕 *structure only*
+### `fct_subscription_events`
 **Partitioned:** `DATE(event_at)` · **Clustered:** `event_type, channel_key`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -745,8 +779,9 @@
 | 49 | `created_at` | TIMESTAMP |  |
 | 50 | `updated_at` | TIMESTAMP |  |
 
-### `fct_target_gross_margin` 🆕 *structure only*
-**Partitioned:** `fiscal_week_end_date` · **Clustered:** `is_current, tcin`
+### `fct_target_gross_margin`
+**Partitioned:** `fiscal_week_end_date`
+*Judgment/quirks: see `database_reference.md`.*
 
 | # | column | type | null |
 |---|---|---|---|
@@ -874,6 +909,559 @@
 ## Views (with logic)
 
 View DDL is included because it encodes derivations and upstream lineage. Views already filter `is_current` internally — **do not re-add it** (Rule 1 exception in `database_reference.md`).
+
+### `vw_inventory_oos` 🆕
+Columns: `sku`, `oos_class`, `is_oos_all_listings`, `is_stockout`, `is_committed_only`, `units_sold_90d`, `is_selling_90d`, `listings_in_scope`, `listings_total`, `listings_out_of_scope`, `max_available`, `min_available`, `total_available`, `max_on_hand`, `total_on_hand`, `has_negative_available`
+
+```sql
+WITH
+
+-- Catalogue status per inventory item.
+-- QUALIFY is a guard, not a fix for an observed problem: inventory_item_id is
+-- 1:1 with variant_id in Shopify by design and verified 1:1 live (2026-08-17).
+-- A fan-out here would silently double-count listings.
+variant_status AS (
+  SELECT
+    inventory_item_id,
+    product_status,
+    is_order_active
+  FROM `biom-reporting-s26.biom_canvas.dim_product_variant`
+  WHERE is_current = TRUE
+    AND inventory_item_id IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY inventory_item_id ORDER BY variant_id
+  ) = 1
+),
+
+-- Every current inventory row, with catalogue status attached.
+-- Join is 0-miss on 725/725 current rows (verified 2026-08-17).
+all_listings AS (
+  SELECT
+    f.inventory_item_id,
+    f.sku,
+    f.tracked,
+    f.available_quantity,
+    f.on_hand_quantity,
+    v.product_status,
+    v.is_order_active
+  FROM `biom-reporting-s26.biom_canvas.fct_inventory` f
+  LEFT JOIN variant_status v
+    ON f.inventory_item_id = v.inventory_item_id
+  WHERE f.is_current = TRUE
+    AND f.is_deleted = FALSE
+),
+
+-- Total listing count per SKU BEFORE scoping, so a consumer can see how much
+-- of a SKU's footprint the scope filter removed. This is the duplicate-listing
+-- spread that produced artifact A.
+listing_footprint AS (
+  SELECT sku, COUNT(*) AS listings_total
+  FROM all_listings
+  WHERE sku IS NOT NULL
+  GROUP BY sku
+),
+
+-- THE SCOPE. Correction 3 above.
+scoped AS (
+  SELECT *
+  FROM all_listings
+  WHERE product_status = 'active'
+    AND is_order_active = TRUE
+    AND sku IS NOT NULL
+    -- F1: exclude tracked = FALSE. Shopify does not decrement untracked items,
+    -- so their quantities are not meaningful in any aggregate (x-redo sits at
+    -- a flat 1,000,000 forever, which is what made SUM(available_quantity)
+    -- return 57,107,094). Preferred over a 9th copy of item 42's named
+    -- non-product exclusion list because `tracked` is Shopify's own "this
+    -- number means nothing" marker and needs no maintenance when the next
+    -- checkout app is installed.
+    -- ⚠️ Currently a NO-OP: 0 of the 239 sellable rows are untracked
+    -- (verified 2026-08-17). Kept as a guard against a future active-and-
+    -- untracked service SKU, and because F1 is correct on its own terms.
+    -- It is NOT what removes the archived block -- the scope filter above is.
+    AND tracked = TRUE
+),
+
+-- 90-day demand, for the L5/L6 re-basing. Uses resolved_sku, not the raw
+-- order-time sku: vw_order_line_sku_resolved is the documented resolution path
+-- and recovers lines whose variant_id was deleted from the catalogue.
+sales_90d AS (
+  SELECT
+    r.resolved_sku AS sku,
+    SUM(o.quantity) AS units_sold_90d
+  FROM `biom-reporting-s26.biom_canvas.vw_order_line_sku_resolved` r
+  JOIN `biom-reporting-s26.biom_canvas.fct_orders` o
+    ON  o.order_id     = r.order_id
+    AND o.line_item_id = r.line_item_id
+    AND o.is_current   = TRUE
+    AND o.is_deleted   = FALSE
+  WHERE r.resolved_sku IS NOT NULL
+    AND DATE(r.order_created_at_utc)
+        BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) AND CURRENT_DATE()
+  GROUP BY r.resolved_sku
+),
+
+sku_grain AS (
+  SELECT
+    s.sku,
+    COUNT(*)                        AS listings_in_scope,
+    -- Correction 1: MAX drives all-listings-OOS. A SKU is out of stock only
+    -- when its BEST in-scope listing is <= 0.
+    MAX(s.available_quantity)       AS max_available,
+    MIN(s.available_quantity)       AS min_available,
+    SUM(s.available_quantity)       AS total_available,
+    MAX(s.on_hand_quantity)         AS max_on_hand,
+    SUM(s.on_hand_quantity)         AS total_on_hand
+  FROM scoped s
+  GROUP BY s.sku
+)
+
+SELECT
+  g.sku,
+
+  -- ── The metric ──────────────────────────────────────────────────────────
+  -- Correction 2: STOCKOUT vs COMMITTED_ONLY are different facts.
+  CASE
+    WHEN g.max_available <= 0 AND g.max_on_hand <= 0 THEN 'STOCKOUT'
+    WHEN g.max_available <= 0 AND g.max_on_hand >  0 THEN 'COMMITTED_ONLY'
+    ELSE 'IN_STOCK'
+  END                                          AS oos_class,
+
+  g.max_available <= 0                         AS is_oos_all_listings,
+  (g.max_available <= 0 AND g.max_on_hand <= 0) AS is_stockout,
+  (g.max_available <= 0 AND g.max_on_hand >  0) AS is_committed_only,
+
+  -- ── Demand, for L5/L6 re-basing ─────────────────────────────────────────
+  COALESCE(s.units_sold_90d, 0)                AS units_sold_90d,
+  COALESCE(s.units_sold_90d, 0) > 0            AS is_selling_90d,
+
+  -- ── Listing spread (artifact A visibility) ──────────────────────────────
+  g.listings_in_scope,
+  f.listings_total,
+  f.listings_total - g.listings_in_scope       AS listings_out_of_scope,
+
+  -- ── Quantities. Safe to aggregate: untracked rows are already excluded. ──
+  g.max_available,
+  g.min_available,
+  g.total_available,
+  g.max_on_hand,
+  g.total_on_hand,
+
+  -- ── Oversell flag (partial F4 — sellable subset only) ───────────────────
+  g.min_available < 0                          AS has_negative_available
+
+FROM sku_grain g
+LEFT JOIN listing_footprint f ON f.sku = g.sku
+LEFT JOIN sales_90d         s ON s.sku = g.sku
+```
+
+### `vw_media_delivery_status` 🆕
+Columns: `channel`, `canvas_table`, `event_date`, `delivery_status`, `spend_modelled`, `impressions_modelled`, `evidence_method`, `evidence_ref`, `evidence_note`, `confidence`
+
+```sql
+WITH meta_span AS (
+  SELECT MIN(date_start) AS d0, MAX(date_start) AS d1
+  FROM `biom-reporting-s26.biom_canvas.fct_meta_performance`
+),
+meta_cal AS (
+  SELECT d AS event_date
+  FROM meta_span, UNNEST(GENERATE_DATE_ARRAY(d0, d1)) AS d
+),
+meta_observed AS (
+  SELECT date_start AS event_date,
+         COUNT(*)          AS n_rows,
+         SUM(impressions)  AS impressions,
+         SUM(spend)         AS spend
+  FROM `biom-reporting-s26.biom_canvas.fct_meta_performance`
+  GROUP BY event_date
+),
+meta_rows AS (
+  SELECT
+    'META'                  AS channel,
+    'fct_meta_performance'  AS canvas_table,
+    c.event_date,
+    CASE
+      WHEN o.n_rows > 0 AND o.impressions > 0 THEN 'DELIVERED'
+      WHEN o.n_rows > 0                        THEN 'OBSERVED_ZERO'
+      WHEN s.delivery_status IS NOT NULL       THEN s.delivery_status
+      ELSE                                          'ABSENT_UNDIAGNOSED'
+    END                      AS delivery_status,
+    IFNULL(o.spend, 0)       AS spend_modelled,
+    IFNULL(o.impressions, 0) AS impressions_modelled,
+    s.evidence_method, s.evidence_ref, s.evidence_note, s.confidence
+  FROM meta_cal c
+  LEFT JOIN meta_observed o
+    ON o.event_date = c.event_date
+  LEFT JOIN `biom-reporting-s26.biom_admin.seed_media_delivery_status` s
+    ON s.canvas_table = 'fct_meta_performance' AND s.event_date = c.event_date
+),
+
+google_span AS (
+  SELECT MIN(date) AS d0, MAX(date) AS d1
+  FROM `biom-reporting-s26.biom_canvas.fct_ad_performance`
+),
+google_cal AS (
+  SELECT d AS event_date
+  FROM google_span, UNNEST(GENERATE_DATE_ARRAY(d0, d1)) AS d
+),
+google_observed AS (
+  SELECT date AS event_date,
+         COUNT(*)          AS n_rows,
+         SUM(impressions)  AS impressions,
+         SUM(spend_usd)    AS spend
+  FROM `biom-reporting-s26.biom_canvas.fct_ad_performance`
+  GROUP BY event_date
+),
+google_rows AS (
+  SELECT
+    'GOOGLE'               AS channel,
+    'fct_ad_performance'   AS canvas_table,
+    c.event_date,
+    CASE
+      WHEN o.n_rows > 0 AND o.impressions > 0 THEN 'DELIVERED'
+      WHEN o.n_rows > 0                        THEN 'OBSERVED_ZERO'
+      WHEN s.delivery_status IS NOT NULL       THEN s.delivery_status
+      ELSE                                          'ABSENT_UNDIAGNOSED'
+    END                      AS delivery_status,
+    IFNULL(o.spend, 0)       AS spend_modelled,
+    IFNULL(o.impressions, 0) AS impressions_modelled,
+    s.evidence_method, s.evidence_ref, s.evidence_note, s.confidence
+  FROM google_cal c
+  LEFT JOIN google_observed o
+    ON o.event_date = c.event_date
+  LEFT JOIN `biom-reporting-s26.biom_admin.seed_media_delivery_status` s
+    ON s.canvas_table = 'fct_ad_performance' AND s.event_date = c.event_date
+)
+
+SELECT * FROM meta_rows
+UNION ALL
+SELECT * FROM google_rows
+```
+
+### `vw_mmm_phase3_weekly_dataset` 🆕
+Columns: `week_start`, `gross_revenue`, `orders`, `new_customer_orders`, `meta_spend`, `meta_impressions`, `goog_spend`, `goog_impressions`, `disc_depth`, `sub_share`, `price`, `holiday_day_count`, `holiday_event_types`, `h10_era`
+
+```sql
+WITH week_spine AS (
+  SELECT DATE_ADD('2025-07-07', INTERVAL 7*n DAY) AS week_start
+  FROM UNNEST(GENERATE_ARRAY(0, 55)) AS n
+),
+
+media_pivot AS (
+  SELECT
+    event_date,
+    MAX(IF(channel = 'META',   delivery_status,      NULL)) AS meta_status,
+    MAX(IF(channel = 'META',   spend_modelled,        NULL)) AS meta_spend_raw,
+    MAX(IF(channel = 'META',   impressions_modelled,  NULL)) AS meta_impr_raw,
+    MAX(IF(channel = 'GOOGLE', delivery_status,      NULL)) AS goog_status,
+    MAX(IF(channel = 'GOOGLE', spend_modelled,        NULL)) AS goog_spend_raw,
+    MAX(IF(channel = 'GOOGLE', impressions_modelled,  NULL)) AS goog_impr_raw
+  FROM `biom-reporting-s26.biom_canvas.vw_media_delivery_status`
+  WHERE event_date BETWEEN '2025-07-07' AND '2026-08-02'
+  GROUP BY event_date
+),
+media_safe AS (
+  SELECT
+    event_date,
+    CASE WHEN meta_status IN ('DELIVERED','OBSERVED_ZERO','CONFIRMED_NO_DELIVERY') THEN meta_spend_raw END AS meta_spend_safe,
+    CASE WHEN meta_status IN ('DELIVERED','OBSERVED_ZERO','CONFIRMED_NO_DELIVERY') THEN meta_impr_raw END AS meta_impr_safe,
+    CASE WHEN goog_status IN ('DELIVERED','OBSERVED_ZERO','CONFIRMED_NO_DELIVERY') THEN goog_spend_raw END AS goog_spend_safe,
+    CASE WHEN goog_status IN ('DELIVERED','OBSERVED_ZERO','CONFIRMED_NO_DELIVERY') THEN goog_impr_raw END AS goog_impr_safe
+  FROM media_pivot
+),
+media_weekly AS (
+  SELECT
+    DATE_TRUNC(event_date, WEEK(MONDAY)) AS week_start,
+    CASE WHEN COUNTIF(meta_spend_safe IS NULL) = 0 THEN SUM(meta_spend_safe) END AS meta_spend,
+    CASE WHEN COUNTIF(meta_impr_safe  IS NULL) = 0 THEN SUM(meta_impr_safe)  END AS meta_impressions,
+    CASE WHEN COUNTIF(goog_spend_safe IS NULL) = 0 THEN SUM(goog_spend_safe) END AS goog_spend,
+    CASE WHEN COUNTIF(goog_impr_safe  IS NULL) = 0 THEN SUM(goog_impr_safe)  END AS goog_impressions
+  FROM media_safe
+  GROUP BY 1
+),
+
+rev AS (
+  SELECT
+    DATE_TRUNC(revenue_date, WEEK(MONDAY)) AS week_start,
+    COUNT(DISTINCT order_id) AS orders,
+    SUM(revenue_amount) AS gross_revenue,
+    SAFE_DIVIDE(SUM(allocated_discount), SUM(revenue_amount)) AS disc_depth,
+    SAFE_DIVIDE(SUM(IF(purchase_type = 'Subscription', admin_net_revenue, 0)), SUM(admin_net_revenue)) AS sub_share,
+    SAFE_DIVIDE(SUM(unit_price * quantity), SUM(quantity)) AS price
+  FROM `biom-reporting-s26.biom_canvas.vw_revenue_subscriptions`
+  WHERE record_type = 'revenue' AND channel_key = 'shopify'
+    AND revenue_date BETWEEN '2025-07-07' AND '2026-08-02'
+  GROUP BY 1
+),
+
+first_orders AS (
+  SELECT
+    customer_id,
+    MIN(DATE(order_created_at_utc, 'America/Chicago')) AS first_order_date
+  FROM `biom-reporting-s26.biom_canvas.fct_orders`
+  WHERE is_current = TRUE AND customer_id IS NOT NULL
+  GROUP BY 1
+),
+new_customer_orders_weekly AS (
+  SELECT
+    DATE_TRUNC(DATE(o.order_created_at_utc, 'America/Chicago'), WEEK(MONDAY)) AS week_start,
+    COUNT(DISTINCT o.order_id) AS new_customer_orders
+  FROM `biom-reporting-s26.biom_canvas.fct_orders` o
+  JOIN first_orders fo ON o.customer_id = fo.customer_id
+  WHERE o.is_current = TRUE AND o.customer_id IS NOT NULL
+    AND DATE(o.order_created_at_utc, 'America/Chicago') = fo.first_order_date
+    AND DATE(o.order_created_at_utc, 'America/Chicago') BETWEEN '2025-07-07' AND '2026-08-02'
+  GROUP BY 1
+),
+
+holiday_weekly AS (
+  SELECT
+    DATE_TRUNC(date_key, WEEK(MONDAY)) AS week_start,
+    COUNTIF(event_type IS NOT NULL) AS holiday_day_count,
+    STRING_AGG(DISTINCT event_type, '+' ORDER BY event_type) AS holiday_event_types
+  FROM `biom-reporting-s26.biom_canvas.dim_date`
+  WHERE date_key BETWEEN '2025-07-07' AND '2026-08-02'
+  GROUP BY 1
+)
+
+SELECT
+  ws.week_start,
+  rev.gross_revenue,
+  rev.orders,
+  ncw.new_customer_orders,
+  mw.meta_spend, mw.meta_impressions,
+  mw.goog_spend, mw.goog_impressions,
+  rev.disc_depth, rev.sub_share, rev.price,
+  hw.holiday_day_count, hw.holiday_event_types,
+  IF(ws.week_start BETWEEN '2025-07-07' AND '2025-09-08', 1, 0) AS h10_era
+FROM week_spine ws
+LEFT JOIN media_weekly mw ON mw.week_start = ws.week_start
+LEFT JOIN rev ON rev.week_start = ws.week_start
+LEFT JOIN new_customer_orders_weekly ncw ON ncw.week_start = ws.week_start
+LEFT JOIN holiday_weekly hw ON hw.week_start = ws.week_start
+ORDER BY ws.week_start
+```
+
+### `vw_order_line_sku_resolved` 🆕
+Columns: `order_id`, `line_item_id`, `customer_id`, `order_created_at_utc`, `order_time_sku`, `line_variant_id`, `gross_using_line_price`, `resolution_method`, `resolved_variant_id`, `resolved_sku`, `candidate_variant_ids`
+
+```sql
+WITH
+-- Authoritative non-product SKU set. Union of the three places this platform already
+-- encodes it, so the definition cannot drift away from them:
+--   canvas_delta.py get_source_dim_product()  -> '1111','2222','P-40WIP-LIT-FRA', vendor='re:do' (sku 'x-redo')
+--   001_build_shopify_gross_sales_by_sku_certified.sql -> 'ONWARDINS01','1111','2222'
+--   vw_repurchase_base 'Non-product line item' -> 'ONWARDINS01','fondue-cashback-sku-1665073709'
+non_product_sku AS (
+  SELECT sku FROM UNNEST([
+    'ONWARDINS01',                     -- Onward shipping insurance ("Checkout+")
+    'fondue-cashback-sku-1665073709',  -- Fondue cashback app
+    'x-redo',                          -- Redo return-protection add-on (vendor='re:do')
+    '1111', '2222',                    -- internal test SKUs
+    'P-40WIP-LIT-FRA'                  -- "Wipes - Internal Use" internal artifact
+  ]) AS sku
+),
+
+-- Every (historical sku -> LIVE variant) mapping, with the period that mapping was valid.
+-- Joining to dim_product_variant on is_current here is what collapses most apparent
+-- ambiguity: a sku reused across one live and several dead variants is not ambiguous.
+hist_live AS (
+  SELECT
+    s.sku,
+    SAFE_CAST(s.variant_id AS INT64)               AS variant_id,
+    s.period_start,
+    IFNULL(s.period_end, DATE '2099-12-31')        AS period_end,
+    v.sku                                          AS target_sku
+  FROM `biom-reporting-s26.biom_admin.sku_change_log` s
+  JOIN `biom-reporting-s26.biom_canvas.dim_product_variant` v
+    ON v.variant_id = SAFE_CAST(s.variant_id AS INT64)
+   AND v.is_current
+),
+
+-- Per-sku rollup, date-agnostic. Used as the fallback tier when no period covers the
+-- order date (sku_change_log periods are largely source='order_proxy' and do not
+-- blanket every order date).
+live_by_sku AS (
+  SELECT
+    sku,
+    COUNT(DISTINCT variant_id) AS n_variants,
+    COUNT(DISTINCT target_sku) AS n_targets,
+    MIN(variant_id)            AS pick_variant_id,   -- deterministic; only used when n_targets = 1
+    MIN(target_sku)            AS pick_target_sku,
+    ARRAY_AGG(DISTINCT variant_id ORDER BY variant_id) AS candidate_variant_ids
+  FROM hist_live
+  GROUP BY sku
+),
+
+-- FIX 2 (2026-08-03): earliest recorded period per (sku, live variant). sku_change_log's
+-- order_proxy periods are inferred from observed activity and do not reach back to a SKU's
+-- first-ever order, so historical lines can fall before every recorded period. Rather than
+-- touch sku_change_log (rebuilt daily 10:45 UTC, other consumers depend on it), the earliest
+-- period is extended backwards here.
+--
+-- "Tied for first" uses a 7-day window rather than a strict MIN, because a strict MIN silently
+-- picks the wrong product when two variants start within days of each other during a labelling
+-- collision: K-WIP-AP-LAV-6PK's Fragrance-free variant starts 2024-05-30 and its Lavender
+-- variant 2024-06-01, so strict-MIN would book Lavender revenue as Fragrance-free. Ties stay
+-- AMBIGUOUS instead.
+-- ponytail: 7-day tie window is a calibration constant, not a derived value. Widen it if a
+-- genuine rename is ever observed taking longer than a week to propagate.
+first_live AS (
+  SELECT
+    sku,
+    variant_id,
+    MIN(period_start) AS first_start,
+    MIN(target_sku)   AS target_sku
+  FROM hist_live
+  GROUP BY sku, variant_id
+),
+
+backdate AS (
+  SELECT
+    sku,
+    COUNT(DISTINCT variant_id) AS tied_variants,
+    COUNT(DISTINCT target_sku) AS tied_targets,
+    MIN(variant_id)            AS pick_variant_id,
+    MIN(target_sku)            AS pick_target_sku
+  FROM (
+    SELECT fl.*, MIN(fl.first_start) OVER (PARTITION BY fl.sku) AS sku_min_start
+    FROM first_live fl
+  )
+  WHERE DATE_DIFF(first_start, sku_min_start, DAY) <= 7
+  GROUP BY sku
+),
+
+-- SKUs that map ONLY to dead variants — gives the DEAD_VARIANT tier a real id to emit
+-- instead of a silent NULL.
+dead_by_sku AS (
+  SELECT
+    s.sku,
+    MIN(SAFE_CAST(s.variant_id AS INT64)) AS variant_id
+  FROM `biom-reporting-s26.biom_admin.sku_change_log` s
+  WHERE NOT EXISTS (
+    SELECT 1 FROM `biom-reporting-s26.biom_canvas.dim_product_variant` v
+    WHERE v.variant_id = SAFE_CAST(s.variant_id AS INT64) AND v.is_current
+  )
+  GROUP BY s.sku
+),
+
+-- Per-LINE rollup restricted to mappings whose period covers that line's order date.
+-- GROUP BY the natural key is what guarantees 1:1 — no QUALIFY needed, and no join
+-- downstream can multiply rows.
+dated AS (
+  SELECT
+    o.order_id,
+    o.line_item_id,
+    COUNT(DISTINCT h.variant_id) AS n_variants,
+    COUNT(DISTINCT h.target_sku) AS n_targets,
+    MIN(h.variant_id)            AS pick_variant_id,
+    MIN(h.target_sku)            AS pick_target_sku,
+    ARRAY_AGG(DISTINCT h.variant_id IGNORE NULLS ORDER BY h.variant_id) AS candidate_variant_ids
+  FROM `biom-reporting-s26.biom_canvas.fct_orders` o
+  LEFT JOIN hist_live h
+    ON h.sku = o.sku
+   AND DATE(o.order_created_at_utc) BETWEEN h.period_start AND h.period_end
+  WHERE o.is_current
+  GROUP BY o.order_id, o.line_item_id
+),
+
+-- Does the line's own variant_id point at a live catalog row?
+resolved AS (
+  SELECT
+    o.order_id,
+    o.line_item_id,
+    o.customer_id,
+    o.order_created_at_utc,
+    o.sku                                       AS order_time_sku,
+    o.variant_id                                AS line_variant_id,
+    o.gross_using_line_price,
+    live.sku                                    AS live_sku_of_line_variant,
+    (live.variant_id IS NOT NULL)               AS line_variant_is_live,
+    np.sku IS NOT NULL                          AS is_non_product,
+    d.n_variants   AS win_n_variants,
+    d.n_targets    AS win_n_targets,
+    d.pick_variant_id AS win_variant_id,
+    d.pick_target_sku AS win_target_sku,
+    d.candidate_variant_ids AS win_candidates,
+    lbs.n_variants AS sku_n_variants,
+    lbs.n_targets  AS sku_n_targets,
+    lbs.pick_variant_id AS sku_variant_id,
+    lbs.pick_target_sku AS sku_target_sku,
+    lbs.candidate_variant_ids AS sku_candidates,
+    bd.tied_variants   AS bd_variants,
+    bd.tied_targets    AS bd_targets,
+    bd.pick_variant_id AS bd_variant_id,
+    bd.pick_target_sku AS bd_target_sku,
+    dbs.variant_id AS dead_variant_id
+  FROM `biom-reporting-s26.biom_canvas.fct_orders` o
+  LEFT JOIN `biom-reporting-s26.biom_canvas.dim_product_variant` live
+    ON live.variant_id = o.variant_id AND live.is_current
+  LEFT JOIN non_product_sku np ON np.sku = o.sku
+  LEFT JOIN dated       d   ON d.order_id = o.order_id AND d.line_item_id = o.line_item_id
+  LEFT JOIN live_by_sku lbs ON lbs.sku = o.sku
+  LEFT JOIN dead_by_sku dbs ON dbs.sku = o.sku
+  LEFT JOIN backdate    bd  ON bd.sku  = o.sku
+  WHERE o.is_current
+)
+
+SELECT
+  order_id,
+  line_item_id,
+  customer_id,
+  order_created_at_utc,
+  order_time_sku,
+  line_variant_id,
+  gross_using_line_price,
+
+  CASE
+    WHEN is_non_product                          THEN 'NON_PRODUCT'
+    WHEN line_variant_is_live                    THEN 'DIRECT_VARIANT_ID'
+    WHEN line_variant_id IS NOT NULL             THEN 'DEAD_VARIANT'
+    WHEN win_n_variants >= 1 AND win_n_targets = 1 THEN 'SKU_HISTORY_DATED'
+    WHEN win_n_variants  = 1 AND win_n_targets = 0 THEN 'SKU_HISTORY_DATED_NULLSKU'
+    WHEN win_n_variants >= 1 AND win_n_targets > 1 THEN 'AMBIGUOUS'
+    WHEN sku_n_variants >= 1 AND sku_n_targets = 1 THEN 'SKU_HISTORY_FALLBACK'
+    WHEN bd_variants = 1 OR bd_targets = 1         THEN 'SKU_HISTORY_BACKDATED'
+    WHEN sku_n_variants >= 1 AND sku_n_targets > 1 THEN 'AMBIGUOUS'
+    WHEN dead_variant_id IS NOT NULL             THEN 'DEAD_VARIANT'
+    ELSE 'NO_PATH'
+  END AS resolution_method,
+
+  CASE
+    WHEN is_non_product                          THEN NULL
+    WHEN line_variant_is_live                    THEN line_variant_id
+    WHEN line_variant_id IS NOT NULL             THEN line_variant_id
+    WHEN win_n_variants >= 1 AND win_n_targets = 1 THEN win_variant_id
+    WHEN win_n_variants  = 1 AND win_n_targets = 0 THEN win_variant_id
+    WHEN win_n_variants >= 1 AND win_n_targets > 1 THEN NULL   -- never guess
+    WHEN sku_n_variants >= 1 AND sku_n_targets = 1 THEN sku_variant_id
+    WHEN bd_variants = 1 OR bd_targets = 1         THEN bd_variant_id
+    WHEN sku_n_variants >= 1 AND sku_n_targets > 1 THEN NULL   -- never guess
+    WHEN dead_variant_id IS NOT NULL             THEN dead_variant_id
+    ELSE NULL
+  END AS resolved_variant_id,
+
+  CASE
+    WHEN is_non_product                          THEN NULL
+    WHEN line_variant_is_live                    THEN live_sku_of_line_variant
+    WHEN line_variant_id IS NOT NULL             THEN NULL
+    WHEN win_n_variants >= 1 AND win_n_targets = 1 THEN win_target_sku
+    WHEN win_n_variants  = 1 AND win_n_targets = 0 THEN NULL   -- variant is live but unnamed
+    WHEN win_n_variants >= 1 AND win_n_targets > 1 THEN NULL
+    WHEN sku_n_variants >= 1 AND sku_n_targets = 1 THEN sku_target_sku
+    WHEN bd_variants = 1 OR bd_targets = 1         THEN bd_target_sku
+    ELSE NULL
+  END AS resolved_sku,
+
+  CASE
+    WHEN is_non_product THEN NULL
+    WHEN win_n_variants >= 1 AND win_n_targets > 1 THEN win_candidates
+    WHEN win_n_variants = 0 AND sku_n_variants >= 1 AND sku_n_targets > 1 THEN sku_candidates
+    ELSE NULL
+  END AS candidate_variant_ids
+
+FROM resolved
+```
 
 ### `vw_repurchase_base`
 Columns: `customer_id`, `first_order_date`, `first_order_month`, `acquisition_channel`, `first_purchase_category`, `first_purchase_sub_category`, `subscription_segment`, `lifetime_orders`, `one_time_orders`, `second_order_date`, `days_first_to_second_order`, `is_repurchaser_2plus`, `is_repurchaser_within_60d`, `is_repurchaser_one_time_2plus`, `lifetime_revenue`, `lifetime_aov`
@@ -1188,7 +1776,7 @@ FROM first_orders fo
 JOIN customer_order_counts coc ON coc.customer_id = fo.customer_id
 JOIN customer_revenue cr ON cr.customer_id = fo.customer_id
 LEFT JOIN second_orders so ON so.customer_id = fo.customer_id
-LEFT JOIN first_order_category foc ON foc.customer_id = fo.customer_id;
+LEFT JOIN first_order_category foc ON foc.customer_id = fo.customer_id
 ```
 
 ### `vw_revenue_subscriptions`
@@ -1637,10 +2225,10 @@ LEFT JOIN plans pl
 LEFT JOIN products p
  ON CAST(s.sub_variant_id AS STRING) = p.shopify_variant_id
 LEFT JOIN customers c
- ON s.customer_id = c.customer_id;;
+ ON s.customer_id = c.customer_id
 ```
 
-### `vw_shopify_category_geo_detail` 🆕 *structure only*
+### `vw_shopify_category_geo_detail`
 Columns: `order_id`, `line_item_id`, `order_name`, `customer_id`, `order_created_at_utc`, `order_created_datetime_ct`, `order_updated_at_utc`, `financial_status`, `fulfillment_status`, `currency_code`, `order_source`, `landing_site`, `referring_site`, `purchase_type`, `product_id`, `variant_id`, `order_line_sku`, `current_sku`, `order_line_product_title`, `order_line_variant_title`, `product_category`, `product_sub_category`, `dim_product_sku`, `dim_product_title`, `product_type`, `vendor`, `is_bundle`, `is_discontinued`, `quantity`, `unit_price`, `total_discount`, `gross_using_line_price`, `net_line_sales`, `customer_state`, `ship_city`, `ship_province`, `ship_zip`, `ship_country_code`, `shipment_status`, `delivery_lifecycle_status`, `delivered_at_utc`, `carrier`, `tracking_number`, `shipment_count`
 
 ```sql
@@ -1675,10 +2263,10 @@ LEFT JOIN `biom-reporting-s26.biom_canvas.dim_customer` c
   ON o.customer_id = c.customer_id AND c.is_current = TRUE
 LEFT JOIN delivery_latest d
   ON CAST(o.order_id AS STRING) = d.shopify_order_id AND d.rn = 1
-WHERE o.is_current = TRUE;
+WHERE o.is_current = TRUE
 ```
 
-### `vw_shopify_sku_order_financial_detail` 🆕 *structure only*
+### `vw_shopify_sku_order_financial_detail`
 Columns: `order_id`, `order_name`, `order_created_at_utc`, `tags`, `shopify_sku`, `product_category`, `product_sub_category`, `order_line_quantity`, `unit_price`, `line_discount`, `gross_amount`, `net_amount`, `order_total_amount`, `order_total_discount`, `shipment_status`, `delivery_lifecycle_status`, `delivered_at_utc`, `carrier`, `tracking_number`, `tracking_note`
 
 ```sql
@@ -1714,10 +2302,10 @@ LEFT JOIN (
   FROM `biom-reporting-s26.biom_canvas.fct_delivery`
   WHERE is_current = TRUE
 ) d ON CAST(o.order_id AS STRING) = d.shopify_order_id AND d.rn = 1
-WHERE o.is_current = TRUE;
+WHERE o.is_current = TRUE
 ```
 
-### `vw_target_week_store` 🆕 *structure only*
+### `vw_target_week_store`
 Columns: `location_id`, `week_start_date`, `location_name`, `location_type`, `store_format`, `store_status`, `city`, `state`, `region`, `district`, `latitude`, `longitude`, `zip_code`, `weekly_pos_amount`, `weekly_pos_units`, `tcins_selling`, `drive_up_amount`, `shipt_app_amount`, `shipt_target_amount`, `alt_fulfillment_pct`, `trailing_4wk_pos_amount`, `trailing_4wk_pos_units`, `wow_pct`
 
 ```sql
@@ -1876,10 +2464,10 @@ LEFT JOIN trailing_4wk t4
   AND ss.week_start_date = t4.week_start_date
 LEFT JOIN wow w
   ON ss.location_id = w.location_id
-  AND ss.week_start_date = w.week_start_date;
+  AND ss.week_start_date = w.week_start_date
 ```
 
-### `vw_target_week_tcin` 🆕 *structure only*
+### `vw_target_week_tcin`
 Columns: `tcin`, `week_start_date`, `week_end_date`, `sku`, `product_title`, `manufacturer_style`, `target_item_description`, `product_category`, `product_sub_category`, `is_in_shopify`, `weekly_pos_amount`, `weekly_pos_units`, `stores_selling`, `velocity_units_per_store`, `velocity_units_per_store_4wk`, `avg_weekly_units_4wk`, `drive_up_amount`, `drive_up_units`, `shipt_app_amount`, `shipt_target_amount`, `circular_amount`, `promo_amount`, `regular_amount`, `alt_fulfillment_pct`, `chain_on_hand_q`, `chain_on_purchase_q`, `chain_on_transfer_q`, `stores_with_inventory`, `stores_with_any_record`, `wip_pct`, `wip_pct_store_weighted`, `wip_pct_active`, `weeks_of_supply`, `is_return_week`, `is_return_dominated_4wk`
 
 ```sql
@@ -2056,10 +2644,10 @@ LEFT JOIN (
   WHERE rn = 1
 ) p
   ON CAST(COALESCE(sw.tcin, iw.tcin) AS STRING) = p.tcin
-;
+
 ```
 
-### `vw_variant_sku_journey` 🆕 *structure only*
+### `vw_variant_sku_journey`
 Columns: `variant_id`, `sku`, `period_start`, `period_end`, `order_lines_in_period`, `sku_period_sequence`, `source`, `exact_date`, `possible_id_reuse`
 
 ```sql
@@ -2078,8 +2666,9 @@ WITH ordered AS (
     )                                       AS grp
   FROM `biom-reporting-s26.biom_raw.shopify_order_line_items`
   WHERE variant_id IS NOT NULL
-    AND DATE(created_at) < "2026-06-11"
+    AND DATE(created_at) < '2026-06-11'
 ),
+
 order_proxy AS (
   SELECT
     variant_id,
@@ -2094,6 +2683,7 @@ order_proxy AS (
   FROM ordered
   GROUP BY variant_id, sku, grp
 ),
+
 scd2_history AS (
   SELECT
     CAST(variant_id AS STRING)              AS variant_id,
@@ -2110,6 +2700,7 @@ scd2_history AS (
     )                                       AS sku_period_sequence
   FROM `biom-reporting-s26.biom_canvas.dim_product_variant`
 )
+
 SELECT
   variant_id,
   sku,
@@ -2117,14 +2708,18 @@ SELECT
   period_end,
   order_lines_in_period,
   sku_period_sequence,
-  "order_proxy"                             AS source,
+  'order_proxy'                             AS source,
   FALSE                                     AS exact_date,
-  CASE
-    WHEN variant_id = "56402017714342"
-    THEN TRUE ELSE FALSE
-  END                                       AS possible_id_reuse
+  -- possible_id_reuse: ALWAYS FALSE as of 2026-08-06 (KNOWN_GAPS item 14 CLOSED). Was a hardcoded
+  -- single-variant_id marker, not a computed heuristic. 56402017714342 and 56402017681574 are both
+  -- confirmed NOT ID reuse (one mid-May-2026 bulk re-SKU event; neither product_id ever changed).
+  -- Real reuse test = COUNT(DISTINCT product_id) > 1 per variant_id, NOT SKU concurrency.
+  -- See scripts/build_sku_change_log.py for the full rationale.
+  FALSE                                     AS possible_id_reuse
 FROM order_proxy
+
 UNION ALL
+
 SELECT
   variant_id,
   sku,
@@ -2132,9 +2727,10 @@ SELECT
   period_end,
   order_lines_in_period,
   sku_period_sequence,
-  "scd2"                                    AS source,
+  'scd2'                                    AS source,
   TRUE                                      AS exact_date,
   FALSE                                     AS possible_id_reuse
 FROM scd2_history
-ORDER BY variant_id, period_start, sku_period_sequence;
+
+ORDER BY variant_id, period_start, sku_period_sequence
 ```
