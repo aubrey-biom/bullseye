@@ -89,6 +89,23 @@ def test_fiscal_label_names_the_week_by_its_start(week_end: date, label: str) ->
     assert pos_brief._fiscal_label(week_end) == label
 
 
+@pytest.mark.parametrize(
+    ("sales_through", "week_end"),
+    [
+        (date(2026, 8, 15), date(2026, 8, 15)),  # Sat, caught up — report THAT week
+        (date(2026, 8, 16), date(2026, 8, 15)),  # Sun, one day into the new week
+        (date(2026, 8, 17), date(2026, 8, 15)),  # Mon, the routine's own slot
+        (date(2026, 8, 20), date(2026, 8, 15)),  # Thu, mid-week
+        (date(2026, 8, 21), date(2026, 8, 15)),  # Fri, still mid-week
+    ],
+)
+def test_latest_week_end_does_not_skip_a_closed_week(sales_through: date, week_end: date) -> None:
+    """When the feed catches up through a Saturday, that week has closed. Backing
+    off a further week made the Monday brief a week stale — and would have
+    reposted the prior week's brief verbatim."""
+    assert pos_brief._latest_week_end(sales_through) == week_end
+
+
 # ---------- percentage formatting ----------
 
 
@@ -200,6 +217,7 @@ def _render_input(cur_amt: float, record_high: float) -> dict:
     skus = pos_brief._annotate([_sku("003-02-5627", amt=43_550.0, units=4_004.0, doors=1726)], CFG)
     for s in skus:
         s.prev_amt, s.eoh_ow, s.wip, s.oos = 41_700.0, 52_184.0, 99.9, 0.06
+        s.prev_oos, s.prev_eoh_ow = 0.05, 53_000.0
     inv = {
         w: SimpleNamespace(eoh_ow=493_924.0 + i * 5_000, wip=99.5, oos=0.49)
         for i, w in enumerate(weeks)
@@ -253,18 +271,42 @@ def test_ungoaled_sku_still_reaches_the_in_stock_flags() -> None:
     d = _render_input(391_030.0, record_high=391_030.0)
     ungoaled = pos_brief._annotate([_sku("003-02-7872", amt=5_143.0, units=2_174.0)], CFG)[0]
     ungoaled.prev_amt, ungoaled.eoh_ow = 5_050.0, 6_678.0
-    ungoaled.wip, ungoaled.oos = 93.6, 6.42
+    ungoaled.wip, ungoaled.oos = 96.0, 4.0  # under the goal → trailing roll-up
+    ungoaled.prev_oos, ungoaled.prev_eoh_ow = 2.6, 8_567.0
 
     delisted = pos_brief._annotate([_sku("999-99-9999", amt=28.0, units=2.0, doors=3)], CFG)[0]
     delisted.prev_amt, delisted.eoh_ow = 20.0, 44.0
     delisted.wip, delisted.oos = 20.0, 80.0
+    delisted.prev_oos, delisted.prev_eoh_ow = 75.0, 49.0
 
     d["skus"] = [*d["skus"], ungoaled, delisted]
     flag_line = next(
         ln for ln in pos_brief.render_weekly(d)["main"].splitlines() if "Highest OOS" in ln
     )
-    assert "Dispenser - Black 6.4%" in flag_line
+    assert "Dispenser - Black 4.0%" in flag_line
     assert "80.0%" not in flag_line
+
+
+def test_sku_past_the_in_stock_goal_gets_its_own_callout_with_the_trend() -> None:
+    """A developing stockout reads as routine when it is the third name in a
+    trailing roll-up. HS Go-Pack went 0% → 2.6% → 6.4% → 18.9% over four weeks
+    while cover halved; that belongs at the top of "What to watch", with last
+    week's rate next to it so a blip is distinguishable from a trend."""
+    d = _render_input(391_030.0, record_high=391_030.0)
+    breaching = pos_brief._annotate([_sku("003-02-7872", amt=5_026.0, units=1_864.0)], CFG)[0]
+    breaching.prev_amt, breaching.eoh_ow = 5_143.0, 4_694.0
+    breaching.wip, breaching.oos = 81.1, 18.93
+    breaching.prev_oos, breaching.prev_eoh_ow = 6.42, 6_678.0
+    d["skus"] = [*d["skus"], breaching]
+
+    watch = pos_brief.render_weekly(d)["main"].split("**What to watch**")[1]
+    callout = next(ln for ln in watch.splitlines() if "past the" in ln)
+    assert "Dispenser - Black" in callout
+    assert "OOS 18.9%" in callout and "up from 6.4% last week" in callout
+    assert "6,678 → 4,694 units" in callout
+    # It leads the section, and is not also repeated in the roll-up below.
+    assert watch.strip().splitlines()[0] == callout.strip()
+    assert "Highest OOS" not in watch or "Dispenser - Black" not in watch.split("Highest OOS")[1]
 
 
 def test_render_reports_the_short_week_it_dropped() -> None:

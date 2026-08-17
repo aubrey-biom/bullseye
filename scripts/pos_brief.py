@@ -50,6 +50,11 @@ GOALS_PATH = Path(__file__).resolve().parents[1] / "config" / "pspw_goals.json"
 # suppressed tail.
 NEW_SKU_MIN = 500.0
 
+# Target's published in-stock goals. Also the line between a SKU that earns its
+# own callout and one that belongs in the trailing roll-up.
+OOS_GOAL = 5.0
+WIP_GOAL = 94.0
+
 # Category rollup used in leadership reporting: dispensers sit with the
 # cleaning franchise, Baby is broken out of Personal Care. Verified to
 # reproduce the 8/3 published mix exactly.
@@ -149,6 +154,20 @@ def _fiscal_label(week_end: date) -> str:
     first_sunday = first + timedelta(days=(6 - first.weekday()) % 7)
     week_no = (start - first_sunday).days // 7 + 1
     return f"{start.strftime('%b')} W{week_no} '{start.strftime('%y')}"
+
+
+def _latest_week_end(sales_through: date) -> date:
+    """Newest week-ending Saturday the feed could cover.
+
+    NOT "the Saturday before the current week": when the feed has caught up
+    through a Saturday, that Saturday's week has closed and is the one to
+    report. Backing off a further week would have the Monday brief headline
+    numbers a week stale — and repost the previous week's brief verbatim.
+
+    The caller still pins the reporting week to the newest week that actually
+    closed COMPLETE, so a Saturday whose week is missing days falls back.
+    """
+    return sales_through - timedelta(days=(sales_through.weekday() - 5) % 7)
 
 
 # ---------- queries ----------
@@ -282,13 +301,23 @@ def sku_detail(client, week_end: date) -> list[Any]:
           FROM {INV}
           WHERE is_current AND inventory_date = '{week_end}'
           GROUP BY dpci
+        ),
+        inv_prev AS (
+          SELECT dpci,
+                 SUM(ending_on_hand_q + ending_on_transfer_q) AS eoh_ow,
+                 SAFE_DIVIDE(SUM(out_of_stock_q), SUM(instock_q) + SUM(out_of_stock_q)) * 100 AS oos
+          FROM {INV}
+          WHERE is_current AND inventory_date = '{pw_end}'
+          GROUP BY dpci
         )
         SELECT cur.dpci, cur.descr, cur.amt, cur.units, prev.amt AS prev_amt,
                inv.doors, inv.eoh_ow, inv.wip, inv.oos,
+               inv_prev.oos AS prev_oos, inv_prev.eoh_ow AS prev_eoh_ow,
                {CATEGORY_SQL} AS category
         FROM cur
         LEFT JOIN prev USING (dpci)
         LEFT JOIN inv USING (dpci)
+        LEFT JOIN inv_prev USING (dpci)
         LEFT JOIN prod p ON p.tcin = cur.tcin
         ORDER BY cur.amt DESC
         """,
@@ -417,11 +446,11 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         + [f"{r.online_amt / r.amt * 100:,.1f}%" if r.amt else "n/a" for r in recent]
     )
     rows.append(
-        ["OOS %  (goal 5.0%)"]
+        [f"OOS %  (goal {OOS_GOAL:.1f}%)"]
         + [f"{inv[r.week_end].oos:,.2f}" if r.week_end in inv else "—" for r in recent]
     )
     rows.append(
-        ["WIP %  (goal 94%)"]
+        [f"WIP %  (goal {WIP_GOAL:.0f}%)"]
         + [f"{inv[r.week_end].wip:,.1f}" if r.week_end in inv else "—" for r in recent]
     )
     rows.append(
@@ -456,10 +485,10 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     # at 6.4% on $5.1K of sales. Lacking a goal is a reason to leave a SKU out of
     # the goal math, not out of the in-stock flags. The sales floor keeps the
     # de-listed tail (Terracotta: 80% OOS on 2 units) from crowding the list.
-    worst_oos = sorted(
-        [s for s in skus if s.oos is not None and s.known and (s.amt or 0) >= NEW_SKU_MIN],
-        key=lambda s: -s.oos,
-    )[:3]
+    flagged = [s for s in skus if s.oos is not None and s.known and (s.amt or 0) >= NEW_SKU_MIN]
+    breaching = sorted([s for s in flagged if s.oos > OOS_GOAL], key=lambda s: -s.oos)
+    # Whatever is called out individually above is not repeated in the roll-up.
+    worst_oos = sorted([s for s in flagged if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:3]
 
     wos = inv[wk].eoh_ow / cur.units if wk in inv and cur.units else None
     wos_4ago = (
@@ -478,8 +507,8 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             )
     if wk in inv:
         working.append(
-            f"• **In-stock execution:** OOS {inv[wk].oos:.2f}% vs 5.0% goal, "
-            f"WIP {inv[wk].wip:.1f}% vs 94% goal."
+            f"• **In-stock execution:** OOS {inv[wk].oos:.2f}% vs {OOS_GOAL:.1f}% goal, "
+            f"WIP {inv[wk].wip:.1f}% vs {WIP_GOAL:.0f}% goal."
         )
     if wos and wos_4ago and wos < wos_4ago:
         working.append(
@@ -498,6 +527,23 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         )
 
     watch = ["⚠️ **What to watch**"]
+    # A SKU past the in-stock goal leads the section — it is the one thing here
+    # someone can act on this week, and burying it in the trailing "Highest OOS"
+    # roll-up reads as routine. Printing last week's rate and the cover trend
+    # alongside separates a developing stockout from a one-week blip.
+    for s in breaching:
+        bits = [f"OOS {s.oos:.1f}%"]
+        if s.prev_oos is not None:
+            bits.append(f"up from {s.prev_oos:.1f}% last week")
+        if s.prev_eoh_ow and s.eoh_ow:
+            bits.append(f"EOH+OW {int(s.prev_eoh_ow):,} → {int(s.eoh_ow):,} units")
+        if s.eoh_ow and s.units:
+            bits.append(f"{s.eoh_ow / s.units:.1f} wks cover")
+        watch.append(
+            f"• 🔴 **{s.name} is past the {OOS_GOAL:.1f}% in-stock goal** — "
+            + ", ".join(bits)
+            + f" on ${s.amt:,.0f} of sales."
+        )
     promo_now = cur.promo_amt / cur.amt * 100 if cur.amt else 0
     promo_then = (
         series[3].promo_amt / series[3].amt * 100 if len(series) > 3 and series[3].amt else None
@@ -720,14 +766,16 @@ def build(mode: str, week_ending: str | None = None, through: str | None = None)
     goals = _goals()
 
     if mode == "weekly":
-        if week_ending:
-            wk = date.fromisoformat(week_ending)
-        else:
-            # most recent COMPLETE week (Sun-Sat) fully covered by the data
-            wk = sales_through - timedelta(days=(sales_through.weekday() + 1) % 7 + 1)
+        wk = date.fromisoformat(week_ending) if week_ending else _latest_week_end(sales_through)
         raw = [r for r in weekly_series(client, wk) if r.week_end <= wk]
         series = [r for r in raw if _complete(r, bounds.first_daily)]
         dropped = [r for r in raw if not _complete(r, bounds.first_daily)]
+        if not week_ending and series:
+            # Report the newest week that actually closed complete. If the most
+            # recent Saturday's week is still missing days, fall back rather than
+            # headline a short week as if it were finished.
+            wk = series[0].week_end
+            dropped = [r for r in dropped if r.week_end < wk]
         inv = weekly_inventory(client, [r.week_end for r in series[:4]])
         skus = _annotate(sku_detail(client, wk), goals)
         mix = category_mix(client, wk)
