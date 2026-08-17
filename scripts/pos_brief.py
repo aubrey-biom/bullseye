@@ -11,8 +11,12 @@ Two modes, matching the cadence leadership reads:
                     worth acting on before the week closes.
 
 Data source is `biom_canvas` in BigQuery via the read-only
-`claude-code-bq-readonly` service account — Target only; that credential has no
-access to Shopify or customer tables by design.
+`claude-code-bq-readonly` service account. That credential reads the whole
+warehouse, but the direct customer identifiers — dim_customer.{email,
+first_name, last_name, phone} and bdg_customer_identity.normalized_email — are
+behind a `biom-pii/direct-identifier` policy tag it deliberately cannot read.
+Customer analysis works off the pseudonymous `customer_id`; nothing here needs a
+name or an email. Note this makes `SELECT *` fail on those two tables.
 
 $PSPW goals are NOT in BigQuery (KMG publishes them); they live in
 config/pspw_goals.json and the brief prints that file's vintage.
