@@ -316,3 +316,66 @@ def test_render_reports_the_short_week_it_dropped() -> None:
     assert "w/e 2026-05-09 (4/7 days)" in out["main"]
     assert "quantity-weighted" in out["main"]
     assert len(out["replies"]) == 2
+
+
+# ---------- pulse mode ----------
+
+
+def _pulse_input(skus: list) -> dict:
+    """Minimum input render_pulse accepts: a 3-day mid-week span."""
+    return {
+        "wtd": {
+            "days": 3,
+            "week_start": date(2026, 8, 16),
+            "cur": SimpleNamespace(amt=171_601.0, units=18_271.0),
+            "prev": SimpleNamespace(amt=160_716.0, units=17_417.0),
+            "avg4_span": 157_499.0,
+            "peer_weeks": 4,
+        },
+        "skus": skus,
+        "sales_through": date(2026, 8, 18),
+        "inv_through": date(2026, 8, 18),
+    }
+
+
+def _pulse_sku(dpci, amt, oos, prev_oos, eoh, prev_eoh, wip=None):
+    s = pos_brief._annotate([_sku(dpci, amt=amt, units=amt / 2.7)], CFG)[0]
+    s.prev_amt, s.oos, s.prev_oos = amt * 0.95, oos, prev_oos
+    s.eoh_ow, s.prev_eoh_ow, s.wip = eoh, prev_eoh, (100 - oos) if wip is None else wip
+    return s
+
+
+def test_pulse_leads_with_a_breach_and_separates_the_watch_list() -> None:
+    """Mid-week is the only time a developing stockout can still be acted on, so
+    a SKU past the goal must not render in the same flat format as one at 3%.
+    HS Go-Pack went 9.9% -> 29.3% between two Tuesdays while cover fell 5,738 ->
+    3,788; as the first line of a four-item list that reads as routine."""
+    breach = _pulse_sku("003-02-7872", 5_026.0, 29.3, 9.9, 3_788.0, 5_738.0, wip=70.7)
+    minor = _pulse_sku("003-02-5627", 7_016.0, 3.7, 3.1, 8_499.0, 8_800.0)
+    main = pos_brief.render_pulse(_pulse_input([breach, minor]))["main"]
+
+    callout = next(ln for ln in main.splitlines() if "past the" in ln)
+    assert "Dispenser - Black" in callout
+    assert "OOS 29.3%" in callout and "9.9% a week ago" in callout
+    assert "5,738 → 3,788 units" in callout
+    # The breach leads; the sub-goal SKU is demoted to the watch list, not mixed in.
+    assert main.index(callout) < main.index("Also watching")
+    watch = main.split("Also watching")[1]
+    assert "Disinf Refill 180ct Var" in watch
+    assert "Dispenser - Black" not in watch, "a breach must not be repeated below"
+
+
+def test_pulse_omits_the_breach_section_when_everything_is_in_stock() -> None:
+    ok = _pulse_sku("003-02-5627", 7_016.0, 1.2, 1.0, 8_499.0, 8_600.0)
+    main = pos_brief.render_pulse(_pulse_input([ok]))["main"]
+    assert "past the" not in main
+    assert "Also watching" not in main, "1.2% is under the 2% floor"
+
+
+def test_pulse_states_the_peer_window_it_actually_used() -> None:
+    """A silently-zero peer count would drop the pace line entirely; when it is
+    non-zero the reader is told how many weeks it averaged."""
+    d = _pulse_input([_pulse_sku("003-02-5627", 7_016.0, 1.0, 1.0, 8_499.0, 8_600.0)])
+    assert "prior 4 weeks" in pos_brief.render_pulse(d)["main"]
+    d["wtd"]["avg4_span"] = None
+    assert "prior" not in pos_brief.render_pulse(d)["main"]

@@ -736,9 +736,28 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
         and s.known
         and (s.amt or 0) >= NEW_SKU_MIN / 2  # partial week — lower bar
     ]
-    if flags:
-        lines += ["", "⚠️ **In-stock flags** (OOS > 2%):"]
-        for s in sorted(flags, key=lambda s: -s.oos)[:4]:
+    # A SKU already past the in-stock goal leads, with its trend, exactly as in
+    # the weekly brief. Mid-week is when a developing stockout can still be acted
+    # on, so rendering a 29% breach in the same flat format as a 3% one — which
+    # is what this did — wastes the one report positioned to catch it.
+    breaching = sorted([s for s in flags if s.oos > OOS_GOAL], key=lambda s: -s.oos)
+    for s in breaching:
+        bits = [f"OOS {s.oos:.1f}%"]
+        if s.prev_oos is not None:
+            bits.append(f"{s.prev_oos:.1f}% a week ago")
+        if s.prev_eoh_ow and s.eoh_ow:
+            bits.append(f"EOH+OW {int(s.prev_eoh_ow):,} → {int(s.eoh_ow):,} units")
+        lines += [
+            "",
+            f"🔴 **{s.name} is past the {OOS_GOAL:.1f}% in-stock goal** — "
+            + ", ".join(bits)
+            + ". Acting this week still changes the outcome.",
+        ]
+
+    rest = sorted([s for s in flags if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:4]
+    if rest:
+        lines += ["", f"⚠️ **Also watching** (OOS over 2%, under the {OOS_GOAL:.1f}% goal):"]
+        for s in rest:
             lines.append(f"  {s.name} — OOS {s.oos:.1f}%, WIP {s.wip:.1f}%")
 
     lines += [
@@ -831,14 +850,25 @@ def build(mode: str, week_ending: str | None = None, through: str | None = None)
         inv AS (
           SELECT dpci,
                  COUNT(DISTINCT location_id) AS doors,
+                 SUM(ending_on_hand_q + ending_on_transfer_q) AS eoh_ow,
                  SAFE_DIVIDE(SUM(instock_q), SUM(instock_q) + SUM(out_of_stock_q)) * 100 AS wip,
                  SAFE_DIVIDE(SUM(out_of_stock_q), SUM(instock_q) + SUM(out_of_stock_q)) * 100 AS oos
           FROM {INV} WHERE is_current AND inventory_date = '{inv_through}'
           GROUP BY dpci
+        ),
+        inv_prev AS (
+          SELECT dpci,
+                 SUM(ending_on_hand_q + ending_on_transfer_q) AS eoh_ow,
+                 SAFE_DIVIDE(SUM(out_of_stock_q), SUM(instock_q) + SUM(out_of_stock_q)) * 100 AS oos
+          FROM {INV} WHERE is_current
+            AND inventory_date = DATE_SUB(DATE '{inv_through}', INTERVAL 7 DAY)
+          GROUP BY dpci
         )
         SELECT cur.dpci, cur.descr, cur.amt, cur.units, prev.amt AS prev_amt,
-               inv.doors, inv.wip, inv.oos
+               inv.doors, inv.wip, inv.oos, inv.eoh_ow,
+               inv_prev.oos AS prev_oos, inv_prev.eoh_ow AS prev_eoh_ow
         FROM cur LEFT JOIN prev USING (dpci) LEFT JOIN inv USING (dpci)
+             LEFT JOIN inv_prev USING (dpci)
         ORDER BY cur.amt DESC
         """,
     )
