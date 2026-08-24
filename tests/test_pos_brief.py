@@ -12,7 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -379,3 +379,67 @@ def test_pulse_states_the_peer_window_it_actually_used() -> None:
     assert "prior 4 weeks" in pos_brief.render_pulse(d)["main"]
     d["wtd"]["avg4_span"] = None
     assert "prior" not in pos_brief.render_pulse(d)["main"]
+
+
+def _series_from(amounts: list[float]) -> list:
+    """Weeks newest-first from the given amounts, ending Sat 2026-08-22."""
+    weeks = [date(2026, 8, 22) - timedelta(days=7 * i) for i in range(len(amounts))]
+    return [
+        SimpleNamespace(
+            week_end=w,
+            days=7,
+            amt=a,
+            units=a / 9.4,
+            promo_amt=a * 0.5,
+            online_amt=a * 0.35,
+            doors=1814,
+        )
+        for w, a in zip(weeks, amounts, strict=True)
+    ]
+
+
+def test_a_broken_win_streak_is_reported_not_dropped() -> None:
+    """The week after "6 straight weekly gains", a bare -1.4% drops the thread —
+    a run ending is the most notable thing about the first down week."""
+    d = _render_input(394_268.0, record_high=399_915.0)
+    d["series"] = _series_from(
+        [394_268, 399_915, 391_030, 370_753, 346_047, 341_969, 310_247, 275_062]
+    )
+    d["inventory"] = {
+        r.week_end: SimpleNamespace(eoh_ow=450_000.0, wip=98.9, oos=1.1) for r in d["series"]
+    }
+    d["pspw_by_week"] = dict.fromkeys([r.week_end for r in d["series"]], 273.78)
+    d["upspw_by_week"] = dict.fromkeys([r.week_end for r in d["series"]], 30.8)
+    lead = pos_brief.render_weekly(d)["main"].splitlines()[2]
+    assert "ends a 6-week run of gains" in lead
+    assert "straight weekly gains" not in lead
+
+
+def test_an_ongoing_streak_still_reads_as_a_streak() -> None:
+    d = _render_input(399_915.0, record_high=399_915.0)
+    d["series"] = _series_from([399_915, 391_030, 370_753, 346_047, 341_969, 310_247])
+    d["inventory"] = {
+        r.week_end: SimpleNamespace(eoh_ow=450_000.0, wip=99.1, oos=0.9) for r in d["series"]
+    }
+    d["pspw_by_week"] = dict.fromkeys([r.week_end for r in d["series"]], 276.97)
+    d["upspw_by_week"] = dict.fromkeys([r.week_end for r in d["series"]], 31.4)
+    lead = pos_brief.render_weekly(d)["main"].splitlines()[2]
+    assert "5 straight weekly gains" in lead
+    assert "ends a" not in lead
+
+
+def test_inventory_line_states_the_sales_change_rather_than_asserting_a_direction() -> None:
+    """ "with sales rising" next to a -1.4% WoW headline reads as a contradiction
+    even when both are true on their own windows. Print the window's number."""
+    d = _render_input(394_268.0, record_high=399_915.0)
+    d["series"] = _series_from([394_268, 399_915, 391_030, 370_753])
+    d["inventory"] = {
+        r.week_end: SimpleNamespace(eoh_ow=446_518.0 + i * 20_000, wip=98.9, oos=1.1)
+        for i, r in enumerate(d["series"])
+    }
+    d["pspw_by_week"] = dict.fromkeys([r.week_end for r in d["series"]], 273.78)
+    d["upspw_by_week"] = dict.fromkeys([r.week_end for r in d["series"]], 30.8)
+    main = pos_brief.render_weekly(d)["main"]
+    line = next(ln for ln in main.splitlines() if "Inventory is unwinding" in ln)
+    assert "with sales rising" not in line
+    assert "across the same window" in line and "+6.3%" in line

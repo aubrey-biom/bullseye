@@ -415,12 +415,19 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     # differ in the 10th decimal even when they are the same week. Compare to
     # the cent, or a genuine record silently fails to announce itself.
     is_record = cur.amt >= d["record_high"] - 0.01
-    streak = 0
-    for i in range(len(series) - 1):
-        if series[i].amt > series[i + 1].amt:
-            streak += 1
-        else:
-            break
+
+    def _gains_from(i: int) -> int:
+        n = 0
+        while i + 1 < len(series) and series[i].amt > series[i + 1].amt:
+            n += 1
+            i += 1
+        return n
+
+    streak = _gains_from(0)
+    # A run ending is the most notable thing about the first down week after a
+    # long climb. Reporting a bare -1.4% the week after "6 straight weekly gains"
+    # drops that thread and leaves the reader to reconstruct it.
+    broke_streak = _gains_from(1) if streak == 0 and len(series) > 1 else 0
 
     head = f"🎯 **Target POS — {_fiscal_label(wk)}** (w/e {wk:%a %b %-d})"
     lead = (
@@ -429,6 +436,8 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     )
     if streak >= 2:
         lead += f" — {streak} straight weekly gains"
+    elif broke_streak >= 2:
+        lead += f" — ends a {broke_streak}-week run of gains"
     lead += (
         f". Trailing 4-wk avg ${avg4 / 1000:,.1f}K, {len(trailing)}-wk avg ${avg13 / 1000:,.1f}K."
     )
@@ -517,7 +526,8 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     if wos and wos_4ago and wos < wos_4ago:
         working.append(
             f"• **Inventory is unwinding** — WOS {wos_4ago:.1f} → {wos:.1f} wks "
-            "over four weeks with sales rising."
+            f"over four weeks, sales {_pct(cur.amt, recent[-1].amt)} across the "
+            "same window."
         )
     if above:
         working.append(
