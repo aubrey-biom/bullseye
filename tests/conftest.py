@@ -79,14 +79,24 @@ def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
 # `select_as_date`. Pin the production types explicitly so a fixture cannot
 # accidentally test a type production never produces. Note sale_quantity is
 # FLOAT64 in production even though it counts units.
+#
+# Two spellings appear for a couple of these: the RAW source column and the name
+# the registry body projects it under. `bq.py` aliases `inventory_date AS
+# business_d` and `fiscal_week_end_date AS fiscal_week_end_d`, and both spellings
+# are live COLUMN_ROLES candidates, so both are pinned — a fixture may legitimately
+# stand in for either side of the alias.
 _TYPES: dict[str, str] = {
     "sales_date": "DATE",
-    "inventory_date": "DATE",
+    "inventory_date": "DATE",  # raw; projected as business_d
     "business_d": "DATE",
     "snapshot_d": "DATE",
     "fiscal_week_begin_d": "DATE",
-    "fiscal_week_end_date": "DATE",
+    "fiscal_week_end_date": "DATE",  # raw; projected as fiscal_week_end_d
+    "fiscal_week_end_d": "DATE",
+    "last_update_d": "DATE",
+    "processed_ct_date": "DATE",
     "order_d": "DATE",
+    "original_estimated_arrival_d": "DATE",
     "revised_estimated_arrival_d": "DATE",
     "purchase_order_create_d": "DATE",
     "tcin": "INT64",
@@ -156,9 +166,12 @@ def bq_client() -> Any:
     """One real BigQuery client for the whole session."""
     from bpd_mcp.bq import BQ_LOCATION_DEFAULT, BQ_PROJECT_DEFAULT, resolve_credentials
 
-    from google.cloud import bigquery  # noqa: I001 - after resolve_credentials
-
+    # Materialise the service-account key before the client library is imported or
+    # constructed, so GOOGLE_APPLICATION_CREDENTIALS is already pointing at it.
     resolve_credentials()
+
+    from google.cloud import bigquery
+
     return bigquery.Client(project=BQ_PROJECT_DEFAULT, location=BQ_LOCATION_DEFAULT)
 
 

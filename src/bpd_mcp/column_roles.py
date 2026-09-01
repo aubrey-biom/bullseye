@@ -625,13 +625,35 @@ def _columns_of(warehouse, table: str) -> list[tuple[str, str]]:
 
 
 def _dataset_has_rows(warehouse, dataset: str) -> bool:
-    """Is the logical table's primary base table non-empty? 0 bytes, cached."""
+    """Is the logical table's primary base table non-empty? 0 bytes, cached.
+
+    IndexError is caught alongside KeyError/TypeError because
+    `LogicalTable.primary_base_table` is `base_tables[0]` and a logical table
+    may legitimately declare `base_tables=()`: the extension seam in `bq.py`
+    documents composing a table purely out of other logical names via
+    `depends_on`, and such a body reads no base table directly.
+
+    Without this, ONE such table among the ones `validate_roles` demands roles
+    of disables role validation for ALL of them, quietly.
+    Neither caller crashes — `build_context` wraps its startup pass in
+    `except Exception -> logger.warning("role_validation_failed")` and the
+    `roles_resolvable` health check is wrapped by `_timed` — but both are
+    all-or-nothing: the exception escapes the loop over datasets, so no dataset
+    is validated at all. Boot logs one opaque warning instead of the drift
+    warnings the pass exists for, and the health check reports "check raised:
+    IndexError" in place of the suite's most valuable answer.
+
+    "No base table" is indistinguishable from "no row count for it", so both
+    answer False and the dataset is skipped, exactly as the other two caught
+    errors already are.
+    """
     try:
         entry = warehouse.registry[dataset]
-    except (KeyError, TypeError):
+        primary = entry.primary_base_table
+    except (KeyError, TypeError, IndexError):
         return False
     counts = warehouse.base_row_counts()
-    return counts.get(entry.primary_base_table, 0) > 0
+    return counts.get(primary, 0) > 0
 
 
 def table_exists(warehouse, table: str) -> bool:

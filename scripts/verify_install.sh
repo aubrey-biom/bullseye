@@ -78,7 +78,12 @@ else
 fi
 
 echo "[6/7] Tool count matches EXPECTED_TOOL_COUNT..."
-PYTHONPATH=src $PY <<'PYEOF'
+# `|| { ...; }`, not a bare command followed by `[ "$?" -ne 0 ]`: `set -e` is on,
+# so a bare heredoc that exits non-zero aborts the whole script on the spot. The
+# status line never ran, [7/7] never ran, and the "SOME CHECKS FAILED" banner
+# never printed — the script died mid-output with exit 1 and no summary. Failures
+# have to be CAUGHT to be accumulated.
+PYTHONPATH=src $PY <<'PYEOF' || HAS_FAIL=1
 from bpd_mcp.server import mcp
 from bpd_mcp.tools.admin import EXPECTED_TOOL_COUNT
 
@@ -89,10 +94,9 @@ if len(tools) != EXPECTED_TOOL_COUNT:
     raise SystemExit(1)
 print(f'  PASS ({len(tools)} tools)')
 PYEOF
-[ "$?" -ne 0 ] && HAS_FAIL=1
 
 echo "[7/7] BigQuery credential + reachability (skipped when unconfigured)..."
-PYTHONPATH=src $PY <<'PYEOF'
+PYTHONPATH=src $PY <<'PYEOF' || HAS_FAIL=1
 import os
 
 if not (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GCP_SA_KEY_B64")):
@@ -113,7 +117,6 @@ except Exception as e:
     raise SystemExit(1)
 print(f"  PASS (querying {s.bpd_bq_project}/{s.bpd_bq_location} as {rows[0][0]})")
 PYEOF
-[ "$?" -ne 0 ] && HAS_FAIL=1
 
 echo
 if [ "$HAS_FAIL" -eq 0 ]; then

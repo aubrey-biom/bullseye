@@ -5,9 +5,10 @@ A stdio MCP server that lets Claude analyze Target's **Business Partner Data**
 location attributes, gross margin) out of **BigQuery**.
 
 The server is a **read-only analytics layer**. It does not download, parse or
-store anything. An independent Kiteworks → GCS → BigQuery pipeline lands the
-BPD file set (834 files, all 18 patterns) into `biom-reporting-s26` daily at
-roughly **06:47 UTC**; this server reads what that pipeline produced.
+store anything. An independent Kiteworks → GCS → BigQuery pipeline lands the BPD
+file set into `biom-reporting-s26` each morning; this server reads what that
+pipeline produced. As of 2026-09-01 `bpd_meta.ingestion_state` holds **834 files
+across all 18 patterns**, most recently downloaded at **06:49 UTC** that day.
 
 Python 3.11+. Framework: **FastMCP**. Data layer: `google-cloud-bigquery`
 against a service account holding **`dataViewer` + `jobUser`** — it can read
@@ -349,30 +350,50 @@ Every tool call logs `tool_called` (arguments, redacted) and `tool_complete`
 ## Tests
 
 ```bash
-# Default suite: hermetic, no network, no credentials needed.
-uv run pytest -q
+# Tier 1 only: hermetic — no network, no credentials, no cost.
+uv run pytest -q -m "not bq and not bq_live"
 
-# Live BigQuery with fixture rows injected as literal CTEs (0 bytes billed).
+# Tier 2: live BigQuery, fixture rows injected as literal CTEs (0 bytes billed).
 uv run pytest -q -m bq
 
-# Live BigQuery against REAL production data (bills bytes).
+# Tier 3: live BigQuery against REAL production data (bills bytes).
 uv run pytest -q -m bq_live
+
+# All three. With a credential present this really does run tiers 2 and 3;
+# without one it collapses to tier 1 (see the skip rule below).
+uv run pytest -q
 ```
 
 Three tiers, and the split is deliberate:
 
 * **Tier 1 — hermetic.** Pure string-in/string-out tests for CTE injection,
-  identifier quoting, the dialect helpers, `sql_safety`, and the drift guards
-  that pin `LOGICAL_TABLES` ↔ `COLUMN_ROLES` ↔ `DATASET_KINDS` ↔ `FEED_KINDS` ↔
-  `KnownDataset`, and `EXPECTED_TOOL_COUNT` ↔ registered tools.
+  identifier quoting, the dialect helpers, `sql_safety`, and role resolution
+  against a stub warehouse that implements nothing but `registry` and
+  `logical_schema`. It also holds the **drift guards**
+  (`tests/test_audit_drift_guards.py`), which pin the registry against every
+  parallel source of truth that can silently disagree with it:
+  `LOGICAL_TABLES` ↔ `COLUMN_ROLES` ↔ `DATASET_KINDS` ↔ `FEED_KINDS` ↔
+  `schemas.KnownDataset` ↔ `bq.KNOWN_DATASET_NAMES`; `EXPECTED_TOOL_COUNT` and
+  the tool roster ↔ the tools actually registered on the FastMCP instance; each
+  entry's declared `date_column` and `column_contract` ↔ the columns its body
+  really projects; and `REQUIRED_ROLES` ↔ `COLUMN_ROLES`. Adding a logical table
+  without its companion entries fails here rather than in production.
 * **Tier 2 — `-m bq`, fixture data.** Fixture rows are swapped into the registry
   as literal `SELECT … UNION ALL SELECT …` CTE bodies and executed **against
   real BigQuery**, which bills 0 bytes and runs in about 0.7 s per query. This
-  is where the bulk of the analytics coverage lives.
-* **Tier 3 — `-m bq_live`, real data.** Per-table smoke invariants, an
-  anti-drift guard comparing each fixture's dry-run schema against the real
-  body's, numeric parity checks on the two de-duplicated tables, and the KMG
-  tie-out.
+  is where the bulk of the analytics coverage lives — the SQL is compiled and
+  computed by the engine that will run it in production, over rows whose right
+  answer is known. A few drift guards also run here, comparing the projection
+  parsed out of each registry body against the schema BigQuery itself reports.
+* **Tier 3 — `-m bq_live`, real data.** Deliberately small: the full
+  `bpd_health_check` runner against production, the registry/roles checks
+  against live schemas, and the KMG tie-out below driven end to end as a
+  subprocess.
+
+Both BigQuery tiers **skip themselves** when neither `GCP_SA_KEY_B64` nor
+`GOOGLE_APPLICATION_CREDENTIALS` is set, so a contributor without warehouse
+access still gets a meaningful green run instead of a wall of errors.
+`scripts/verify_install.sh` runs tier 1 only, for that reason.
 
 **There is deliberately no DuckDB test double.** It was measured and rejected:
 DuckDB rejects `SAFE_CAST` and backtick identifiers outright, and where both
@@ -384,26 +405,77 @@ would pass exactly when production is broken.
 
 ## Source-of-truth tie-out (KMG POS report)
 
-`scripts/validate_kmg.py` validates the warehouse against the vendor's weekly
-KMG POS report — the external source of truth. It embeds the expected numbers
-from the JunW1'26 report (week ending 2026-06-06) and checks weekly unit and
-dollar totals for 12 fiscal weeks, per-TCIN units and dollars for w/e 6/6 (25
-SKUs), the channel-originated dollar split, and per-TCIN on-hand at w/e 6/6.
+`scripts/validate_kmg.py` validates the BigQuery data layer against the vendor's
+weekly KMG POS report. That report is external to both the old DuckDB warehouse
+and the new one, which is what makes this the **acceptance gate for the
+migration**: it is the only artifact in the repo that can answer "did the
+data-layer swap change any number?" against a ruler the swap cannot move.
+
+It embeds the numbers from the JunW1'26 report (week ending 2026-06-06) and runs
+**62 checks**: weekly unit and dollar totals for 12 fiscal weeks, per-TCIN units
+and dollars for w/e 6/6 (25 SKUs), the channel-originated dollar split and its
+reconciliation to the weekly total, and per-TCIN on-hand for the 21 SKUs whose
+reported OH is above noise level.
 
 ```bash
 uv run python scripts/validate_kmg.py --project biom-reporting-s26 --location us-central1
 ```
 
-Read-only; exit 0 = tie-out clean. This script is the **acceptance gate for the
-BigQuery migration**: it is the only artifact in the repo that can answer "did
-the data-layer swap change any number?".
+Read-only. Four queries and a few seconds; **94 MB billed** on a cold query
+cache, 0 on a repeat run inside the cache window. No column name is
+hardcoded — it resolves through `column_roles.resolve_column` and
+`ResolvedColumn.select_as_date`, so it fails the same way the tools would if
+Target renames something. Exit 0 = nothing failed; `--strict` additionally fails
+on the documented report-side discrepancy below.
+
+### Result of the post-migration run
+
+**2026-09-01, against production: 61 passed, 1 known-discrepancy, 0 failed,
+0 skipped.** The swap moved no number.
+
+* All 12 weekly dollar totals tie, and 11 of the 12 weekly unit totals tie — the
+  largest of those differences is 0.03%.
+* All 25 per-SKU unit figures for w/e 6/6 match the report exactly, and all 25
+  dollar figures match to the report's whole-dollar rounding.
+* The channel split reconciles: store-originated reads 0.49% low and
+  online-originated 1.22% high (offsetting: -$1,159 / +$1,202), while their
+  **total** matches the report to 0.013%.
+* All 21 on-hand figures match, 12 of them against `ending_on_hand_q` alone and
+  the other 9 only once `ending_on_transfer_q` is added — KMG's "OH" column
+  includes in-transit units for some SKUs and not others. The harness accepts
+  either definition and prints which one matched.
+
+The single outstanding difference is `w/e 2026-04-04` units, and it is a defect
+in the report rather than in the data:
+
+| source | units | dollars |
+| --- | --- | --- |
+| KMG report, "12 Week Comparison" | 21,352 | $213,179 |
+| `biom_canvas.fct_target_sales` (`data_grain='weekly'`) | **23,994** | $213,175.31 |
+| `bpd_raw.weekly_sales_tcin_loc` | **23,994** | $213,175.31 |
+| `bpd_raw.history_sales_weekly` | **23,994** | $213,175.31 |
+
+Three independent Target feeds agree with each other and disagree with the
+report's unit figure, while the report's own dollar total for that week ties to
+0.002%. The last of the three is the Kiteworks file the DuckDB warehouse loaded
+directly, so the pre-migration number was 23,994 as well.
+
+The harness reports that week as `KNOWN` rather than `FAIL` — a gate that can
+never go green stops being read — but the allowance is **pinned to 23,994** in
+`KNOWN_REPORT_DISCREPANCIES`. It is an assertion, not a whitelist: if that week
+ever returns any other number it is a plain `FAIL` again, and a tier-2 test
+(`test_moving_off_the_pinned_value_is_a_real_failure`) holds that behaviour in
+place.
 
 ---
 
 ## Evaluation suite
 
-`evals/bpd_eval.xml` contains 10 realistic Q&A pairs — the regression suite for
-answer quality. Re-run after every meaningful change.
+`evals/bpd_eval.xml` contains 10 realistic multi-tool questions, each written to
+be answered end to end through the MCP. It is **not yet a regression suite**:
+every `<answer>` is still the `__FILL_FROM_REAL_DATA__` placeholder, so nothing
+can be string-compared until the expected values are pinned against real data.
+The questions themselves are usable today as a manual exercise of the tools.
 
 ---
 
@@ -421,8 +493,12 @@ answer quality. Re-run after every meaningful change.
    canvas with raw on a computed boundary, which self-heals — but the cleaner
    fix is upstream in the GCS → BigQuery loader.
 3. **The DFE forecast feed is genuinely stale.** `DFE_WKLY_ITEM_LOC_FORECAST`
-   last landed 2026-07-29. Not a migration bug; `bpd_data_freshness` just makes
-   it visible for the first time.
+   last landed 2026-07-29 UTC, carrying a file dated 2026-07-27 — 12 files in
+   total and nothing since (checked 2026-09-01). Not a migration bug;
+   `bpd_data_freshness` just makes it visible for the first time. Note the
+   content still reaches forward: fiscal weeks in `forecast_weekly` run to
+   2026-10-18, which is why `bpd_list_datasets` reports snapshot and content
+   ranges separately.
 4. **`snapshot_retention_caveat`** in `get_forecast_vs_actual` describes
    DuckDB's per-key ingest retention. The BigQuery sources are SCD2 with
    `valid_from`/`valid_to`, so historical snapshots may be recoverable and
