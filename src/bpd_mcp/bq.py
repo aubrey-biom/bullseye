@@ -1183,7 +1183,6 @@ def resolve_credentials(*, credentials_path: Path | None = None) -> tuple[Path |
                 f"{_SA_KEY_ENV} decoded to something that is not JSON. It should be the "
                 f"base64 of a service-account key file.\n\n{_CREDENTIAL_HELP}"
             )
-        _SA_KEY_DEST.parent.mkdir(parents=True, exist_ok=True)
         # Atomic, and never briefly world-readable. write_bytes() would create the
         # key at the process umask (commonly 0644) and only narrow it on the next
         # line. It is also not atomic, and every concurrent server process targets
