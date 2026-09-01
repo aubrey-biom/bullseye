@@ -500,10 +500,11 @@ def validate_roles(warehouse) -> list[dict[str, Any]]:
     for dataset, roles in demanded.items():
         if not table_exists(warehouse, dataset):
             continue
-        _, rows = warehouse.execute_sql(
-            f"SELECT COUNT(*) FROM {_safe(dataset)}"
-        )
-        if not rows or rows[0][0] == 0:
+        # Emptiness probe via `__TABLES__` row counts (0 bytes, cached), NOT
+        # `SELECT COUNT(*) FROM <logical>`. Under CTE injection each such count
+        # runs the full registry body — ~333 MB across the roster, paid at every
+        # boot and every health check. See BigQueryWarehouse.base_row_counts.
+        if not _dataset_has_rows(warehouse, dataset):
             continue
         for role in sorted(roles):
             try:
@@ -517,25 +518,30 @@ def validate_roles(warehouse) -> list[dict[str, Any]]:
 class ResolvedColumn:
     name: str
     """The column name as it exists in the warehouse."""
-    duckdb_type: str
-    """Upper-case DuckDB type (e.g. 'DATE', 'TIMESTAMP', 'VARCHAR', 'BIGINT')."""
+    sql_type: str
+    """Upper-case BigQuery type (e.g. 'DATE', 'TIMESTAMP', 'STRING', 'INT64')."""
 
     @property
     def is_date_typed(self) -> bool:
-        t = self.duckdb_type.upper()
+        t = self.sql_type.upper()
+        # DATE and DATETIME both match the DATE prefix.
         return t.startswith("DATE") or t.startswith("TIMESTAMP")
 
     def select_as_date(self, *, alias: str | None = None) -> str:
         """SQL expression that returns this column as a DATE.
 
-        If the column is already a DATE/TIMESTAMP, the cast is a no-op. If it's
-        a VARCHAR (as Target sometimes ships fiscal_week_begin_d), the cast
-        applies at query time. Quoted identifier ensures safety.
+        If the column is already a DATE/TIMESTAMP the cast is a no-op. Otherwise
+        it is a STRING — several bpd_raw feeds ship dates that way, and Target
+        pads absent values with a placeholder rather than NULL. SAFE_CAST, not
+        CAST, is mandatory here: a plain CAST over one placeholder row aborts the
+        whole query with `400 Invalid date: '""'`, so a single bad row in
+        location_attr would take down every date-ranged tool. SAFE_CAST yields
+        NULL for those rows and the aggregates skip them.
         """
-        from .warehouse import quote_ident
+        from .bq import quote_ident
 
         ident = quote_ident(self.name)
-        expr = ident if self.is_date_typed else f"CAST({ident} AS DATE)"
+        expr = ident if self.is_date_typed else f"SAFE_CAST({ident} AS DATE)"
         return f"{expr} AS {quote_ident(alias)}" if alias else expr
 
 
@@ -565,8 +571,9 @@ def resolve_column(
 ) -> ResolvedColumn:
     """Find the first candidate column for `(dataset, role)` that actually exists.
 
-    Always queries `information_schema.columns` fresh — no caching. This is the
-    Issue-6 fix: tools must see schema changes from a sync without an MCP restart.
+    Reads the warehouse's cached logical schema (0 bytes, no BigQuery round
+    trip). Resolution still happens at CALL time rather than import time, so a
+    test that swaps a fixture body into the registry resolves against that body.
 
     `extra_candidates` lets a caller bolt on dataset-agnostic additional hints
     (e.g. when looking for a date column across multiple datasets).
@@ -578,7 +585,7 @@ def resolve_column(
         if c not in candidates:
             candidates.append(c)
 
-    # Fresh introspection — engine sees post-sync schema immediately.
+    # Call-time introspection against the registry's declared projection.
     cols = _columns_of(warehouse, dataset)
 
     by_name = {name.lower(): (name, dtype) for name, dtype in cols}
@@ -586,7 +593,7 @@ def resolve_column(
     for cand in candidates:
         if cand.lower() in by_name:
             real_name, dtype = by_name[cand.lower()]
-            return ResolvedColumn(name=real_name, duckdb_type=str(dtype).upper())
+            return ResolvedColumn(name=real_name, sql_type=str(dtype).upper())
 
     raise ColumnNotFound(
         detail={
@@ -599,24 +606,42 @@ def resolve_column(
 
 
 def _columns_of(warehouse, table: str) -> list[tuple[str, str]]:
-    """List (column_name, data_type) for a table. Always fresh from info schema."""
-    sql = (
-        "SELECT column_name, data_type FROM information_schema.columns "
-        f"WHERE table_schema='main' AND table_name='{_safe(table)}' "
-        "ORDER BY ordinal_position"
-    )
-    _, rows = warehouse.execute_sql(sql)
-    return [(r[0], r[1]) for r in rows]
+    """`[(column_name, BIGQUERY_TYPE)]` in projection order for a logical table.
+
+    Delegates to `BigQueryWarehouse.logical_schema`, which is cached and costs
+    0 bytes. There is deliberately no `information_schema` query here: BigQuery
+    scopes INFORMATION_SCHEMA per dataset, so the DuckDB-era
+    `FROM information_schema.columns WHERE table_schema='main'` resolved to a
+    dataset named `information_schema` and raised 404 NotFound for every role
+    lookup — which meant every analytics tool.
+
+    An unknown table yields `[]` so `resolve_column` reports the richer
+    ColumnNotFound diagnostic instead of a KeyError.
+    """
+    try:
+        return list(warehouse.logical_schema(table))
+    except KeyError:
+        return []
 
 
-def _safe(s: str) -> str:
-    return "".join(ch for ch in s if ch.isalnum() or ch == "_")
+def _dataset_has_rows(warehouse, dataset: str) -> bool:
+    """Is the logical table's primary base table non-empty? 0 bytes, cached."""
+    try:
+        entry = warehouse.registry[dataset]
+    except (KeyError, TypeError):
+        return False
+    counts = warehouse.base_row_counts()
+    return counts.get(entry.primary_base_table, 0) > 0
 
 
 def table_exists(warehouse, table: str) -> bool:
-    """Fresh check — does `table` exist in main schema? Re-queried per call."""
-    _, rows = warehouse.execute_sql(
-        f"SELECT 1 FROM information_schema.tables "
-        f"WHERE table_schema='main' AND table_name='{_safe(table)}'"
-    )
-    return bool(rows)
+    """Is `table` a known logical table? A registry membership test, 0 bytes.
+
+    The registry IS the catalogue now — every logical table is defined there and
+    is always queryable, so unlike the DuckDB era (where sync created tables
+    lazily and absence was normal) this cannot vary at runtime.
+    """
+    try:
+        return table in warehouse.registry
+    except TypeError:
+        return False

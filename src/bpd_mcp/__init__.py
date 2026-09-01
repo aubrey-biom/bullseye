@@ -1,3 +1,3 @@
-"""bpd_mcp — MCP server bridging Target BPD on Kiteworks to a local DuckDB warehouse."""
+"""bpd_mcp — MCP server exposing Target BPD analytics over a read-only BigQuery data layer."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

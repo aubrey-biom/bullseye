@@ -3,8 +3,11 @@
 Layer 1: token-scan rejects keywords that could mutate state or attach files.
 Layer 2: multi-statement detection.
 Layer 3: comment-stripped pre-pass (so `/* */ DROP TABLE` is caught).
-Layer 4: caller MUST run on a connection opened `read_only=True`. We assert that
-         too in the tool, so even if all of the above were bypassed the engine refuses.
+Layer 4: the BigQuery credential itself is read-only. The service account holds
+         dataViewer + jobUser and nothing more, so even if every layer above were
+         bypassed the write is refused at the IAM layer (verified: a CREATE TABLE
+         returns 403 "Permission bigquery.tables.create denied"). That is strictly
+         stronger than the old read-only-connection assertion it replaces.
 
 This module is intentionally conservative; false positives are preferable to false
 negatives. Anything other than a single SELECT / WITH is rejected.
@@ -15,7 +18,7 @@ from __future__ import annotations
 import re
 
 # Anything outside of this allow-list of leading keywords is rejected.
-_ALLOWED_LEAD = ("SELECT", "WITH", "EXPLAIN", "DESCRIBE", "SHOW", "PRAGMA")
+_ALLOWED_LEAD = ("SELECT", "WITH")
 
 # These tokens are forbidden anywhere — even cloaked in a comment.
 _FORBIDDEN_TOKENS = {
@@ -44,19 +47,12 @@ _FORBIDDEN_TOKENS = {
     "COMMIT",
     "ROLLBACK",
     "UPDATE_EXTENSIONS",
+    "SCRIPT",
+    "EXECUTE",
+    "SET",
+    "DECLARE",
+    "ASSERT",
 }
-
-# Allowed PRAGMA names (read-only introspection only).
-_PRAGMA_ALLOWLIST = {
-    "table_info",
-    "show_tables",
-    "database_list",
-    "version",
-    "show_databases",
-    "show_views",
-    "memory_limit",
-}
-
 
 class SqlBlocked(ValueError):
     """Raised when SQL is rejected by the safety layer (code SQL_BLOCKED)."""
@@ -107,20 +103,6 @@ def validate(sql: str) -> str:
     bad = upper_tokens & _FORBIDDEN_TOKENS
     if bad:
         raise SqlBlocked(f"forbidden keyword(s) detected: {sorted(bad)}")
-
-    if lead == "PRAGMA":
-        # PRAGMA can be read-only OR can mutate config. Only allow a small allow-list.
-        # Token after PRAGMA, lowercased without parens.
-        if len(tokens) < 2:
-            raise SqlBlocked("PRAGMA requires an argument")
-        pragma_name = tokens[1].lower()
-        if pragma_name not in _PRAGMA_ALLOWLIST:
-            raise SqlBlocked(
-                f"PRAGMA {pragma_name!r} not in allowlist {sorted(_PRAGMA_ALLOWLIST)}"
-            )
-        # Reject assignments like `PRAGMA name = value`.
-        if "=" in stmt:
-            raise SqlBlocked("PRAGMA assignments are not permitted (read-only)")
 
     return sql.strip().rstrip(";")
 

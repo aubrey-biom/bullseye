@@ -1,10 +1,10 @@
 """Pydantic input/output schemas for every MCP tool.
 
-Every list-style tool returns the standard envelope (§9):
-    {items, total, count, offset, has_more, next_offset}
+Every tool returns a `ToolResponse`. Action-style tools additionally define an
+explicit Output model so FastMCP can publish `outputSchema` to clients.
 
-Every action-style tool returns an explicit Output model so FastMCP can publish
-`outputSchema` to clients.
+The paginated `ListEnvelope` is gone with the Kiteworks file-browsing tools —
+nothing the server exposes now is a paginated remote listing.
 """
 
 from __future__ import annotations
@@ -26,15 +26,6 @@ class _BaseModel(BaseModel):
 # --------------------------------------------------------------------------------------
 
 
-class ListEnvelope(_BaseModel):
-    items: list[dict[str, Any]] = Field(default_factory=list)
-    total: int = 0
-    count: int = 0
-    offset: int = 0
-    has_more: bool = False
-    next_offset: int | None = None
-
-
 class ErrorPayload(_BaseModel):
     code: str
     message: str
@@ -52,58 +43,14 @@ class ToolResponse(_BaseModel):
 
 
 # --------------------------------------------------------------------------------------
-# Files tools
+# Catalog
 # --------------------------------------------------------------------------------------
 
-
-class ListTopFoldersInput(_BaseModel):
-    limit: int = Field(default=20, ge=1, le=100)
-    offset: int = Field(default=0, ge=0)
-    response_format: ResponseFormat = "markdown"
-
-
-class ListFolderContentsInput(_BaseModel):
-    folder_id: str = Field(description="UUID (or numeric string) of the folder to list.")
-    name_contains: str | None = Field(
-        default=None,
-        description=(
-            "Case-insensitive substring filter on file/folder names, applied "
-            "CLIENT-SIDE (Patch #12 — Kiteworks' `name` param is exact-match "
-            "and must never be used for substring queries)."
-        ),
-    )
-    extensions: str | None = Field(
-        default=None,
-        description="Comma-separated list of extensions, e.g. 'zip,csv'.",
-    )
-    limit: int = Field(default=20, ge=1, le=100)
-    offset: int = Field(default=0, ge=0)
-    response_format: ResponseFormat = "markdown"
-
-
-class GetFileMetadataInput(_BaseModel):
-    file_id: str
-    response_format: ResponseFormat = "markdown"
-
-
-class SearchFilesInput(_BaseModel):
-    query: str = Field(min_length=1, description="Search query.")
-    object_id: str | None = Field(default=None, description="Limit to a folder UUID.")
-    search_type: Literal["f", "d", "e"] = Field(
-        default="f", description="'f' file, 'd' folder, 'e' email."
-    )
-    include_content: bool = Field(
-        default=False, description="If true, run a full-text search; else metadata-only."
-    )
-    limit: int = Field(default=20, ge=1, le=100)
-    offset: int = Field(default=0, ge=0)
-    response_format: ResponseFormat = "markdown"
-
-
-# --------------------------------------------------------------------------------------
-# Sync tools
-# --------------------------------------------------------------------------------------
-
+# The 15 logical tables the server exposes. This list MUST equal
+# `bq.KNOWN_DATASET_NAMES` (i.e. the keys of `bq.LOGICAL_TABLES`), which is in
+# turn pinned to `column_roles.COLUMN_ROLES` / `DATASET_KINDS` / `FEED_KINDS` by
+# a drift guard. It is spelled out literally rather than generated so MCP
+# clients get a real enum in the published tool schema.
 KnownDataset = Literal[
     "sales_daily",
     "sales_weekly",
@@ -121,81 +68,6 @@ KnownDataset = Literal[
     "po_plan_biweekly",
     "forecast_weekly",
 ]
-
-
-class SyncNewFilesInput(_BaseModel):
-    datasets: list[KnownDataset] | None = Field(
-        default=None,
-        description="If supplied, restrict the sync to these dataset names.",
-    )
-    dry_run: bool = Field(
-        default=False,
-        description="If true, list which files would be processed without downloading.",
-    )
-    response_format: ResponseFormat = "markdown"
-
-
-class FileOutcomeOut(_BaseModel):
-    file_id: str
-    file_name: str
-    dataset: str | None
-    status: str
-    rows: int = 0
-    bytes: int = 0
-    error: str | None = None
-
-
-class SyncNewFilesOutput(_BaseModel):
-    folder_id: str | None
-    files_found: int
-    files_new: int
-    files_loaded: int
-    files_failed: int
-    files_skipped: int
-    files_unknown: int
-    duration_s: float
-    outcomes: list[FileOutcomeOut]
-    notes: str = ""
-
-
-class RefreshDatasetInput(_BaseModel):
-    dataset: KnownDataset
-    full: bool = Field(
-        default=False,
-        description=(
-            "If true, clear the existing table+ledger for this dataset first. "
-            "DESTRUCTIVE: Kiteworks retains only ~2 weeks of files, so local "
-            "history older than that is permanently lost. Requires "
-            "confirm_destructive."
-        ),
-    )
-    confirm_destructive: str | None = Field(
-        default=None,
-        description=(
-            "Required when full=true. Must be exactly: "
-            "'I understand this deletes local history'."
-        ),
-    )
-    response_format: ResponseFormat = "markdown"
-
-
-class ReingestLocalInput(_BaseModel):
-    datasets: list[KnownDataset] | None = Field(
-        default=None,
-        description="If supplied, restrict the reingest to these dataset names.",
-    )
-    only_unledgered: bool = Field(
-        default=True,
-        description=(
-            "Skip zips whose file_name already has a status='loaded' ledger row "
-            "(default). Set false to force re-loading everything on disk."
-        ),
-    )
-    dry_run: bool = Field(
-        default=False,
-        description="If true, list which zips would be reingested without loading.",
-    )
-    response_format: ResponseFormat = "markdown"
 
 
 class ListDatasetsInput(_BaseModel):
@@ -234,10 +106,14 @@ class ExportQueryToCsvInput(_BaseModel):
         default=True, description="Include column headers as the first row."
     )
     max_rows: int = Field(
-        default=1_000_000,
+        default=200_000,
         ge=1,
         le=10_000_000,
-        description="Hard row cap to avoid run-away exports.",
+        description=(
+            "Hard row cap to avoid run-away exports. Lowered from the DuckDB-era "
+            "1,000,000: on per-byte billing an unguarded export is a money "
+            "question, not a disk question. Overridable via BPD_EXPORT_MAX_ROWS."
+        ),
     )
     response_format: ResponseFormat = "markdown"
 
@@ -422,19 +298,19 @@ class ForecastVsActualInput(_BaseModel):
 # --------------------------------------------------------------------------------------
 
 
-class AuthStatusInput(_BaseModel):
+class BigQueryStatusInput(_BaseModel):
+    """Input for `bpd_bigquery_status` (was `bpd_auth_status`)."""
+
     response_format: ResponseFormat = "markdown"
 
 
-class CacheStatusInput(_BaseModel):
-    response_format: ResponseFormat = "markdown"
+class DataFreshnessInput(_BaseModel):
+    """Input for `bpd_data_freshness` (was `bpd_cache_status`).
 
+    The old tool measured local disk; there is no local data store any more.
+    What it was actually for — "how current is this data?" — is what survives.
+    """
 
-class ClearCacheInput(_BaseModel):
-    confirm: bool = Field(
-        default=False,
-        description="Must be true to actually wipe. Else returns a dry-run preview.",
-    )
     response_format: ResponseFormat = "markdown"
 
 
@@ -457,8 +333,18 @@ class HealthCheckInput(_BaseModel):
     skip_network: bool = Field(
         default=False,
         description=(
-            "Skip checks that require network access "
-            "(auth_kiteworks_reachable). Useful for offline diagnostics."
+            "Skip every check that calls BigQuery. Leaves only the local "
+            "checks (credentials present, config validity, MCP self-check). "
+            "Useful when diagnosing an outage or working offline."
+        ),
+    )
+    execute: bool = Field(
+        default=False,
+        description=(
+            "Make the tool smoke test really RUN its queries instead of only "
+            "dry-running them. A dry run proves the SQL compiles and every "
+            "column role resolves at 0 bytes billed; executing scans real data "
+            "across 11 tools and costs money. Default false."
         ),
     )
     response_format: ResponseFormat = "markdown"

@@ -10,7 +10,7 @@ import json
 from datetime import date, datetime
 from typing import Any
 
-from .schemas import ListEnvelope, ToolResponse
+from .schemas import ToolResponse
 
 
 def _json_default(o: Any) -> Any:
@@ -46,50 +46,6 @@ def render_markdown_table(rows: list[dict[str, Any]], *, columns: list[str] | No
 
 def render_keyvalue(d: dict[str, Any]) -> str:
     return "\n".join(f"- **{k}**: {_cell(v)}" for k, v in d.items())
-
-
-def make_list_response(
-    *,
-    items: list[dict[str, Any]],
-    offset: int,
-    limit: int,
-    total: int | None = None,
-    fmt: str = "markdown",
-    title: str | None = None,
-    columns: list[str] | None = None,
-) -> ToolResponse:
-    actual_total = total if total is not None else (offset + len(items))
-    has_more = (offset + len(items)) < actual_total if total is not None else len(items) >= limit
-    envelope = ListEnvelope(
-        items=items,
-        total=actual_total,
-        count=len(items),
-        offset=offset,
-        has_more=has_more,
-        next_offset=(offset + len(items)) if has_more else None,
-    )
-    if fmt == "json":
-        return ToolResponse(
-            ok=True,
-            format="json",
-            rendered=json.dumps(envelope.model_dump(), default=_json_default, indent=2),
-            data=envelope.model_dump(),
-        )
-    # markdown
-    body = ""
-    if title:
-        body += f"### {title}\n\n"
-    body += render_markdown_table(items, columns=columns)
-    body += (
-        f"\n\n_count={envelope.count}, total={envelope.total}, "
-        f"offset={envelope.offset}, has_more={envelope.has_more}_"
-    )
-    return ToolResponse(
-        ok=True,
-        format="markdown",
-        rendered=body,
-        data=envelope.model_dump(),
-    )
 
 
 def make_kv_response(

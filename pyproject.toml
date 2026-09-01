@@ -1,7 +1,7 @@
 [project]
 name = "bpd-mcp"
-version = "0.1.0"
-description = "MCP server exposing Target BPD data over Kiteworks into a local DuckDB warehouse."
+version = "0.2.0"
+description = "MCP server exposing Target BPD analytics over a read-only BigQuery data layer."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Biom" }]
@@ -9,33 +9,37 @@ dependencies = [
     # mcp 2.0 removed the `mcp.server.fastmcp` module this server is built on.
     # Stay on the 1.x line until we deliberately migrate.
     "mcp>=1.0.0,<2",
-    "httpx[http2]>=0.27",
+    # The data layer. Read-only: the service account holds dataViewer + jobUser.
+    "google-cloud-bigquery>=3.20",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "duckdb>=1.0",
-    "polars>=1.0",
-    "pyarrow>=15.0",
-    # pandas is used only by the permissive parse fallback (parsers.py attempt 3);
-    # polars is the primary engine.
-    "pandas>=2.0",
-    "tenacity>=8.3",
     "python-dotenv>=1.0",
     "structlog>=24.1",
     "rich>=13.7",
 ]
+# Removed with the Kiteworks ingest half (sync/parsers/client/auth) and the local
+# DuckDB warehouse:
+#   duckdb        - replaced by BigQuery; the single-writer file lock it imposed is
+#                   the reason for the whole migration.
+#   httpx[http2]  - only the Kiteworks client and the deleted AppContext used it.
+#   tenacity      - retry policy for Kiteworks downloads.
+#   polars        - the CSV parse engine; nothing reads files any more.
+#   pyarrow       - only used to hand polars frames to DuckDB's registrar.
+#   pandas        - only the permissive parse fallback (parsers.py attempt 3).
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
-    "respx>=0.21",
+    # The live-BigQuery test tier is ~150-250 independent round trips; -n 8 is
+    # the lever for its wall time, not reduced fidelity.
+    "pytest-xdist>=3.5",
     "ruff>=0.4",
     "mypy>=1.10",
 ]
 
 [project.scripts]
 bpd-mcp = "bpd_mcp.__main__:main"
-bpd-bootstrap = "scripts.bootstrap_auth:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -59,6 +63,10 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003", "SIM105"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "bq: executes against live BigQuery with fixture CTE data (0 bytes billed)",
+  "bq_live: executes against live BigQuery with REAL production data (bills bytes)",
+]
 
 [tool.mypy]
 python_version = "3.11"

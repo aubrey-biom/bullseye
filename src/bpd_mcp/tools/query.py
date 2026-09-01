@@ -1,23 +1,56 @@
 """Query tools: run_sql, sales_summary, top_skus, inventory_snapshot, sell_through,
 describe_schema, plus the S&OP analytics added in the May 2026 patch
-(open_orders, upcoming_pos, forecast_vs_actual)."""
+(open_orders, upcoming_pos, forecast_vs_actual).
+
+DIALECT: every statement built here is **BigQuery Standard SQL**. The DuckDB
+spellings this module used to emit are gone; the ones that mattered, and why:
+
+  * `"x"` is a STRING LITERAL in BigQuery, not an identifier. All quoting goes
+    through `quote_ident`, which now emits backticks (see bq.quote_ident).
+  * `TRY_CAST` -> `SAFE_CAST`. Not tidiness: bpd_raw ships several date columns
+    as STRING holding Target's literal `""` placeholder, and a plain CAST is a
+    hard 400 `Invalid date` — optimizer-dependently, so a passing smoke query
+    proves nothing.
+  * `date_trunc('week', x)` -> `DATE_TRUNC(x, WEEK(MONDAY))`. Argument order
+    flips AND the default anchor differs; see the comment at the two call sites.
+  * `x +/- INTERVAL n DAY` -> `DATE_ADD/DATE_SUB(x, INTERVAL n DAY)`. The infix
+    form returns DATETIME in BigQuery, which leaks a time component into GROUP
+    BY keys and into Python-side date arithmetic.
+  * `current_date` -> `CURRENT_DATE()` (already UTC, matching the DuckDB session
+    pin that used to be set explicitly).
+  * `DATE - DATE` -> `DATE_DIFF(a, b, DAY)`. BigQuery's infix form yields a
+    `relativedelta`, which is not JSON-serializable.
+  * `COUNT(*) FILTER (WHERE p)` -> `COUNTIF(p)`.
+  * `EXPLAIN` -> `warehouse.dry_run()`; BigQuery rejects EXPLAIN outright.
+  * ASC ordering: DuckDB puts NULLs last in BOTH directions, BigQuery puts them
+    FIRST on ASC. Every ASC `ORDER BY` here carries an explicit `NULLS LAST`.
+    DESC already agrees in both engines — the existing `DESC NULLS LAST` clauses
+    are correct as written and must not be "simplified".
+
+Logical table names (`sales_daily`, `forecast_weekly`, ...) are still written as
+bare identifiers. `BigQueryWarehouse.execute_sql` injects the backing CTEs
+outermost, so nothing in this module needs injection awareness.
+"""
 
 from __future__ import annotations
 
 from datetime import date, timedelta
 from typing import Any
 
+from ..bq import LOGICAL_TABLES
 from ..column_roles import (
     ColumnNotFound,
     ResolvedColumn,
     resolve_column,
     table_exists,
 )
+from ..config import get_settings
 from ..formatting import (
     make_error_response,
     make_kv_response,
     make_table_response,
 )
+from ..logging_setup import get_logger
 from ..schemas import (
     DescribeSchemaInput,
     ExportQueryToCsvInput,
@@ -34,24 +67,46 @@ from ..schemas import (
 from ..sql_safety import SqlBlocked, validate, wrap_with_limit
 from ..warehouse import Warehouse, quote_ident
 
+log = get_logger(__name__)
+
 # --------------------------------------------------------------------------------------
 # Column-resolution helpers (Patch #4)
 # --------------------------------------------------------------------------------------
 #
-# All schema introspection happens at *call time* (not at module load) so a sync
-# that creates a new table is visible without restarting the MCP. See Issue 6.
+# Column resolution happens at *call time*, against the live BigQuery schema of
+# each logical table's CTE body (a cached 0-byte dry run). See column_roles.
+
+# The server no longer ingests anything, so "not loaded yet" is never actionable
+# advice. Every logical table is a view over a BigQuery table that an
+# independent pipeline fills.
+_PIPELINE_NOTE = (
+    "the upstream Kiteworks -> GCS -> BigQuery pipeline loads it daily around "
+    "06:47 UTC"
+)
+
+
+def _backing_source(table: str) -> str | None:
+    """Fully-qualified BigQuery table behind a logical name, if it is registered."""
+    entry = LOGICAL_TABLES.get(table)
+    return entry.primary_base_table if entry is not None else None
 
 
 def _missing_table_error(
     *, table: str, fmt: str, hint: str | None = None
 ) -> ToolResponse:
+    src = _backing_source(table)
+    if src is not None:
+        why = f"{table!r} is backed by `{src}`, but {_PIPELINE_NOTE} and has "
+        why += "not landed data for this window"
+    else:
+        why = (
+            f"{table!r} is not a registered logical table — known tables are "
+            f"{sorted(LOGICAL_TABLES)}"
+        )
     return make_error_response(
         code="DATA_UNAVAILABLE",
-        message=(
-            f"dataset table {table!r} not loaded yet — run bpd_sync_new_files first"
-            + (f". {hint}" if hint else "")
-        ),
-        details={"dataset": table},
+        message=why + (f". {hint}" if hint else ""),
+        details={"dataset": table, "backing_table": src},
         fmt=fmt,
     )
 
@@ -81,7 +136,12 @@ def _rows_to_dicts(cols: list[str], rows: list[tuple[Any, ...]]) -> list[dict[st
 
 
 def _as_pydate(v: Any) -> date | None:
-    """Normalize DuckDB date-ish values (date, datetime, ISO string) to date."""
+    """Normalize a driver date-ish value (date, datetime, ISO string) to `date`.
+
+    BigQuery returns `datetime.date` for DATE columns, but a DATETIME leaking in
+    from an un-ported `DATE +/- INTERVAL` would make `datetime > date + timedelta`
+    raise TypeError inside a bare `except` and silently degrade a tool.
+    """
     from datetime import datetime as _datetime
 
     if v is None:
@@ -102,8 +162,8 @@ def _effective_date_range(
     """MIN/MAX of `date_expr` as DATEs under `where_sql`. Best-effort (Patch #12)."""
     try:
         _, dr = warehouse.execute_sql(
-            f"SELECT MIN(TRY_CAST({date_expr} AS DATE)), "
-            f"MAX(TRY_CAST({date_expr} AS DATE)) "
+            f"SELECT MIN(SAFE_CAST({date_expr} AS DATE)), "
+            f"MAX(SAFE_CAST({date_expr} AS DATE)) "
             f"FROM {quote_ident(table)} {where_sql}"
         )
         if dr:
@@ -136,6 +196,67 @@ def _alternative_sales_source(
     }
 
 
+# --------------------------------------------------------------------------------------
+# Pre-flight gate for the two raw-SQL tools (replaces the DuckDB EXPLAIN step)
+# --------------------------------------------------------------------------------------
+
+
+def _human_bytes(n: int) -> str:
+    """Scan sizes span KB to hundreds of GB; a fixed GB format renders a 1 MB
+    threshold as the meaningless '0.00 GB'."""
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= scale:
+            return f"{n / scale:.2f} {unit}"
+    return f"{n} B"
+
+
+def _dry_run_gate(
+    warehouse: Warehouse, wrapped: str, *, fmt: str
+) -> tuple[int | None, ToolResponse | None]:
+    """Validate and price `wrapped` before executing it.
+
+    BigQuery rejects `EXPLAIN` outright (`Statement not supported:
+    ExplainStatement`), so the old planner gate could not simply be re-spelled.
+    A dry run is strictly better than the EXPLAIN it replaces: it keeps the
+    syntax/name validation AND returns `total_bytes_processed` at zero cost,
+    which matters far more on per-byte billing than it did on a local file.
+    Deleting the gate outright — the tempting move — would lose both halves.
+
+    Returns `(estimated_bytes, None)` when the query may proceed, or
+    `(estimated_bytes_or_None, error_response)` when it must not.
+    """
+    settings = get_settings()
+    try:
+        job = warehouse.dry_run(wrapped)
+    except Exception as e:
+        return None, make_error_response(
+            code="SQL_PLAN_FAILED",
+            message=f"dry run failed: {e}",
+            details={"sql": wrapped[:2000]},
+            fmt=fmt,
+        )
+    estimated = int(getattr(job, "total_bytes_processed", 0) or 0)
+    if estimated > int(settings.bpd_bq_warn_bytes):
+        log.warning(
+            "expensive_query",
+            estimated_bytes=estimated,
+            warn_bytes=int(settings.bpd_bq_warn_bytes),
+        )
+    limit = int(settings.bpd_bq_max_bytes_billed)
+    if estimated > limit:
+        return estimated, make_error_response(
+            code="QUERY_TOO_EXPENSIVE",
+            message=(
+                f"query would scan {_human_bytes(estimated)}, above the "
+                f"{_human_bytes(limit)} limit (BPD_BQ_MAX_BYTES_BILLED). Narrow "
+                "the date range or add a tcin/location filter."
+            ),
+            details={"estimated_bytes": estimated, "max_bytes_billed": limit},
+            fmt=fmt,
+        )
+    return estimated, None
+
+
 # ---------- bpd_run_sql ----------
 
 
@@ -158,16 +279,16 @@ async def run_sql(read_only_warehouse: Warehouse, params: RunSqlInput) -> ToolRe
             fmt=params.response_format,
         )
 
+    # `wrap_with_limit` runs BEFORE execute_sql, and the logical-table CTEs are
+    # injected INSIDE execute_sql, outermost — so they stay in scope for the
+    # whole statement, including inside `_bpd_sub`. Do not inject here.
     wrapped = wrap_with_limit(cleaned, params.limit)
-    # Step 1: EXPLAIN to ensure planner accepts it before we execute.
-    try:
-        read_only_warehouse.execute_sql(f"EXPLAIN {wrapped}")
-    except Exception as e:
-        return make_error_response(
-            code="SQL_PLAN_FAILED",
-            message=f"EXPLAIN failed: {e}",
-            fmt=params.response_format,
-        )
+
+    estimated_bytes, gate_error = _dry_run_gate(
+        read_only_warehouse, wrapped, fmt=params.response_format
+    )
+    if gate_error is not None:
+        return gate_error
 
     try:
         cols, rows = read_only_warehouse.execute_sql(wrapped)
@@ -182,7 +303,14 @@ async def run_sql(read_only_warehouse: Warehouse, params: RunSqlInput) -> ToolRe
         rows=dict_rows,
         columns=cols if cols else None,
         title="Query results",
-        extra={"row_count": len(dict_rows), "columns": cols, "limit": params.limit},
+        extra={
+            "row_count": len(dict_rows),
+            "columns": cols,
+            "limit": params.limit,
+            # Surfaced so cost is visible in the transcript, not on a bill weeks
+            # later.
+            "estimated_bytes_scanned": estimated_bytes,
+        },
         fmt=params.response_format,
     )
 
@@ -199,7 +327,25 @@ async def describe_schema(warehouse: Warehouse, params: DescribeSchemaInput) -> 
     if info["views"]:
         parts.append("**Views**: " + ", ".join(info["views"]))
     for name, body in info["tables"].items():
-        parts.append(f"\n#### `{name}` ({body['row_count']:,} rows)")
+        # row_count is the PRIMARY BASE TABLE's count, not a count through the
+        # logical table's body (a real count would run the whole registry body
+        # on every describe). For the reduced feeds those differ by a lot —
+        # orders_daily reports ~147k base rows against ~7.7k logical rows — so
+        # label the basis and print latest_state_note. Rendering the bare number
+        # as "rows" states a 19x overstatement as fact in the first tool a user
+        # runs. bq.describe()'s docstring requires a renderer to surface both.
+        basis = body.get("row_count_basis")
+        source = body.get("source")
+        if basis == "base_table":
+            suffix = f"~{body['row_count']:,} base rows"
+            if source:
+                suffix += f" in {source}"
+        else:
+            suffix = f"{body['row_count']:,} rows"
+        parts.append(f"\n#### `{name}` ({suffix})")
+        note = body.get("latest_state_note")
+        if note:
+            parts.append(f"> {note}")
         col_rows = [{"name": c["name"], "type": c["type"]} for c in body["columns"]]
         from ..formatting import render_markdown_table
 
@@ -256,9 +402,30 @@ async def get_sales_summary(
     if params.grain == "day":
         bucket = date_expr
     elif params.grain == "week":
-        bucket = f"date_trunc('week', {date_expr})"
+        # WEEK(MONDAY) is deliberate bug-for-bug parity with DuckDB, NOT a claim
+        # about Target's fiscal calendar. DuckDB's date_trunc('week', x) is
+        # Monday-anchored; BigQuery's bare WEEK defaults to SUNDAY. Verified:
+        # 2026-05-02 (Sat) -> 2026-04-27 under WEEK(MONDAY) and under DuckDB,
+        # 2026-04-26 under bare WEEK.
+        #
+        # Target's real fiscal week is Sunday-start / Saturday-end (verified:
+        # FISCAL_WEEK_BEGIN_D is Sunday in 100% of rows; every weekly sales /
+        # inventory / GM date is Saturday in 100% of rows). So this buckets a
+        # Saturday week-END back to the PRECEDING Monday. That oddity predates
+        # the BigQuery swap and is preserved on purpose: a data-layer swap must
+        # not move a single reported figure. FOLLOW-UP: decide WEEK(SUNDAY) on
+        # its own merits, separately.
+        #
+        # Do NOT harmonize this with the +/- 6 day anchoring in
+        # get_forecast_vs_actual — that is Target's fiscal week-END anchor and
+        # is a different concept.
+        #
+        # Note the ARGUMENT ORDER FLIP. Getting it wrong is not a compile error:
+        # DATE_TRUNC(x, WEEK) parses fine and silently shifts every bucket by a
+        # day, moving Saturday-anchored rows into a different week.
+        bucket = f"DATE_TRUNC({date_expr}, WEEK(MONDAY))"
     else:
-        bucket = f"date_trunc('month', {date_expr})"
+        bucket = f"DATE_TRUNC({date_expr}, MONTH)"
 
     where_clauses: list[str] = []
     if params.start_date:
@@ -293,7 +460,11 @@ async def get_sales_summary(
             f"SELECT {bucket} AS bucket, "
             f"SUM({quote_ident(units_col.name)}) AS total_units "
             f"FROM {quote_ident(table)} {where_sql} "
-            "GROUP BY bucket ORDER BY bucket"
+            # NULLS LAST: DuckDB sorts NULLs last in both directions, BigQuery
+            # puts them FIRST on ASC. The partial-bucket logic below no longer
+            # depends on row position, but the rendered table should still read
+            # the way it always has.
+            "GROUP BY bucket ORDER BY bucket NULLS LAST"
         )
     else:
         sql = (
@@ -301,7 +472,7 @@ async def get_sales_summary(
             f"SUM({quote_ident(units_col.name)}) AS total_units, "
             f"SUM({quote_ident(dollars_col.name)}) AS total_dollars "
             f"FROM {quote_ident(table)} {where_sql} "
-            "GROUP BY bucket ORDER BY bucket"
+            "GROUP BY bucket ORDER BY bucket NULLS LAST"
         )
 
     try:
@@ -336,14 +507,19 @@ async def get_sales_summary(
             nxt = (b.replace(day=28) + timedelta(days=4)).replace(day=1)
             return b, nxt - timedelta(days=1)
 
-        # A NULL-date bucket (rows whose date is NULL) sorts last in DuckDB —
-        # anchor the boundary flags on the first/last DATED buckets, and mark
-        # the NULL bucket's flag as None (unknowable) rather than False
-        # (review fix: the true latest bucket was never flagged).
+        # Anchor the boundary flags on the EARLIEST and LATEST dated buckets by
+        # VALUE, not by row position. Under DuckDB a NULL-date bucket sorted
+        # last, so scanning from either end happened to find a dated bucket;
+        # under BigQuery an ASC sort puts NULLs first, and position-based
+        # first/last would attach `partial_bucket=True` to the wrong end. Doing
+        # it by value makes the result independent of the engine's null
+        # ordering altogether. The NULL bucket's own flag stays None
+        # (unknowable) rather than False.
         for r in dict_rows:
             r["partial_bucket"] = False if _bounds(r["bucket"]) else None
-        first = next((r for r in dict_rows if _bounds(r["bucket"])), None)
-        last = next((r for r in reversed(dict_rows) if _bounds(r["bucket"])), None)
+        dated = [r for r in dict_rows if _bounds(r["bucket"]) is not None]
+        first = min(dated, key=lambda r: _bounds(r["bucket"])[0], default=None)
+        last = max(dated, key=lambda r: _bounds(r["bucket"])[1], default=None)
         if first is not None:
             fb = _bounds(first["bucket"])
             if eff_min > fb[0] + tol:
@@ -357,7 +533,7 @@ async def get_sales_summary(
         "table": table,
         "source_grain": source_grain,
         "date_col": date_col.name,
-        "date_col_type": date_col.duckdb_type,
+        "date_col_type": date_col.sql_type,
         "units_col": units_col.name,
         "dollars_col": dollars_col.name if dollars_col else None,
         "requested_start": str(params.start_date) if params.start_date else None,
@@ -499,13 +675,16 @@ async def get_inventory_snapshot(
     # newest date WITHIN the as_of window (review fix: anchoring to the
     # whole-table max made any historical as_of return zero rows), and pairs
     # staler than max_staleness_days can be excluded.
-    anchor_where = f"WHERE TRY_CAST({date_expr} AS DATE) <= DATE '{as_of.isoformat()}'"
+    anchor_where = f"WHERE SAFE_CAST({date_expr} AS DATE) <= DATE '{as_of.isoformat()}'"
     stale_filter = ""
     if params.max_staleness_days is not None:
+        # DATE_SUB, not `- INTERVAL n DAY`: the infix form returns DATETIME in
+        # BigQuery, so `dt >= <DATETIME>` would compare a DATE against a
+        # DATETIME and shift the boundary by the implicit midnight.
         stale_filter = (
-            f"AND dt >= (SELECT MAX(TRY_CAST({date_expr} AS DATE)) "
-            f"FROM {quote_ident(table)} {anchor_where}) "
-            f"- INTERVAL {int(params.max_staleness_days)} DAY"
+            f"AND dt >= DATE_SUB((SELECT MAX(SAFE_CAST({date_expr} AS DATE)) "
+            f"FROM {quote_ident(table)} {anchor_where}), "
+            f"INTERVAL {int(params.max_staleness_days)} DAY)"
         )
     sql = f"""
         WITH ranked AS (
@@ -522,7 +701,7 @@ async def get_inventory_snapshot(
         )
         SELECT tcin, location_id, dt AS as_of_date, on_hand
         FROM ranked WHERE rn = 1 {stale_filter}
-        ORDER BY tcin, location_id
+        ORDER BY tcin NULLS LAST, location_id NULLS LAST
         LIMIT {int(params.limit)}
     """
     try:
@@ -572,7 +751,7 @@ async def get_inventory_snapshot(
         extra={
             "table": table,
             "date_col": date_col.name,
-            "date_col_type": date_col.duckdb_type,
+            "date_col_type": date_col.sql_type,
             "on_hand_col": on_hand_col.name,
             "staleness": staleness,
         },
@@ -622,9 +801,9 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
     inv_join_kw = "LEFT JOIN"
     if params.max_staleness_days is not None:
         inv_stale_filter = (
-            f"AND inv_dt >= (SELECT MAX(TRY_CAST({inv_date_expr} AS DATE)) "
-            f"FROM {quote_ident(inv_table)}) "
-            f"- INTERVAL {int(params.max_staleness_days)} DAY"
+            f"AND inv_dt >= DATE_SUB((SELECT MAX(SAFE_CAST({inv_date_expr} AS DATE)) "
+            f"FROM {quote_ident(inv_table)}), "
+            f"INTERVAL {int(params.max_staleness_days)} DAY)"
         )
         inv_join_kw = "JOIN"
 
@@ -661,8 +840,22 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
                            ORDER BY {inv_date_expr} DESC
                        ) AS rn
                 FROM {quote_ident(inv_table)}
-            ) WHERE rn = 1 {inv_stale_filter}
+            ) AS ranked_inv WHERE rn = 1 {inv_stale_filter}
         )
+        -- The NULLIF / CASE division guards below are NOT removable
+        -- boilerplate. DuckDB evaluates 1/0 to inf; BigQuery raises
+        -- "division by zero" and FAILS THE WHOLE QUERY. They are outage
+        -- prevention now. Hold any new division to the same standard.
+        --
+        -- `* 1.0` promotes INT64 to FLOAT64. Every measure a role can currently
+        -- reach is INT64 or FLOAT64, so that holds; if a role ever resolves to
+        -- a NUMERIC column (e.g. dim_product.current_price) the product stays
+        -- NUMERIC and division rounds to 9 decimals instead.
+        --
+        -- FULL/LEFT JOIN ... USING (k) is kept verbatim: BigQuery coalesces the
+        -- USING keys exactly as DuckDB does, and qualified refs alongside USING
+        -- are legal. Rewriting USING -> ON would drop the coalescing and NULL
+        -- the spine on the unmatched side.
         SELECT s.tcin, s.location_id, s.units_sold, latest_inv.on_hand,
                CASE WHEN s.units_sold IS NULL OR s.units_sold = 0 THEN NULL
                     ELSE (latest_inv.on_hand * 1.0)
@@ -748,13 +941,20 @@ async def get_open_orders(
 ) -> ToolResponse:
     """Outstanding Target POs summed by SKU, derived from the latest-state order book.
 
-    orders_daily is a delta feed materialized as LATEST STATE: its natural key
-    (purchase_order_id, tcin, receiving_location_id) has no date column and each
-    load replaces matching keys, so the table always holds exactly one row —
-    the last-known state — per PO line. No snapshot filter or dedup is needed.
+    orders_daily is a delta feed that DuckDB materialized as LATEST STATE: each
+    load replaced matching rows on the natural key (purchase_order_id, tcin,
+    receiving_location_id), so the table held exactly one row — the last-known
+    state — per PO line. BigQuery keeps every snapshot instead, so the
+    latest-state reduction now lives in the logical table's own CTE body
+    (a QUALIFY ROW_NUMBER() ... ORDER BY snapshot_d DESC = 1 in
+    bq.LOGICAL_TABLES["orders_daily"]). This tool therefore still reads the
+    whole table with no snapshot filter of its own, and must NOT add one —
+    that would double-apply the reduction. Verified: the reduction is the
+    difference between ~498k open units and ~14.2M.
 
     There is no physical "open units" column (and `purchase_order_active_f` is
-    unpopulated at source), so open units are DERIVED per line as
+    98.1% Target's literal `""` placeholder — filtering on it would drop nearly
+    the entire order book), so open units are DERIVED per line as
     ordered - received - cancel_remaining, keeping lines where that is > 0
     (Patch #10).
     """
@@ -925,10 +1125,12 @@ async def get_upcoming_pos(
             continue
 
         # Normalize the snapshot column to a DATE regardless of physical type
-        # (VARCHAR ISO string, DATE, or TIMESTAMP). Wrapped so one table's bad
-        # date value degrades to skipped_tables instead of aborting the tool
-        # (review fix).
-        snap_day = f"CAST({snap.select_as_date()} AS DATE)"
+        # (STRING ISO date, DATE, or TIMESTAMP). SAFE_CAST, not CAST: several
+        # bpd_raw date columns ship as STRING holding Target's literal `""`
+        # placeholder, and a plain CAST is a hard 400 `Invalid date`. Wrapped so
+        # one table's bad date value degrades to skipped_tables instead of
+        # aborting the tool (review fix).
+        snap_day = f"SAFE_CAST({snap.select_as_date()} AS DATE)"
         try:
             _, mx = warehouse.execute_sql(
                 f"SELECT MAX({snap_day}) FROM {quote_ident(table)}"
@@ -949,17 +1151,34 @@ async def get_upcoming_pos(
         latest_iso = str(latest_snapshot)[:10]
 
         order_expr = order_d.select_as_date()
+        # CURRENT_DATE() is already UTC in BigQuery, matching the
+        # `SET TimeZone='UTC'` session pin the DuckDB warehouse used to set —
+        # so no timezone argument, deliberately.
+        #
+        # `current_date + INTERVAL '3 weeks'` was DuckDB-only twice over: the
+        # quoted plural interval literal does not parse in BigQuery, and the
+        # infix form would return DATETIME even if it did.
+        #
+        # The snapshot filter below is the ONLY thing keeping these two
+        # unpartitioned accumulating-snapshot tables affordable (po_plan_daily
+        # 5.86M rows over 118 business_d values, po_plan_biweekly 9.39M over
+        # 34). Never remove it.
         where = [
             f"{snap_day} = DATE '{latest_iso}'",
-            f"{order_expr} >= current_date",
-            f"{order_expr} < current_date + INTERVAL '{int(params.weeks_forward)} weeks'",
+            f"{order_expr} >= CURRENT_DATE()",
+            f"{order_expr} < DATE_ADD(CURRENT_DATE(), "
+            f"INTERVAL {int(params.weeks_forward)} WEEK)",
         ]
         tcin_filter = _in_list_sql(tcin_col.name, params.tcin_filter)
         if tcin_filter:
             where.append(tcin_filter)
         projections.append(
             f"SELECT {quote_ident(tcin_col.name)} AS tcin, "
-            f"date_trunc('week', {order_expr}) AS week, "
+            # WEEK(MONDAY): argument order flips vs DuckDB's
+            # date_trunc('week', x) AND the default anchor differs (bare WEEK
+            # is Sunday-anchored). Bug-for-bug parity with DuckDB is
+            # deliberate — see the long note in get_sales_summary.
+            f"DATE_TRUNC({order_expr}, WEEK(MONDAY)) AS week, "
             f"{quote_ident(qty.name)} AS qty, "
             f"'{table}' AS source "
             f"FROM {quote_ident(table)} "
@@ -990,8 +1209,9 @@ async def get_upcoming_pos(
         return make_error_response(
             code="DATA_UNAVAILABLE",
             message=(
-                f"po_plan table(s) {empty_tables} exist but contain no rows yet "
-                "— run bpd_sync_new_files (or the feed may have nothing planned)."
+                f"po_plan table(s) {empty_tables} are registered but returned no "
+                f"rows — {_PIPELINE_NOTE}, or the feed may have nothing planned "
+                "in the requested window."
             ),
             details={"empty_tables": empty_tables},
             fmt=fmt,
@@ -1002,7 +1222,8 @@ async def get_upcoming_pos(
         f"WITH planned AS ({union_sql}) "
         "SELECT tcin, week, source, SUM(qty) AS planned_units, "
         "COUNT(*) AS line_count "
-        "FROM planned GROUP BY tcin, week, source ORDER BY week, tcin, source"
+        "FROM planned GROUP BY tcin, week, source "
+        "ORDER BY week NULLS LAST, tcin NULLS LAST, source NULLS LAST"
     )
     try:
         out_cols, rows = warehouse.execute_sql(sql)
@@ -1079,10 +1300,21 @@ def _classify_forecast_drops(
         f"MIN({week_begin_day}) AS min_week, "
         f"MAX({week_begin_day}) AS max_week, "
         "COUNT(*) AS n_rows "
-        "FROM forecast_weekly GROUP BY 1 ORDER BY 1"
+        # NULLS LAST keeps a NULL-snapshot group at the END of the ascending
+        # list, where DuckDB put it — the caller slices `[-40:]` for "the
+        # newest 40 drops", so BigQuery's default NULLS-FIRST on ASC would
+        # quietly change which rows survive that slice.
+        "FROM forecast_weekly GROUP BY snap ORDER BY snap NULLS LAST"
     )
     out: list[dict[str, Any]] = []
-    for snap, horizon_weeks, min_week, max_week, n_rows in rows:
+    for raw_snap, horizon_weeks, raw_min_week, raw_max_week, n_rows in rows:
+        # Normalize before any Python date arithmetic: a DATETIME leaking in
+        # from a mis-ported expression would make `datetime > date + timedelta`
+        # raise TypeError, which the caller's bare `except` would swallow into
+        # a one-element error dict that still reads like a successful call.
+        snap = _as_pydate(raw_snap)
+        min_week = _as_pydate(raw_min_week)
+        max_week = _as_pydate(raw_max_week)
         # Live-validated against Target's real publication timing (Patch #12):
         #   retro weeklies publish EXACTLY 7 days after week-begin (the Sunday
         #   after the week ends) — snap > max_week + 6 means every covered
@@ -1167,21 +1399,33 @@ async def get_forecast_vs_actual(
     # sales_weekly uses Saturday-anchored sales_date. Canonicalize both sides
     # to the Saturday week-END; keep a week-BEGIN expr for the pre-week policy
     # and drop classification.
+    #
+    # The 6 and the direction are CORRECT and must not be touched. Verified:
+    # FISCAL_WEEK_BEGIN_D is a Sunday in 100% of 4,734,013 forecast rows, and
+    # every weekly sales / inventory / GM date is a Saturday in 100% of rows,
+    # so begin + 6 = the Saturday week-END. This is Target's fiscal week-end
+    # anchor and is a DIFFERENT CONCEPT from the WEEK(MONDAY) bucketing in
+    # get_sales_summary / get_upcoming_pos; harmonizing them would shift every
+    # forecast cell by a week.
+    #
+    # DATE_ADD/DATE_SUB, not `+/- INTERVAL 6 DAY`: the infix form returns
+    # DATETIME in BigQuery. The outer CAST the DuckDB version needed is gone
+    # because DATE_ADD of a DATE already returns a DATE.
     fc_name_lower = fc_date.name.lower()
     fc_is_week_begin = "begin" in fc_name_lower or "start" in fc_name_lower
     if fc_is_week_begin:
-        fc_week_end_expr = f"CAST({fc_date_expr} + INTERVAL 6 DAY AS DATE)"
+        fc_week_end_expr = f"DATE_ADD({fc_date_expr}, INTERVAL 6 DAY)"
         fc_week_begin_expr = fc_date_expr
     else:
         fc_week_end_expr = fc_date_expr
-        fc_week_begin_expr = f"CAST({fc_date_expr} - INTERVAL 6 DAY AS DATE)"
+        fc_week_begin_expr = f"DATE_SUB({fc_date_expr}, INTERVAL 6 DAY)"
 
     # ---- effective window: requested weeks_back clamped to actuals coverage.
     weeks_back = int(params.weeks_back)
     try:
         _, cov = warehouse.execute_sql(
-            f"SELECT MIN(CAST({act_date_expr} AS DATE)), "
-            f"MAX(CAST({act_date_expr} AS DATE)) FROM sales_weekly"
+            f"SELECT MIN(SAFE_CAST({act_date_expr} AS DATE)), "
+            f"MAX(SAFE_CAST({act_date_expr} AS DATE)) FROM sales_weekly"
         )
     except Exception as e:
         return make_error_response(
@@ -1193,7 +1437,10 @@ async def get_forecast_vs_actual(
     if act_min is None:
         return make_error_response(
             code="DATA_UNAVAILABLE",
-            message="sales_weekly exists but contains no rows yet — run bpd_sync_new_files.",
+            message=(
+                "sales_weekly returned no rows — it is backed by "
+                f"`{_backing_source('sales_weekly')}` and {_PIPELINE_NOTE}."
+            ),
             fmt=fmt,
         )
     from datetime import timedelta as _td
@@ -1243,13 +1490,17 @@ async def get_forecast_vs_actual(
         )
 
     # ---- per-side filters (tcin/location/effective window).
+    # These date predicates are load-bearing for COST as well as correctness:
+    # BigQuery pushes them down into the injected CTEs and partition pruning
+    # survives (sales_daily 13.3 MB -> 3.5 MB, inventory_daily 38.9 MB ->
+    # 3.2 MB). Dropping one as a "simplification" is a ~10x cost regression.
     fc_where: list[str] = [
-        f"CAST({fc_week_end_expr} AS DATE) >= DATE '{effective_start.isoformat()}'",
-        f"CAST({fc_week_end_expr} AS DATE) <= DATE '{effective_end.isoformat()}'",
+        f"SAFE_CAST({fc_week_end_expr} AS DATE) >= DATE '{effective_start.isoformat()}'",
+        f"SAFE_CAST({fc_week_end_expr} AS DATE) <= DATE '{effective_end.isoformat()}'",
     ]
     act_where: list[str] = [
-        f"CAST({act_date_expr} AS DATE) >= DATE '{effective_start.isoformat()}'",
-        f"CAST({act_date_expr} AS DATE) <= DATE '{effective_end.isoformat()}'",
+        f"SAFE_CAST({act_date_expr} AS DATE) >= DATE '{effective_start.isoformat()}'",
+        f"SAFE_CAST({act_date_expr} AS DATE) <= DATE '{effective_end.isoformat()}'",
     ]
     if params.tcin_filter:
         tcin_in = ",".join(str(int(v)) for v in params.tcin_filter)
@@ -1298,10 +1549,13 @@ async def get_forecast_vs_actual(
         cutoff_desc = f"fixed as_of_date {params.as_of_date.isoformat()}"
     elif policy == "pre_week":
         lead = int(params.pre_week_min_lead_days)
+        # DATE_SUB/DATE_ADD: this pair had NO outer CAST in the DuckDB version,
+        # so under BigQuery the infix form would yield a DATETIME and compare
+        # `snapshot_date <= DATETIME`, silently shifting the cutoff.
         if lead >= 0:
-            cutoff_sql = f"({fc_week_begin_expr} - INTERVAL {lead} DAY)"
+            cutoff_sql = f"DATE_SUB({fc_week_begin_expr}, INTERVAL {lead} DAY)"
         else:
-            cutoff_sql = f"({fc_week_begin_expr} + INTERVAL {-lead} DAY)"
+            cutoff_sql = f"DATE_ADD({fc_week_begin_expr}, INTERVAL {-lead} DAY)"
         cutoff_desc = (
             f"pre_week (snapshot at least {lead} day(s) before each week began)"
         )
@@ -1357,7 +1611,7 @@ async def get_forecast_vs_actual(
         WITH {fc_source_cte}
         fc_cells AS (
             SELECT {quote_ident(fc_tcin.name)} AS tcin, {fc_loc_proj}
-                   CAST({fc_week_end_expr} AS DATE) AS week_end_date,
+                   SAFE_CAST({fc_week_end_expr} AS DATE) AS week_end_date,
                    COALESCE(SUM({quote_ident(fc_units.name)}), 0) AS forecast_units
             FROM {fc_cells_from}
             {fc_cells_where}
@@ -1365,7 +1619,7 @@ async def get_forecast_vs_actual(
         ),
         act_cells AS (
             SELECT {quote_ident(act_tcin.name)} AS tcin, {act_loc_proj}
-                   CAST({act_date_expr} AS DATE) AS week_end_date,
+                   SAFE_CAST({act_date_expr} AS DATE) AS week_end_date,
                    COALESCE(SUM({quote_ident(act_units.name)}), 0) AS actual_units
             FROM sales_weekly
             WHERE {" AND ".join(act_where)}
@@ -1383,38 +1637,88 @@ async def get_forecast_vs_actual(
 
     # Output grouping per the requested aggregate.
     if params.aggregate == "by_sku":
-        group_key = "tcin"
+        group_cols = ["tcin"]
     elif params.aggregate == "by_sku_location_week":
-        group_key = "tcin, location_id, week_end_date"
+        group_cols = ["tcin", "location_id", "week_end_date"]
     else:  # by_sku_week
-        group_key = "tcin, week_end_date"
+        group_cols = ["tcin", "week_end_date"]
+    group_key = ", ".join(group_cols)
 
     coverage_filter = "" if params.include_unmatched else "WHERE coverage = 'matched'"
-    sql = f"""{cte_prefix}
-        SELECT {group_key}, coverage,
-               SUM(forecast_units) AS forecast_units,
-               SUM(actual_units) AS actual_units,
-               COUNT(*) AS cell_count,
-               SUM(actual_units) - SUM(forecast_units) AS variance_units,
-               CASE WHEN COALESCE(SUM(forecast_units), 0) = 0 THEN NULL
-                    ELSE (SUM(actual_units) - SUM(forecast_units)) * 100.0
-                         / SUM(forecast_units)
-               END AS variance_pct
-        FROM all_cells
-        {coverage_filter}
-        GROUP BY {group_key}, coverage
-        ORDER BY {group_key}, coverage
-        LIMIT 2000
-    """
-    coverage_sql = f"""{cte_prefix}
-        SELECT coverage, COUNT(*) AS cells,
-               SUM(forecast_units) AS forecast_units,
-               SUM(actual_units) AS actual_units
-        FROM all_cells GROUP BY coverage
+
+    # ------------------------------------------------------------------
+    # ONE JOB, NOT TWO. The result rollup and the coverage rollup both used to
+    # be executed with their own copy of `cte_prefix`. Under BigQuery that is
+    # two full scans: the forecast_weekly CTE alone reads 151.5 MB and its
+    # QUALIFY blocks predicate pushdown, so pruning does not help — ~350 MB per
+    # tool call. They are UNION ALL'd onto one statement with a `_kind`
+    # discriminator and split back apart in Python below, which halves it.
+    #
+    # The two branches must be union-compatible, so the coverage branch pads
+    # the grouping columns and the variance columns with typed NULLs. The
+    # response's row/column shape is unchanged: `_kind` and the coverage rows
+    # are stripped before anything is returned.
+    # ------------------------------------------------------------------
+    _NULL_FOR = {
+        "tcin": "CAST(NULL AS INT64)",
+        "location_id": "CAST(NULL AS INT64)",
+        "week_end_date": "CAST(NULL AS DATE)",
+    }
+    result_cols = [
+        *group_cols,
+        "coverage",
+        "forecast_units",
+        "actual_units",
+        "cell_count",
+        "variance_units",
+        "variance_pct",
+    ]
+    cov_pad = ", ".join(f"{_NULL_FOR[c]} AS {c}" for c in group_cols)
+    # Ordering: result rows first (so the caller's slice of `rows` keeps its
+    # historical order), then coverage rows. Within the result rows, the
+    # original `ORDER BY {group_key}, coverage` — with NULLS LAST, because
+    # BigQuery puts NULLs first on ASC where DuckDB put them last.
+    order_asc = ", ".join(f"{c} NULLS LAST" for c in group_cols)
+    sql = f"""{cte_prefix},
+        res AS (
+            SELECT {group_key}, coverage,
+                   SUM(forecast_units) AS forecast_units,
+                   SUM(actual_units) AS actual_units,
+                   COUNT(*) AS cell_count,
+                   SUM(actual_units) - SUM(forecast_units) AS variance_units,
+                   -- The COALESCE(...)=0 guard is not boilerplate: DuckDB
+                   -- evaluates 1/0 to inf, BigQuery raises "division by zero"
+                   -- and fails the whole query.
+                   CASE WHEN COALESCE(SUM(forecast_units), 0) = 0 THEN NULL
+                        ELSE (SUM(actual_units) - SUM(forecast_units)) * 100.0
+                             / SUM(forecast_units)
+                   END AS variance_pct
+            FROM all_cells
+            {coverage_filter}
+            GROUP BY {group_key}, coverage
+            ORDER BY {order_asc}, coverage NULLS LAST
+            LIMIT 2000
+        ),
+        cov AS (
+            SELECT coverage, COUNT(*) AS cells,
+                   SUM(forecast_units) AS forecast_units,
+                   SUM(actual_units) AS actual_units
+            FROM all_cells GROUP BY coverage
+        )
+        SELECT 'result' AS _kind, {group_key}, coverage,
+               forecast_units, actual_units, cell_count,
+               variance_units, variance_pct
+        FROM res
+        UNION ALL
+        SELECT 'coverage' AS _kind, {cov_pad}, coverage,
+               forecast_units, actual_units, cells AS cell_count,
+               CAST(NULL AS FLOAT64) AS variance_units,
+               CAST(NULL AS FLOAT64) AS variance_pct
+        FROM cov
+        ORDER BY _kind DESC, {order_asc}, coverage NULLS LAST
     """
     try:
-        out_cols, rows = warehouse.execute_sql(sql)
-        _, cov_rows = warehouse.execute_sql(coverage_sql)
+        all_cols, all_rows = warehouse.execute_sql(sql)
     except Exception as e:
         return make_error_response(
             code="SQL_EXECUTION_FAILED",
@@ -1422,9 +1726,25 @@ async def get_forecast_vs_actual(
             details={"sql": sql},
             fmt=fmt,
         )
+
+    kind_ix = all_cols.index("_kind")
+    out_cols = [c for c in all_cols if c != "_kind"]
+    assert out_cols == result_cols, (out_cols, result_cols)
+    cov_ix = {c: all_cols.index(c) for c in ("coverage", "forecast_units",
+                                             "actual_units", "cell_count")}
+    rows = [
+        tuple(v for i, v in enumerate(r) if i != kind_ix)
+        for r in all_rows
+        if r[kind_ix] == "result"
+    ]
     coverage_summary = {
-        r[0]: {"cells": r[1], "forecast_units": r[2], "actual_units": r[3]}
-        for r in cov_rows
+        r[cov_ix["coverage"]]: {
+            "cells": r[cov_ix["cell_count"]],
+            "forecast_units": r[cov_ix["forecast_units"]],
+            "actual_units": r[cov_ix["actual_units"]],
+        }
+        for r in all_rows
+        if r[kind_ix] == "coverage"
     }
 
     # Best-effort honesty metadata: drop classification + snapshot lag.
@@ -1434,23 +1754,32 @@ async def get_forecast_vs_actual(
     snapshot_lag: dict[str, Any] | None = None
     snapshot_lag_error: str | None = None
     if fc_snap is not None:
-        snap_day = f"CAST({fc_snap.select_as_date()} AS DATE)"
-        week_begin_day = f"CAST({fc_week_begin_expr} AS DATE)"
+        snap_day = f"SAFE_CAST({fc_snap.select_as_date()} AS DATE)"
+        week_begin_day = f"SAFE_CAST({fc_week_begin_expr} AS DATE)"
         try:
             forecast_drops = _classify_forecast_drops(warehouse, week_begin_day, snap_day)
         except Exception as e:  # metadata must never break the tool
             forecast_drops = [{"error": f"drop classification failed: {e}"}]
         try:
+            # DATE_DIFF, not `DATE - DATE`: BigQuery's infix subtraction
+            # returns an INTERVAL, which arrives in Python as a
+            # `relativedelta` and is not JSON-serializable — it would blow up
+            # in the response encoder, not here.
+            #
+            # COUNTIF, not `COUNT(*) FILTER (WHERE ...)`: the FILTER clause is
+            # a hard 400 syntax error in BigQuery. It sits inside the
+            # try/except below, which degrades to `extra.snapshot_lag_error`
+            # with ok=True — so a smoke test would never have caught it.
             _, lag = warehouse.execute_sql(
-                f"SELECT MIN({week_begin_day} - {snap_day}), "
-                f"MAX({week_begin_day} - {snap_day}), "
-                f"COUNT(*) FILTER (WHERE {snap_day} > {week_begin_day}) "
+                f"SELECT MIN(DATE_DIFF({week_begin_day}, {snap_day}, DAY)), "
+                f"MAX(DATE_DIFF({week_begin_day}, {snap_day}, DAY)), "
+                f"COUNTIF({snap_day} > {week_begin_day}) "
                 "FROM forecast_weekly"
             )
             if lag and lag[0][0] is not None:
                 snapshot_lag = {
-                    "min_lead_days": _interval_days(lag[0][0]),
-                    "max_lead_days": _interval_days(lag[0][1]),
+                    "min_lead_days": lag[0][0],
+                    "max_lead_days": lag[0][1],
                     "post_hoc_rows": lag[0][2],
                 }
         except Exception as e:
@@ -1487,6 +1816,14 @@ async def get_forecast_vs_actual(
     if cutoff_sql is not None:
         # Applies to ANY historical cutoff (pre_week or as_of_date) — the
         # thinness comes from retention, not from the policy chosen.
+        #
+        # FOLLOW-UP (out of scope for the data-layer swap, unverified): this
+        # text describes DuckDB's per-key ingest retention, which no longer
+        # exists. The BigQuery source is SCD2 with valid_from/valid_to, so
+        # historical snapshots may in fact be recoverable and `pre_week`
+        # backtesting may be genuinely possible. The caveat is therefore now
+        # wrong IN THE USER'S FAVOUR — conservative, not misleading — so it is
+        # left exactly as it was rather than being rewritten on a guess.
         extra["snapshot_retention_caveat"] = (
             "per-key ingest retention keeps only the NEWEST drop's row for "
             "each (tcin, location, week) — once a later forward or "
@@ -1514,15 +1851,6 @@ async def get_forecast_vs_actual(
         extra=extra,
         fmt=fmt,
     )
-
-
-def _interval_days(v: Any) -> Any:
-    """DuckDB DATE-DATE may come back as int days or timedelta; normalize."""
-    from datetime import timedelta as _td
-
-    if isinstance(v, _td):
-        return v.days
-    return v
 
 
 # --------------------------------------------------------------------------------------
@@ -1586,14 +1914,9 @@ async def export_query_to_csv(
         )
 
     wrapped = wrap_with_limit(cleaned, int(params.max_rows))
-    try:
-        read_only_warehouse.execute_sql(f"EXPLAIN {wrapped}")
-    except Exception as e:
-        return make_error_response(
-            code="SQL_PLAN_FAILED",
-            message=f"EXPLAIN failed: {e}",
-            fmt=fmt,
-        )
+    estimated_bytes, gate_error = _dry_run_gate(read_only_warehouse, wrapped, fmt=fmt)
+    if gate_error is not None:
+        return gate_error
     try:
         out_cols, rows = read_only_warehouse.execute_sql(wrapped)
     except Exception as e:
@@ -1623,6 +1946,7 @@ async def export_query_to_csv(
         "rows_written": len(rows),
         "columns": out_cols,
         "bytes_written": bytes_written,
+        "estimated_bytes_scanned": estimated_bytes,
     }
     return make_kv_response(
         data=payload,

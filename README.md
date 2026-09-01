@@ -1,14 +1,32 @@
 # bpd-mcp — Target BPD MCP Server
 
-A local stdio MCP server that lets Claude work with Target's **Business Partner Data**
-(daily/weekly sales, inventory, item attributes, location attributes, gross margin)
-delivered through the vendor's **Kiteworks** drop folder. Files are downloaded over
-the Kiteworks REST API, parsed, and loaded into a local **DuckDB** warehouse that
-Claude can query with SQL or with the prebuilt analytics tools below.
+A stdio MCP server that lets Claude analyze Target's **Business Partner Data**
+(daily/weekly sales, inventory, orders, PO plans, DFE forecast, item and
+location attributes, gross margin) out of **BigQuery**.
 
-The server is written in Python (3.11+). Framework: **FastMCP**. Data layer:
-DuckDB + Polars. Auth: OAuth2 password grant + refresh token against
-`{base_url}/oauth/token`.
+The server is a **read-only analytics layer**. It does not download, parse or
+store anything. An independent Kiteworks → GCS → BigQuery pipeline lands the
+BPD file set (834 files, all 18 patterns) into `biom-reporting-s26` daily at
+roughly **06:47 UTC**; this server reads what that pipeline produced.
+
+Python 3.11+. Framework: **FastMCP**. Data layer: `google-cloud-bigquery`
+against a service account holding **`dataViewer` + `jobUser`** — it can read
+everything and write nothing.
+
+## Why it is not DuckDB any more
+
+The previous version maintained a local DuckDB warehouse at
+`~/.bpd-mcp/bpd.duckdb`. DuckDB permits **exactly one process** to hold a
+database file: while a read-write connection is open, a second process cannot
+open the file at all — not even with `read_only=True`. Claude Desktop now
+spawns a **second copy of this server** for Cowork/Code sessions, and that copy
+crashed on the lock. That was the reported symptom: *the server does not start.*
+
+BigQuery is a network service, so N server processes hold N independent HTTPS
+clients and never contend. Removing the lock **is** the point of the change. As
+a direct consequence, startup takes no file lock, writes no state file, and
+performs no snapshot cleanup — see the module docstring of `server.py`, which
+enumerates each single-process assumption that was removed and why.
 
 ---
 
@@ -19,21 +37,22 @@ DuckDB + Polars. Auth: OAuth2 password grant + refresh token against
 pip install uv               # if you don't have it
 uv sync                      # creates .venv and installs everything
 
-# 1. Configure
-cp .env.example .env
-$EDITOR .env                 # set KITEWORKS_USERNAME / KITEWORKS_PASSWORD / BPD_VENDOR_ID
+# 1. Point at BigQuery. Either works:
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/claude-code-bq-readonly.json
+#   ...or, for environments that can only pass strings:
+export GCP_SA_KEY_B64="$(base64 -w0 /path/to/claude-code-bq-readonly.json)"
 
-# 2. Verify the install is healthy (one command; no MCP needed).
+# 2. Verify the install is healthy (one command; no MCP client needed).
 ./scripts/verify_install.sh
 
-# 3. One-time interactive auth bootstrap (saves a refresh token to ~/.bpd-mcp/tokens.json @ 0600)
-uv run bpd-bootstrap
-
-# 4. Run the MCP server (stdio transport — for Claude Desktop / Claude Code)
+# 3. Run the MCP server (stdio transport — for Claude Desktop / Claude Code)
 uv run bpd-mcp
 ```
 
-Once running, point Claude Desktop at it:
+There is no auth bootstrap step and no first sync. The data is already there —
+ask Claude to "describe the schema" and start querying.
+
+Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -42,8 +61,9 @@ Once running, point Claude Desktop at it:
       "command": "uv",
       "args": ["--directory", "/absolute/path/to/bpd-mcp", "run", "bpd-mcp"],
       "env": {
-        "KITEWORKS_USERNAME": "you@biom.com",
-        "KITEWORKS_PASSWORD": "...",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/absolute/path/to/claude-code-bq-readonly.json",
+        "BPD_BQ_PROJECT": "biom-reporting-s26",
+        "BPD_BQ_LOCATION": "us-central1",
         "BPD_VENDOR_ID": "139440",
         "BPD_VENDOR_TIER": "BV"
       }
@@ -52,490 +72,368 @@ Once running, point Claude Desktop at it:
 }
 ```
 
-Then in Claude: ask "sync new files" → "describe the schema" → "what were
-trailing-4-week unit sales?". The tool reference is below.
+If your launcher can only pass strings, swap `GOOGLE_APPLICATION_CREDENTIALS`
+for `"GCP_SA_KEY_B64": "<base64 of the service-account JSON>"`. The server
+materializes it to `~/.config/gcloud/biom-bq-sa.json` at mode `0600` and never
+logs or returns the key bytes.
+
+**The same config may be used by more than one Claude surface at the same
+time.** Running Claude Desktop and Claude Code against this server
+concurrently is supported and is the reason the data layer changed.
 
 ---
 
 ## Configuration
 
-Configuration is read from environment variables and (optionally) a `.env` file at
-the project root. See `.env.example` for the full list. The non-obvious knobs:
+Read from environment variables and (optionally) a `.env` file at the project
+root. See `.env.example`.
 
-| Var                          | Default                             | Notes                                                                 |
-| ---------------------------- | ----------------------------------- | --------------------------------------------------------------------- |
-| `KITEWORKS_BASE_URL`         | `https://securesharek.target.com`   | Host pinned at the HTTP layer — only this host is allowed.            |
-| `KITEWORKS_CLIENT_ID`        | (Target's shared ID)                | Pre-filled with the credentials from the BPD setup PDF.               |
-| `KITEWORKS_CLIENT_SECRET`    | (Target's shared secret)            | Pre-filled. If Target rotates these, update `.env`.                   |
-| `KITEWORKS_OAUTH_SCOPE`      | `*/*/*`                             | If Kiteworks rejects, the error message is surfaced verbatim — try `folders/* files/* search/* users/me`. |
-| `KITEWORKS_API_VERSION`      | `15`                                | Sent as `X-Kiteworks-Version` on every REST call.                     |
-| `BPD_VENDOR_ID`              | `139440`                            | The Kiteworks folder name (Biom's BPID).                              |
-| `BPD_VENDOR_TIER`            | `BV`                                | `BV` Basic, `BR` Brand, `CC` Category Captain.                        |
-| `BPD_DATA_DIR`               | `~/.bpd-mcp`                        | Root for raw zips, the DuckDB warehouse, tokens, and logs.            |
-| `BPD_AUTO_SYNC_ON_START`     | `false`                             | If true, sync new files when the MCP starts.                          |
-| `BPD_MAX_PARALLEL_DOWNLOADS` | `4`                                 | Concurrency cap for the sync worker.                                  |
-| `BPD_AUTO_BACKUP`            | `true`                              | Timestamped warehouse backup before every sync/reingest (Patch #9).   |
-| `BPD_BACKUP_KEEP`            | `5`                                 | How many backups to retain in `backups/` (oldest pruned).             |
+| Var                         | Default              | Notes                                                                                     |
+| --------------------------- | -------------------- | ----------------------------------------------------------------------------------------- |
+| `GOOGLE_APPLICATION_CREDENTIALS` | —               | Path to the service-account JSON. Read straight from `os.environ`, never a settings field. |
+| `GCP_SA_KEY_B64`            | —                    | Base64 of that JSON, for launchers that only pass strings. Materialized at `0600`.        |
+| `BPD_BQ_PROJECT`            | `biom-reporting-s26` | GCP project.                                                                              |
+| `BPD_BQ_LOCATION`           | `us-central1`        | **Required.** An empty location makes `INFORMATION_SCHEMA` silently return zero rows instead of erroring. Validated non-empty. |
+| `BPD_BQ_MAX_BYTES_BILLED`   | 20 GiB               | Hard `maximum_bytes_billed` on every job.                                                 |
+| `BPD_BQ_WARN_BYTES`         | 1 GiB                | The pre-flight dry-run gate logs a warning above this.                                    |
+| `BPD_BQ_DATERANGE_TTL_S`    | `900`                | TTL for the combined date-range sweep (~527 MB per refresh — the one metadata query that costs money). |
+| `BPD_BQ_ROWCOUNT_TTL_S`     | `300`                | TTL for `__TABLES__` row counts (0 bytes).                                                |
+| `BPD_EXPORT_MAX_ROWS`       | `200000`             | Cap for `bpd_export_query_to_csv`. Lowered from 1,000,000: on per-byte billing an unguarded export is a money question, not a disk question. |
+| `BPD_VENDOR_ID`             | `139440`             | Biom's BPID. Identity only.                                                               |
+| `BPD_VENDOR_TIER`           | `BV`                 | `BV` Basic, `BR` Brand, `CC` Category Captain.                                            |
+| `BPD_DATA_DIR`              | `~/.bpd-mcp`         | Root for **outputs only**.                                                                |
+| `BPD_LOG_LEVEL`             | `INFO`               |                                                                                           |
 
-The data dir layout is:
+The data dir now holds outputs, not data:
 
 ```
 ~/.bpd-mcp/
-├── raw/                  # downloaded .zip files (LRU-capped at 5 GB; un-ingested zips are never evicted)
-├── extracted/            # transient unzip workspace
-├── backups/              # timestamped bpd-<stamp>-<reason>.duckdb copies (Patch #9)
-├── bpd.duckdb            # the warehouse
-├── bpd.duckdb.ro         # read-only snapshot for `bpd_run_sql` (auto-managed)
-├── tokens.json           # 0600 perms enforced
+├── exports/              # bpd_export_query_to_csv writes here
 └── logs/bpd-mcp.log      # rotating JSON log (10 MB × 5)
 ```
+
+`raw/`, `extracted/`, `backups/`, `bpd.duckdb`, `bpd.duckdb.ro` and
+`tokens.json` are all gone. Nothing reads them. Deleting them by hand is safe
+once every old server process has exited.
+
+---
+
+## Data model: logical tables
+
+The analytics tools reference **15 logical tables** by bare name. They are not
+BigQuery views — the service account cannot create views — so the server
+injects each referenced one as a CTE immediately before the query runs. From a
+caller's point of view (including `bpd_run_sql`) they behave exactly like
+tables:
+
+```sql
+SELECT tcin, SUM(sale_quantity) AS units
+FROM sales_daily
+WHERE sales_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 28 DAY)
+GROUP BY tcin ORDER BY units DESC
+```
+
+| Logical table           | BigQuery source                                             | Note |
+| ----------------------- | ----------------------------------------------------------- | ---- |
+| `sales_daily`           | `biom_canvas.fct_target_sales` (`data_grain='daily'`)        | |
+| `sales_weekly`          | `fct_target_sales` weekly/history ∪ `bpd_raw.weekly_sales_tcin_loc` | union covers the canvas weekly gap; boundary is computed, so it self-heals |
+| `sales_weekly_item`     | `bpd_raw.weekly_sales_tcin`                                  | item-grain rollup, feed stopped 2026-05-16 |
+| `inventory_daily`       | `biom_canvas.fct_target_inventory` (`daily`)                 | `inventory_date` aliased to `business_d` |
+| `inventory_weekly`      | `fct_target_inventory` (`history_weekly`) ∪ `bpd_raw.weekly_inv_tcin_loc` | |
+| `inventory_weekly_item` | `bpd_raw.weekly_inv_tcin`                                    | feed stopped 2026-05-16 |
+| `gross_margin`          | `biom_canvas.fct_target_gross_margin` ∪ `bpd_raw.history_gm_weekly` | `fiscal_week_end_date` aliased to `fiscal_week_end_d` |
+| `gross_margin_item`     | `bpd_raw.weekly_gm_tcin`                                     | feed stopped 2026-05-16 |
+| `orders_daily`          | `bpd_raw.daily_order_tcin_loc`                               | **de-duplicated** to the newest `snapshot_d` per PO line |
+| `po_plan_daily`         | `bpd_raw.dly_po_plan_tcin`                                   | accumulating snapshot, **not** de-duplicated here |
+| `po_plan_biweekly`      | `bpd_raw.bi_weekly_po_planning_item_dc`                      | accumulating snapshot, **not** de-duplicated here |
+| `forecast_weekly`       | `bpd_raw.dfe_wkly_item_loc_forecast`                         | **de-duplicated** to the newest `last_update_d` per (tcin, location, week) |
+| `item_attr`             | `bpd_raw.weekly_item_mta`                                    | EAV form |
+| `item_attr_extended`    | `bpd_raw.wkly_tcin_item`                                     | |
+| `location_attr`         | `bpd_raw.wkly_loc_attr_v0_0`                                 | |
+
+Two of these carry a **latest-state reduction** that is the difference between
+right and catastrophically wrong: `orders_daily` unreduced reports 14.2 M open
+units instead of ~0.5 M (28×), and `forecast_weekly` unreduced reports 6.9 M
+forecast units instead of ~1.06 M (6.5×). `bpd_describe_schema` surfaces the
+reduction per table as `latest_state_note`. The two `po_plan_*` tables are
+accumulating snapshots **by design** and are reduced by `bpd_get_upcoming_pos`
+instead, which filters each source to its own `MAX(business_d)` — never add a
+second reduction in the registry, the two would fight silently.
+
+`row_count` in `bpd_describe_schema` / `bpd_list_datasets` is the **base
+table's** count from `__TABLES__` (0 bytes), so it overstates every filtered or
+de-duplicated table. Counting through the CTEs instead would cost ~333 MB per
+call. `row_count_basis: "base_table"` marks it.
+
+### Adding a table (the extension seam)
+
+Adding a source — Shopify, Loop, anything non-BPD — is a **config change**:
+append one `LogicalTable` to `bq.LOGICAL_TABLES`, then add the matching
+`COLUMN_ROLES`, `DATASET_KINDS` and `FEED_KINDS` entries and extend
+`schemas.KnownDataset`. CTE injection, `describe()`, `table_exists`,
+`resolve_column`, `detect_date_column`, `bpd_list_datasets`, the health checks
+and the drift guards all read that one dict. The full checklist is a comment at
+the top of `src/bpd_mcp/bq.py`.
 
 ---
 
 ## Tool reference
 
-Every tool name is prefixed `bpd_` to avoid collision with other MCPs. Every tool
-accepts a `response_format` of `markdown` (default) or `json`.
+14 tools, all prefixed `bpd_`. Every tool accepts `response_format` of
+`markdown` (default) or `json`.
 
-### Discovery & files
+### Catalog & query
 
-| Tool                       | Purpose                                                              |
-| -------------------------- | -------------------------------------------------------------------- |
-| `bpd_list_top_folders`     | List Kiteworks top-level folders. Use once to find your BPID folder. |
-| `bpd_list_folder_contents` | Paginated children of a folder. `name_contains` is a case-insensitive substring filter applied client-side (Patch #12 — Kiteworks' `name` param is exact-match and returned 0 rows for every substring query); `extensions` passes through. |
-| `bpd_get_file_metadata`    | Size, fingerprint, dates, parent.                                    |
-| `bpd_search_files`         | Wraps `/rest/query` for ad-hoc filename / content search.            |
+| Tool                         | Purpose |
+| ---------------------------- | ------- |
+| `bpd_list_datasets`          | Per logical table: row count, `feed_kind`, `status` (active/retired), snapshot range (`min/max_date` = freshness) AND content range (`content_max_date` = how far `order_d` / fiscal weeks / ETAs reach), plus how many source files the pipeline has landed and when. |
+| `bpd_describe_schema`        | Every logical table, its columns and types, the base table behind it, and any latest-state reduction. Also the MCP resource `bpd://schema`. |
+| `bpd_run_sql`                | Arbitrary BigQuery Standard SQL. Reference logical tables by bare name. Read-only at the credential layer AND at the validator. Dry-run first for cost, then wrapped in `LIMIT N`; `extra.estimated_bytes_scanned` is echoed on every response. |
+| `bpd_export_query_to_csv`    | Same query path, written to `~/.bpd-mcp/exports/<filename>`. Row cap from `BPD_EXPORT_MAX_ROWS`. |
 
-### Sync
+### Analytics
 
-| Tool                  | Purpose                                                                       |
-| --------------------- | ----------------------------------------------------------------------------- |
-| `bpd_sync_new_files`  | Discover new BPD zips → download → parse → load. Idempotent. Supports `dry_run`. Takes a pre-sync backup. |
-| `bpd_refresh_dataset` | Re-load a single dataset. `full=true` is **destructive** (see [Backups & recovery](#backups-destructive-op-guardrails--recovery-patch-9)): requires `confirm_destructive` with the exact phrase, takes a mandatory pre-delete backup, and refuses outright when it would lose history Kiteworks can't re-serve. |
-| `bpd_reingest_local`  | **Recovery tool (Patch #9).** Load zips already in `raw/` through the normal pipeline — no downloads, nothing deleted. Skips already-loaded files; supports `dry_run` and a `datasets` filter. Idempotent. |
-| `bpd_list_datasets`   | Per dataset: row count, `feed_kind` (delta vs snapshot semantics), `status` (active/retired), snapshot range (`min/max_date` = freshness) AND content range (`content_max_date` = how far order_d / fiscal weeks / ETAs reach — months past freshness for forward-looking feeds), file count, last-loaded time. |
-
-### Query
-
-| Tool                         | Purpose                                                                     |
-| ---------------------------- | --------------------------------------------------------------------------- |
-| `bpd_run_sql`                | Arbitrary DuckDB SQL. **Read-only enforced at the engine layer** (separate `read_only=True` connection on a snapshot copy of the DB) AND at the validator (multi-statement and DDL/DML tokens rejected, comment-cloaked included). Wraps the result in `LIMIT N`. |
-| `bpd_describe_schema`        | All tables, columns, types. Also exposed as MCP resource `bpd://schema`.    |
-| `bpd_get_sales_summary`      | Sum units (and dollars when available) by `day`/`week`/`month` with optional filters. Echoes the effective date range covered, flags partial boundary buckets, and reports the other sales table's coverage (`extra.alternative_source`). |
-| `bpd_get_top_skus`           | Top-N SKUs by units or dollars over a date range. A no-arg call spans all loaded history — the title + `extra` now say exactly what period that is. |
-| `bpd_get_inventory_snapshot` | Latest known on-hand per TCIN × location at or before a date. `extra.staleness` counts pairs carried forward across feed gaps (>7 days older than the table max); `max_staleness_days` excludes them. |
-| `bpd_get_sell_through`       | Joins sales + latest inventory to compute weeks-of-supply + sell-through. `max_staleness_days` drops inventory pairs whose latest snapshot is stale — WOS from 10-week-old on-hand is misleading. |
-
-### S&OP analytics (May 2026 patch)
-
-| Tool                          | Purpose                                                                                  |
-| ----------------------------- | ---------------------------------------------------------------------------------------- |
-| `bpd_get_open_orders`         | Outstanding Target POs summed by SKU. `orders_daily` is a latest-state order book (one row per PO line — the natural key has no date); open units are **derived** as `revised_order_q − item_received_q − cancel_remaining_order_q`, keeping lines > 0. `as_of_date` filters by PO **creation** date (not time travel). |
-| `bpd_get_upcoming_pos`        | `po_plan_daily` + `po_plan_biweekly`, each filtered to its **latest `business_d` snapshot** (the tables accumulate a full plan per day — unfiltered sums multiply by snapshot count). Windows on `order_d`, grouped by (tcin, week, **source**) so the two plans never blend; per-source totals in `extra`. |
-| `bpd_get_forecast_vs_actual`  | Joins Target's DFE `forecast_weekly` against `sales_weekly` on a coverage-honest (tcin, location, week) spine — only **matched** cells produce variance; unmatched volume is counted in `extra.coverage`, never zero-filled (`include_unmatched=true` returns those rows with the missing side NULL). `variance_pct` is a true percent (0–100 scale). `weeks_back` clamps to actuals coverage with the effective range echoed. `snapshot_policy`: `latest_available` (default) or `pre_week`; `extra.forecast_drops` classifies each forecast snapshot as `weekly_retrospective` vs `forward_horizon` (never anchor on `max(last_update_d)` — it's usually a tiny retrospective file). |
+| Tool                         | Purpose |
+| ---------------------------- | ------- |
+| `bpd_get_sales_summary`      | Units (and dollars when available) by `day`/`week`/`month` with optional filters. Echoes the effective date range, flags partial boundary buckets, and reports the other sales table's coverage in `extra.alternative_source`. |
+| `bpd_get_top_skus`           | Top-N SKUs by units or dollars over a date range. A no-arg call spans all history; the title and `extra` say exactly what period that is. |
+| `bpd_get_inventory_snapshot` | Latest known on-hand per TCIN × location at or before a date. `extra.staleness` counts pairs carried forward across feed gaps; `max_staleness_days` excludes them. |
+| `bpd_get_sell_through`       | Sales + latest inventory → weeks-of-supply and sell-through. `max_staleness_days` drops stale inventory pairs — WOS from 10-week-old on-hand is misleading. |
+| `bpd_get_open_orders`        | Outstanding Target POs summed by SKU. Open units are **derived** as `revised_order_q − item_received_q − cancel_remaining_order_q`, keeping lines > 0. `as_of_date` filters by PO **creation** date, not time travel. |
+| `bpd_get_upcoming_pos`       | `po_plan_daily` + `po_plan_biweekly`, each filtered to its **latest `business_d` snapshot**. Windows on `order_d`, grouped by (tcin, week, **source**) so the two plans never blend. |
+| `bpd_get_forecast_vs_actual` | DFE `forecast_weekly` vs `sales_weekly` on a coverage-honest (tcin, location, week) spine — only **matched** cells produce variance; unmatched volume is counted in `extra.coverage`, never zero-filled. `variance_pct` is a true percent. `snapshot_policy`: `latest_available` (default) or `pre_week`. |
 
 ### Admin
 
-| Tool                       | Purpose                                                                                   |
-| -------------------------- | ----------------------------------------------------------------------------------------- |
-| `bpd_auth_status`          | OAuth state, scope, expires_in_s, user email (via `/rest/users/me`).                       |
-| `bpd_cache_status`         | Disk usage, row counts. Reports two date ranges: `earliest/latest_data_date` (transactional datasets only — the business-data range) and `earliest/latest_data_date_including_dimensional` (covers `location_attr.last_remodel_date` etc.). Per-dataset breakdown includes the detected date column and dataset `kind`. |
-| `bpd_clear_cache`          | **Destructive.** Requires `confirm=true`. Otherwise returns a dry-run preview.            |
-| `bpd_health_check`         | Multi-check audit across auth, warehouse, sync ledger, disk, and MCP self-state — including a **tool smoke test** that actually invokes every warehouse-only tool (a broken tool fails health, not just its own callers), a **roles_resolvable** check that validates the column-role registry against every populated table, and a **dimension_recency** check that catches rolled-back dimension tables. Each check returns pass/warn/fail. Use as the first call when diagnosing any MCP issue. Set `skip_network=true` for offline mode. |
-| `bpd_export_query_to_csv`  | Run a read-only SQL query and write the result to `~/.bpd-mcp/exports/<filename>` (mode 0644). Useful for sharing data with team members who don't have MCP access. Same read-only safety as `bpd_run_sql`. |
+| Tool                    | Purpose |
+| ----------------------- | ------- |
+| `bpd_bigquery_status`   | Which identity we query as (`SESSION_USER()`), where the credential came from (a path or env-var name — never key bytes), project, location, reachable datasets, and an explicit `write_capability: none`. **Replaces `bpd_auth_status`.** |
+| `bpd_data_freshness`    | Per-dataset snapshot and content date ranges, plus the upstream pipeline's own per-pattern ledger: file counts, newest file date, last download, lag in days. **Replaces `bpd_cache_status`.** |
+| `bpd_health_check`      | 12-check audit (see below). First call when diagnosing anything. |
+
+**Removed in this version**, with no replacement: `bpd_list_top_folders`,
+`bpd_list_folder_contents`, `bpd_get_file_metadata`, `bpd_search_files`,
+`bpd_sync_new_files`, `bpd_refresh_dataset`, `bpd_reingest_local`,
+`bpd_clear_cache`. The first four browsed Kiteworks; the next three ingested
+into the local warehouse; `bpd_clear_cache` was **deleted rather than stubbed**
+on purpose — a no-op "clear cache" is worse than none, because a user who calls
+it reasonably believes state was reset and then reads normal results as a
+failed reset.
+
+### `bpd_health_check`
+
+Four local checks (`bq_credentials_present`, `location_configured`,
+`config_validity`, `mcp_self_check`) then eight BigQuery-backed ones:
+`bq_reachable_as`, `bq_datasets_reachable`, `registry_tables_resolve` (every
+logical body dry-runs clean, every base table exists, `data_grain` still holds
+only the three expected values), `roles_resolvable`, `datasets_have_data`,
+`feed_freshness`, `known_unpopulated_columns`, `tools_smoke_test`.
+
+`skip_network=true` runs only the four local checks. The smoke test **dry-runs**
+by default: each tool's SQL is compiled and priced by BigQuery but not executed,
+which proves every dialect translation and every resolved column name at
+**0 bytes billed**. Pass `execute=true` to really run them.
+
+`roles_resolvable` is the most valuable check in the suite now — the registry's
+projection is a second thing that can drift away from `COLUMN_ROLES`, and this
+catches both sides.
 
 ---
 
-## Column-role registry (Patch #4)
+## Column-role registry
 
 Real Target schemas use non-obvious column names (`sale_quantity` not `units`,
 `sales_date` not `date`, `selected_forecast_q` not `forecast_units`,
-`fiscal_week_begin_d` not `week_start_date`). The analytics tools (and the
-`forecast_vs_actual` snapshot logic) resolve column names dynamically at call
-time via `src/bpd_mcp/column_roles.py`. To handle a new Target column-name
-variant, append it to the relevant `COLUMN_ROLES["<dataset>"]["<role>"]` list.
-Errors include the candidates tried and the actual columns present, so the fix
-is usually a one-line append.
+`fiscal_week_begin_d` not `week_start_date`). No analytics tool hardcodes a
+column: they call `resolve_column(warehouse, table, role)` in
+`src/bpd_mcp/column_roles.py`, which matches an ordered candidate list per
+`(logical_table, role)` against the live schema. To handle a new Target
+column-name variant, append it to the relevant
+`COLUMN_ROLES["<table>"]["<role>"]` list. Errors name the candidates tried and
+the columns actually present, so the fix is usually a one-line append.
 
-`DATASET_KINDS` classifies each dataset as `transactional` or `dimensional` —
-used by `bpd_cache_status` to compute the "business data" date range without
-dimensional date columns (e.g. `last_remodel_date` back to 2000) skewing it.
+That indirection is what made swapping the entire data layer tractable.
 
-`bpd_get_forecast_vs_actual` accepts `as_of_date` to lock the forecast snapshot
-cutoff. When omitted, the default is "the day before each forecast week begins"
-— giving you the pre-week prediction Target actually published, not a post-hoc
-revised one. The tool picks the latest `last_update_d` ≤ cutoff per
-`(tcin, location, week)`.
+`DATASET_KINDS` classifies each table `transactional` or `dimensional`, so
+`bpd_data_freshness` can compute the business-data range without
+`location_attr.last_remodel_date` (which reaches back to 2000) skewing it.
 
-### Adding a new dataset to the catalog (Patch #6.2)
+---
 
-This is a **two-file edit** — get either side wrong and the upsert raises
-on the first re-load (or worse: pre-#6.2, silently duplicated rows).
+## Cost model
 
-**1. `src/bpd_mcp/column_roles.py`** — append the new dataset to
-`COLUMN_ROLES` with the real Target column names per role (`date`,
-`location`, `tcin`, plus any dataset-specific roles like `units` or
-`dollars`). Put the actual column Target ships **first** in each list;
-aliases follow as fallbacks. This is the source of truth that analytics
-tools resolve against at query time.
+BigQuery bills by byte scanned, so the server treats cost as a correctness
+concern:
 
-**2. `src/bpd_mcp/parsers.py`** — add the `FilePattern` to `PATTERNS`.
-`primary_key_candidates` must list the real Target column names first,
-mirroring the priority order in `column_roles.py`. Use the
-`_pk_with_loc(*date_cols)` / `_pk_item(*date_cols)` helpers — they accept
-multiple date-column candidates and emit the cartesian product with
-`_LOC_COLS`. If the dataset has a non-`location_id` location column (e.g.
-`location_number` on `location_attr`), extend `_LOC_COLS` so every
-location-keyed dataset can match it.
+* **Every job carries `maximum_bytes_billed`** (`BPD_BQ_MAX_BYTES_BILLED`,
+  20 GiB). An over-limit job is rejected by BigQuery as an **HTTP 500** with
+  `reason: bytesBilledLimitExceeded` — not a 403 — and is surfaced as
+  `QUERY_TOO_EXPENSIVE`.
+* **`bpd_run_sql` and `bpd_export_query_to_csv` dry-run first.** A dry run
+  validates the SQL and returns `total_bytes_processed` at 0 bytes, so it
+  replaces DuckDB's `EXPLAIN` gate and adds a cost gate on top.
+  `estimated_bytes_scanned` is echoed into every response.
+* **Only referenced CTEs are injected.** Blanket injection would add ~400 MB of
+  avoidable scan per call.
+* **Metadata is free or cached.** Schemas come from cached dry runs (0 bytes);
+  row counts from `__TABLES__` (0 bytes, 300 s TTL); the date-range sweep is one
+  combined `UNION ALL` job (~527 MB, 900 s TTL). `INFORMATION_SCHEMA` bills a
+  10 MB minimum per query and is avoided.
+* **Date predicates matter.** Partition pruning survives CTE injection
+  (`sales_daily` 13.3 MB → 3.5 MB with a `WHERE`), so never drop a date filter
+  as a "simplification". The three `biom_canvas` facts are partitioned and
+  clustered; all 13 `bpd_raw` tables are neither.
 
-**Drift guard.** `tests/test_parsers.py::
-test_pk_audit_all_first_candidates_have_column_roles_or_canonical_cols`
-iterates every `PATTERNS` entry's first PK candidate and verifies each
-column is either canonical (`tcin` / `dpci` / `fiscal_week`) or matches
-the first entry of some role in `column_roles` for that dataset. If you
-add a dataset and forget to update both files in sync, this test fails
-with a precise pointer.
+Every query logs `bytes_billed`, `bytes_processed`, `cache_hit`, the injected
+logical tables and the job id at INFO.
 
-**Loud-failure backstop.** `Warehouse.upsert_dataframe` raises
-`primary_key_missing_in_df` on the first load if the catalog's PK columns
-don't appear in the parsed df. Silent DELETE-skip + duplicate INSERT was
-the failure mode that produced the sales_weekly 2.0× regression — the
-loud failure is intentional, so the next person hits the error
-immediately instead of accumulating duplicates on every re-load.
-
-**Canonical column-name shim (Patch #8).** When Target ships the SAME
-logical column under a new name (seven incidents so far), add an entry to
-`parsers.CANONICAL_RENAMES` instead of widening PK candidates: the parser
-renames the variant to the canonical name BEFORE the type-hint casts (see
-`_finalize`), so a renamed column takes the exact same type path as the
-canonical column and the file merges into the existing table with the
-existing key. Renames never clobber — they only fire when the canonical
-column is absent. `upsert_dataframe` additionally casts incoming values to
-the table's column types, runs DELETE+INSERT in ONE transaction (a failed
-INSERT rolls back its DELETE), and `ensure_data_table` widens tables via
-ALTER ADD COLUMN when a generation carries extra columns.
-
-### HISTORY backfill (one-off — retired in Patch #12, classifiable forever)
-
-Target dropped 207 `HISTORY_{SALES,INV,GM}_WEEKLY` files (Jan 2025 → May
-2026) as a one-time backfill. Three catalog patterns route them into the
-existing `sales_weekly` / `inventory_weekly` / `gross_margin` tables with
-the siblings' exact natural keys; `week_end_d` → `business_d` and
-`fiscal_week_end_date` → `fiscal_week_end_d` are normalized via the shim.
-Weekly datasets use `replace_scope` (week-scoped deletion): a file is the
-complete extract of its week, so loading it replaces the ENTIRE week —
-overlapping weeks can't become a mix of two feed generations, and re-syncs
-stay idempotent. If a regular file and a HISTORY file cover the same week,
-the last one loaded wins wholesale (both are self-consistent extracts).
-After the backfill is ingested and validated, delete the three `HISTORY_`
-patterns from `parsers.PATTERNS`. There is no item-grain GM history —
-`gross_margin_item` can be derived from `gross_margin` by aggregating
-across `location_id`/`location_id_originated`.
+Slower than DuckDB, unavoidably: each query is a network round trip
+(~0.7–1.5 s) where DuckDB was sub-millisecond, and a tool that issues several
+queries takes seconds. That is the price of the multi-process capability.
 
 ---
 
 ## Target schema quirks
 
-Worth knowing when writing custom SQL against the warehouse — bugs hide here:
+Worth knowing before writing custom SQL — bugs hide here:
 
-- **Week anchors disagree.** `forecast_weekly.fiscal_week_begin_d` is Sunday-anchored; `sales_weekly.sales_date` is the Saturday week-end. `bpd_get_forecast_vs_actual` normalizes both to Saturday (shifts the forecast +6 days) for joining. If you write a manual join via `bpd_run_sql`, do the same.
-- **`item_attr` is in EAV form** — item attributes are rows (`mta_n`, `mta_value_n`), not columns. Pivot to wide form in your query if you need attributes side-by-side.
-- **`sales_weekly.sales_date` is the week-end Saturday**, not a generic sales date. Don't filter as if it's a "transaction occurred on this day" column.
-- **`forecast_weekly` ships dates as VARCHAR.** `fiscal_week_begin_d` is stored as text like `'2026-05-03'`. The analytics tools insert a `CAST(... AS DATE)` at query time automatically; manual SQL needs the same cast.
-- **`forecast_weekly` carries multiple snapshots per (tcin, location, week)** distinguished by `last_update_d`. Use `bpd_get_forecast_vs_actual`'s `as_of_date` (or `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY last_update_d DESC)`) to pick a single snapshot.
-- **Product names contain unescaped inch marks** (e.g. `6"` in the Bone SKU). The parser uses `quote_char=None` to handle this. If you ever write a custom CSV reader against the raw BPD files, do the same.
-- **`""` (two literal double-quotes) is the NULL placeholder in nullable typed columns** like `purchase_order_active_f` (BOOL) and `parent_tcin` (BIGINT). With `quote_char=None`, polars no longer reduces it to an empty field; the parser lists `'""'` explicitly in `null_values` so it maps to NULL. A custom reader needs the same mapping or the column will read as VARCHAR and break INSERT into the typed warehouse column.
-
----
-
-## Warehouse design (Patch #3)
-
-The MCP keeps **one** `~/.bpd-mcp/bpd.duckdb` file. Engine-level read-only execution
-for `bpd_run_sql` is provided by wrapping each query in `BEGIN TRANSACTION READ ONLY`
-on a fresh cursor against the writable connection. DuckDB rejects writes inside
-such a transaction at the engine layer (verified on DuckDB 1.5.2).
-
-This replaces the earlier `.duckdb.ro` snapshot file, which caused schema-drift
-bugs whenever migrations applied to the writable copy weren't reflected in the
-snapshot. On startup, the server now deletes any leftover `.duckdb.ro` /
-`.duckdb.ro.wal` from prior installs (look for `removed_legacy_snapshot` events
-in the log).
-
-**Defense in depth for `bpd_run_sql`:**
-1. Validator (app layer): rejects multi-statement, DDL/DML keywords, comment-cloaked
-   writes, `ATTACH`, `COPY`, `INSTALL/LOAD`, `EXPORT DATABASE`.
-2. Engine (DuckDB layer): `BEGIN TRANSACTION READ ONLY` rejects any write that
-   touches the current database.
-
-Note: DuckDB's read-only transaction does NOT cover `ATTACH` / `COPY ... TO` —
-those are stopped at the validator layer instead. The two layers together cover
-every write surface.
+- **Week anchors disagree.** `forecast_weekly.fiscal_week_begin_d` is Sunday-anchored (100% of rows); every weekly sales/inventory/GM date is the Saturday week-END (100% of rows). `bpd_get_forecast_vs_actual` normalizes by shifting the forecast +6 days. A manual join must do the same.
+- **Week bucketing is Monday-anchored, deliberately.** `get_sales_summary(grain='week')` uses `DATE_TRUNC(x, WEEK(MONDAY))`. BigQuery's bare `WEEK` defaults to **Sunday**; DuckDB's `date_trunc('week', …)` was Monday. The Monday form is **bug-for-bug parity** with the pre-migration numbers, not a claim about Target's fiscal calendar — a data-layer swap must not move a reported figure. It is a recorded follow-up, not a settled design; see "Follow-ups".
+- **`item_attr` is in EAV form** — attributes are rows (`mta_n`, `mta_value_n`), not columns. Pivot in your query.
+- **`""` (two literal double-quote characters) is Target's NULL placeholder.** It survives into BigQuery as a STRING value. `daily_order_tcin_loc.ITEM_CHANGE_D` / `IMPORTS_IN_STORE_D` / `RECEIPT_D` and `location_attr.last_remodel_date` (574 of 2,222 rows) all carry it. **Always `SAFE_CAST(col AS DATE)`, never `CAST`** — a plain `CAST` returns a hard 400 `Invalid date`, and worse, it is optimizer-dependent: `COUNT(CAST(…))` can succeed because BigQuery elides the cast, so a passing smoke query proves nothing.
+- **`orders_daily.purchase_order_active_f` is 98% placeholder.** Do not filter on it; `bpd_get_open_orders` derives openness arithmetically instead.
+- **`data_grain` is an unconstrained STRING.** `fct_target_inventory` has only `daily` and `history_weekly` — there is no `weekly` grain. A new fourth value would be silently ignored by the weekly tables, which is why `registry_tables_resolve` guards it.
+- **`dim_product.current_price` is NUMERIC.** `NUMERIC * 1.0` stays NUMERIC with 9-digit division rounding rather than promoting to FLOAT64. No role reaches it today; if one ever does, check the precision.
+- **Division guards are load-bearing.** The `NULLIF(…, 0)` and `CASE WHEN COALESCE(SUM(…),0)=0 THEN NULL` patterns look like removable boilerplate. DuckDB returned `inf` for `1/0`; BigQuery **fails the entire query**. Hold new division to the same standard.
 
 ---
 
-## How the data flows
+## Security model
 
-```
-+-------------------+         +------------------------+
-| Claude            | stdio   | bpd-mcp (Python)       |
-|                   |<------->| FastMCP + tools        |
-+-------------------+         | Auth manager           |
-                              | Sync worker            |
-                              +-----------+------------+
-                                          |
-                          +---------------+----------------+
-                          |                                |
-                          v                                v
-              +---------------------+         +------------------------+
-              | Kiteworks REST API  |         | Local data layer       |
-              | /oauth/token        |         | raw/ (zip audit trail) |
-              | /rest/folders/top   |         | bpd.duckdb (15 tables) |
-              | /rest/folders/{}/.. |         |  ├ sales_daily         |
-              | /rest/files/{}/..   |         |  ├ sales_weekly[_item] |
-              +---------------------+         |  ├ inventory_daily     |
-                                              |  ├ inventory_weekly[_item]
-                                              |  ├ gross_margin[_item] |
-                                              |  ├ item_attr[_extended]|
-                                              |  ├ location_attr       |
-                                              |  ├ orders_daily        |
-                                              |  ├ po_plan_daily       |
-                                              |  ├ po_plan_biweekly    |
-                                              |  ├ forecast_weekly     |
-                                              |  ├ _file_ledger        |
-                                              |  ├ _sync_log           |
-                                              |  └ _schema_registry    |
-                                              +------------------------+
-```
-
-The sync worker:
-
-1. Finds the vendor's top-level folder by matching its name to `BPD_VENDOR_ID`.
-2. Walks the folder (depth-capped) and collects every file.
-3. Classifies each file name against the BPD pattern catalog (`parsers.py`).
-4. Skips files already loaded with a matching fingerprint (per `_file_ledger`).
-5. For each new file: streams the download to `raw/`, opens the inner pipe/tab-delimited
-   text (delimiter sniffed from line 1), reads with Polars, registers the discovered
-   schema in `_schema_registry`, then INSERT-OR-REPLACE on the natural primary key into
-   the discovered DuckDB table.
-6. Emits a structured summary back to the MCP tool caller.
-
-`-1` is preserved as a meaningful integer sentinel ("not applicable") rather than
-NULL — Target uses it in their data model and silently coercing would lose meaning.
-
-Schema drift (new columns) is logged with the diff. The data table is not auto-altered
-in v1; a `bpd_refresh_dataset` with `full=true` picks up a genuinely new column — but
-read the guardrails section first: full refreshes delete local history and Kiteworks
-can only re-serve ~2 weeks of it.
-
-### Parse resilience (May 2026 patch)
-
-Target sometimes ships malformed files (extra delimiters, embedded quotes, BOM,
-mixed line endings). The parser uses a three-tier fallback chain and records
-which tier succeeded:
-
-1. **`strict`** — polars `read_csv` with strict parsing. The happy path.
-2. **`ignore_errors`** — polars with `ignore_errors=True`. Rows that fail
-   tokenization are skipped; the file still loads.
-3. **`pandas_permissive`** — pandas python engine with
-   `on_bad_lines='skip'`. Slower but tolerates everything but binary garbage.
-
-`_file_ledger` has two diagnostic columns to expose what happened:
-
-- **`parse_method`** ∈ `{strict, ignore_errors, pandas_permissive, failed}`
-- **`error_message`** — full exception text (truncated only at 2000 chars).
-  Populated on both failures and on fallback successes (so you can find files
-  that loaded *but* needed permissive parsing).
-
-Useful query: `SELECT file_name, dataset, status, parse_method, error_message
-FROM _file_ledger WHERE parse_method != 'strict' OR status = 'failed'`.
-
-The `bpd_cache_status` tool reports overall earliest/latest data dates *and*
-a per-dataset breakdown showing the detected date column and date range per
-table. Date columns are discovered by type (DATE/TIMESTAMP) first, then by
-name heuristic (`*_date`), then by a per-dataset fallback registry.
-
----
-
-## Backups, destructive-op guardrails & recovery (Patch #9)
-
-Kiteworks retains only **~2 weeks** of files. That makes the local warehouse and
-the `raw/` zip archive the *only* copies of older history — a lesson learned the
-hard way when a `full=true` refresh in July 2026 wiped a validated 17-month
-sales backfill that Target could no longer re-serve. Patch #9 adds three layers
-of protection:
-
-**1. Automatic backups.** Before any operation that writes the warehouse
-(`bpd_sync_new_files`, `bpd_reingest_local`), a consistent timestamped copy is
-saved to `~/.bpd-mcp/backups/bpd-<stamp>-<reason>.duckdb` (CHECKPOINT first, so
-the copy includes everything in the WAL). Retention is `BPD_BACKUP_KEEP`
-(default 5, oldest pruned); routine backups can be disabled with
-`BPD_AUTO_BACKUP=false`. The backup taken before a full refresh's delete is
-**mandatory** and ignores that toggle.
-
-**2. Destructive-refresh guardrails.** `bpd_refresh_dataset(full=true)`:
-
-* requires `confirm_destructive="I understand this deletes local history"` —
-  anything else returns a preview of exactly what would be deleted (file count
-  + date span) and does nothing;
-* **refuses outright** (`REFRESH_WOULD_LOSE_HISTORY`) when the dataset's local
-  history starts earlier than the oldest file Kiteworks currently serves —
-  i.e. when the deleted rows could never be re-downloaded;
-* takes the mandatory backup before the first `DELETE`.
-
-**3. Raw-archive protection.** The 5 GB LRU cap on `raw/` never evicts a zip
-that has no `status='loaded'` ledger row — an un-ingested zip may be the only
-copy of its data anywhere. It is skipped (with a warning) even if that leaves
-the directory over the cap; ingest it with `bpd_reingest_local` to make it
-evictable.
-
-**4. Stale-dimension guard (Patch #10).** Dimensional datasets
-(`location_attr`, `item_attr`, `item_attr_extended`) are full-universe
-last-write-wins snapshots: whichever file loads last wins outright, with no
-row-count change to signal anything. Both the live sync and `bpd_reingest_local`
-now refuse to load a dimensional file older than the newest known snapshot
-(batch + ledger) — so an out-of-order arrival or an orphaned old zip can never
-silently roll a dimension back (the July 2026 `location_attr` regression). As
-a bonus, at most one file per dimensional dataset loads per batch — older ones
-were dead work anyway. The `dimension_recency` health check detects the
-rolled-back state after the fact from the ledger alone.
-
-### Recovery runbook
-
-If warehouse data is lost (or after restoring an older `bpd.duckdb`):
-
-```text
-1. bpd_reingest_local(dry_run=true)      # preview: which raw/ zips would load
-2. bpd_reingest_local()                   # load them — no downloads, nothing deleted
-3. bpd_sync_new_files()                   # catch up on anything Kiteworks still serves
-4. python scripts/validate_kmg.py         # tie the rebuilt warehouse back to the KMG report
-```
-
-`bpd_reingest_local` runs each zip through the exact same
-parse→rename→upsert pipeline as a live sync (same replace-scope semantics,
-same ledger bookkeeping — ledger rows get `file_id = local:<file_name>`), loads
-files in ascending file-date order so period-replace datasets converge to the
-same state a live sync would have produced, and skips files already recorded
-as loaded. To restore a backup wholesale: stop the MCP, copy the chosen
-`backups/bpd-*.duckdb` over `~/.bpd-mcp/bpd.duckdb`, restart, then run the
-runbook above to catch up.
-
----
-
-## Security model (§15)
-
-* **Token file is 0600.** The server refuses to start if perms are looser.
-* **Secrets are never logged.** A structlog processor recursively redacts any key
-  matching `(?i)(password|secret|token|authorization|bearer|refresh)`. Tokens that
-  do get logged (e.g. on acquisition) are masked as `<token:1234...abcd>`.
-* **Outbound calls are host-pinned** to `KITEWORKS_BASE_URL` at the `httpx` event-hook
-  layer. Any attempt to talk to another host raises immediately.
-* **`bpd_run_sql` is read-only.** Enforced at the engine layer (the connection is
-  opened `read_only=True` against a snapshot of the DB) AND at the validator
-  (multi-statement, DDL, DML, ATTACH, COPY, INSTALL/LOAD, PRAGMA-with-assignment all
-  rejected — and comment-cloaked variants too).
-* **No write APIs to Kiteworks.** Uploads/deletes/share are not implemented.
-* **stdout is reserved for MCP protocol.** All logging goes to stderr + the rotating
-  log file. A single stray print on stdout would corrupt the MCP transport.
+* **Read-only at the credential layer.** The service account holds `dataViewer`
+  + `jobUser`. `CREATE VIEW` and `CREATE TABLE` both return 403
+  `bigquery.tables.create denied`. This is strictly stronger than the
+  `BEGIN TRANSACTION READ ONLY` facade it replaces — it cannot be bypassed by a
+  code path, because the permission does not exist.
+* **`sql_safety.py` is kept as defense in depth.** It admits only statements
+  leading with `SELECT` or `WITH`, and rejects multi-statement input plus
+  DDL/DML tokens including comment-cloaked variants. It is deliberately
+  conservative: `REPLACE` is blocked, which also blocks BigQuery's legitimate
+  `SELECT * REPLACE(...)` modifier. False positives are preferred to false
+  negatives.
+* **Cost is a safety property too** — see the hard `maximum_bytes_billed` and
+  the dry-run gate above.
+* **Secrets are never logged.** A structlog processor recursively redacts keys
+  matching `(?i)(password|secret|token|authorization|bearer|refresh)`. The
+  service-account key is read from `os.environ` and never becomes a settings
+  field: a `SecretStr` would still reach logs via `model_dump()`.
+* **No write path to anything.** No uploads, no ingestion, no DDL.
+* **stdout is reserved for MCP protocol.** All logging goes to stderr and the
+  rotating log file. One stray `print` on stdout corrupts the transport.
 
 ---
 
 ## Logging
 
-Configured by `BPD_LOG_LEVEL` (default `INFO`). Three sinks:
+Configured by `BPD_LOG_LEVEL` (default `INFO`). Two sinks plus a hard rule:
 
 * **stderr** — JSON-rendered structlog events. Safe for stdio MCPs.
 * **`~/.bpd-mcp/logs/bpd-mcp.log`** — rotating JSON, 10 MB × 5 backups.
 * **Nothing to stdout, ever.**
 
-Every tool call logs a `tool_called` event with its arguments (after redaction) and a
-`tool_complete` event with duration. Sync worker emits per-file events.
+Every tool call logs `tool_called` (arguments, redacted) and `tool_complete`
+(duration). Every BigQuery job logs its bytes and job id.
 
 ---
 
 ## Tests
 
 ```bash
-# Unit + integration (no network)
+# Default suite: hermetic, no network, no credentials needed.
 uv run pytest -q
 
-# With the real Kiteworks (requires creds in env; never run in CI)
-BPD_INTEGRATION=1 uv run pytest -q -k integration
+# Live BigQuery with fixture rows injected as literal CTEs (0 bytes billed).
+uv run pytest -q -m bq
+
+# Live BigQuery against REAL production data (bills bytes).
+uv run pytest -q -m bq_live
 ```
 
-Coverage requirements (§13):
+Three tiers, and the split is deliberate:
 
-* `tests/test_auth.py` — password→refresh transition, 0600 perms, error surface verbatim.
-* `tests/test_parsers.py` — filename catalog, pipe/tab sniff, `-1` sentinel, schema discovery.
-* `tests/test_warehouse.py` — idempotent loads, schema drift, view creation, migration idempotency.
-* `tests/test_sql_safety.py` — keyword/AST blocks.
-* `tests/test_read_only_view.py` — engine-level RO enforcement, legacy snapshot cleanup, migration visibility.
-* `tests/test_health_check.py` — every health check has pass + fail tests.
-* `tests/test_audit_drift_guards.py` — pin parallel sources of truth (PATTERNS ↔ KnownDataset, EXPECTED_LEDGER_COLUMNS ↔ DDL, EXPECTED_TOOL_COUNT ↔ registered tools).
-* `tests/test_tools_query.py` — sales_summary math + markdown/json toggle.
-* `tests/test_recovery_safety.py` — Patch #9: backups + retention, confirm-phrase gate, would-lose-history refusal, full-refresh happy path, local reingest (recovery, idempotency, ordering), raw-dir eviction protection; Patch #10: stale-dimension guard (reingest + live sync).
-* `tests/test_column_roles.py` — resolver behavior + Patch #10: every REQUIRED_ROLES entry resolves against real Target headers (executable "the lists match reality" claim); known-unpopulated columns banned from candidate lists.
+* **Tier 1 — hermetic.** Pure string-in/string-out tests for CTE injection,
+  identifier quoting, the dialect helpers, `sql_safety`, and the drift guards
+  that pin `LOGICAL_TABLES` ↔ `COLUMN_ROLES` ↔ `DATASET_KINDS` ↔ `FEED_KINDS` ↔
+  `KnownDataset`, and `EXPECTED_TOOL_COUNT` ↔ registered tools.
+* **Tier 2 — `-m bq`, fixture data.** Fixture rows are swapped into the registry
+  as literal `SELECT … UNION ALL SELECT …` CTE bodies and executed **against
+  real BigQuery**, which bills 0 bytes and runs in about 0.7 s per query. This
+  is where the bulk of the analytics coverage lives.
+* **Tier 3 — `-m bq_live`, real data.** Per-table smoke invariants, an
+  anti-drift guard comparing each fixture's dry-run schema against the real
+  body's, numeric parity checks on the two de-duplicated tables, and the KMG
+  tie-out.
+
+**There is deliberately no DuckDB test double.** It was measured and rejected:
+DuckDB rejects `SAFE_CAST` and backtick identifiers outright, and where both
+engines accept the same text they disagree — `SELECT "sale_quantity"` returns
+the column in DuckDB and the string `'sale_quantity'` in BigQuery. A double
+would pass exactly when production is broken.
 
 ---
-
-## Post-patch verification sequence
-
-After every patch lands, the user runs:
-
-```bash
-git pull && uv sync
-pkill -f bpd-mcp && sleep 2
-rm -f ~/.bpd-mcp/bpd.duckdb.ro ~/.bpd-mcp/bpd.duckdb.ro.wal   # one-time, patch #3
-./scripts/verify_install.sh                                   # local checks (8 steps)
-# Fully quit + reopen Claude Desktop
-# In Claude Desktop: call bpd_health_check                    # full audit incl. tool smoke test
-# In Claude Desktop: call bpd_sync_new_files                  # ~99 loaded, 0-2 failed
-```
-
-`verify_install.sh` validates the local install (imports, tests, ruff, ledger schema,
-token perms, tool count) without touching the network. `bpd_health_check` runs once
-the MCP is back up and adds the cross-cutting checks (auth, RO enforcement, sync
-ledger invariants, orphan files, etc.).
 
 ## Source-of-truth tie-out (KMG POS report)
 
 `scripts/validate_kmg.py` validates the warehouse against the vendor's weekly
 KMG POS report — the external source of truth. It embeds the expected numbers
-from the JunW1'26 report (week ending 2026-06-06) and checks:
-
-1. Weekly unit + dollar totals for 12 fiscal weeks (w/e 3/21 → 6/6)
-2. Per-TCIN units and dollars for w/e 6/6 (25 SKUs)
-3. Channel-originated dollar split (store vs online+flex)
-4. Per-TCIN on-hand inventory at w/e 6/6
+from the JunW1'26 report (week ending 2026-06-06) and checks weekly unit and
+dollar totals for 12 fiscal weeks, per-TCIN units and dollars for w/e 6/6 (25
+SKUs), the channel-originated dollar split, and per-TCIN on-hand at w/e 6/6.
 
 ```bash
-uv run python scripts/validate_kmg.py          # default: ~/.bpd-mcp/bpd.duckdb
+uv run python scripts/validate_kmg.py --project biom-reporting-s26 --location us-central1
 ```
 
-Read-only; exit 0 = tie-out clean. Missing weeks (pre-subscription) SKIP
-rather than FAIL. When a newer KMG report arrives, update the EXPECTED_*
-tables at the top of the script — extraction provenance is documented inline.
+Read-only; exit 0 = tie-out clean. This script is the **acceptance gate for the
+BigQuery migration**: it is the only artifact in the repo that can answer "did
+the data-layer swap change any number?".
 
 ---
 
 ## Evaluation suite
 
-`evals/bpd_eval.xml` contains 10 realistic Q&A pairs. The `<answer>` values are
-placeholders until Aubrey runs the MCP against her real data and pins them. Re-run
-after every meaningful change — they're the regression suite.
+`evals/bpd_eval.xml` contains 10 realistic Q&A pairs — the regression suite for
+answer quality. Re-run after every meaningful change.
 
 ---
 
-## Known limits & next steps (§16, §19)
+## Follow-ups (recorded, not decided)
 
-* **OAuth endpoint is `/oauth/token`** per Kiteworks docs and the BPD PDF. If a 404
-  ever appears at that path, the exact error is surfaced — the server does NOT
-  silently probe alternate paths.
-* **Client credentials are shared across all BPD vendors.** If Target rotates them,
-  update `KITEWORKS_CLIENT_ID` / `KITEWORKS_CLIENT_SECRET` in `.env`.
-* **Refresh token TTL is server-side.** If the server hasn't refreshed before TTL,
-  `bpd-bootstrap` must be re-run.
-* **`bpd_run_sql` reads a snapshot of the warehouse**, refreshed lazily on each call
-  (mtime check). This is the engine-level read-only handle the spec asks for —
-  DuckDB cannot mix RW/RO connections to the same file in one process.
-* **No file upload / share / member endpoints.** v1 is read-only by design.
-* **Watch mode, remote deployment, materialized rollups** — see §16. Not in v1.
+1. **Week convention.** `DATE_TRUNC(x, WEEK(MONDAY))` is bug-for-bug DuckDB
+   parity. Target's real fiscal week is Sunday-start / Saturday-end, so the
+   current bucketing pushes a Saturday week-end back to the preceding Monday.
+   Worth deciding `WEEK(SUNDAY)` on its own merits, separately from this swap.
+   Do **not** harmonize it with the ±6-day anchoring in `get_forecast_vs_actual`
+   — that is Target's fiscal week-end anchor and a different concept.
+2. **The canvas weekly gap.** `fct_target_sales` stopped ingesting
+   `data_grain='weekly'` after 2026-05-02 and `fct_target_inventory` never had a
+   weekly grain, while the raw weekly feeds are current. The registry unions
+   canvas with raw on a computed boundary, which self-heals — but the cleaner
+   fix is upstream in the GCS → BigQuery loader.
+3. **The DFE forecast feed is genuinely stale.** `DFE_WKLY_ITEM_LOC_FORECAST`
+   last landed 2026-07-29. Not a migration bug; `bpd_data_freshness` just makes
+   it visible for the first time.
+4. **`snapshot_retention_caveat`** in `get_forecast_vs_actual` describes
+   DuckDB's per-key ingest retention. The BigQuery sources are SCD2 with
+   `valid_from`/`valid_to`, so historical snapshots may be recoverable and
+   `pre_week` backtesting may be genuinely possible. The caveat is now likely
+   wrong in the user's favour. Unverified.
+5. **Two roles resolve to nothing** — `gross_margin.margin` and
+   `item_attr_extended.date`. Both were unresolvable under DuckDB too and no
+   tool consumes either. Left faithful; flagged for a cleanup pass.
+6. **Three dead item-grain feeds.** `sales_weekly_item`, `inventory_weekly_item`
+   and `gross_margin_item` all stop at 2026-05-16. Registered so the surface
+   stays complete and the staleness is visible; worth asking Target whether they
+   are retired.
+7. **`.env.example` still contains committed Kiteworks credentials.** Rotating
+   them was explicitly deferred; the file carries a TODO where they were.

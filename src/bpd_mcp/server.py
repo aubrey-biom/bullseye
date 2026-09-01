@@ -1,15 +1,30 @@
 """FastMCP server entry point.
 
-Holds a single shared lifespan context with:
-  * Settings (env)
-  * AuthManager + token bundle from disk
-  * httpx.AsyncClient (host-pinned)
-  * KiteworksClient
-  * Writable Warehouse + ReadOnlyView (engine-level RO via transaction wrapper).
+The lifespan context holds exactly two things now:
 
-Each tool function takes its arguments as **top-level** parameters (not a wrapped
-`params:` model) so MCP clients send flat argument dicts. The corresponding Pydantic
-input models in `schemas.py` are used for validation inside each tool.
+  * `Settings` (env)
+  * one `BigQueryWarehouse` — a read-only, network-backed data layer
+
+**Why that matters.** The previous design opened a local DuckDB file. DuckDB
+allows exactly ONE process to hold a database file: while a read-write
+connection is live, a second process cannot open it at all, not even with
+`read_only=True`. Claude Desktop now spawns a second copy of this server for
+Cowork/Code sessions, and that second copy crashed on the lock. BigQuery is a
+network service, so N processes can hold N clients with no contention — that
+is the entire point of the change.
+
+Consequently, **nothing in startup may reintroduce a single-process
+assumption**. No file locks, no PID/state file, no snapshot copy, no leftover
+`.ro` cleanup (which raced two processes against the same unlink), no
+auto-sync-on-start writing to shared local state. The only local paths the
+server touches at all are its own log directory and the CSV `exports/`
+directory, both of which are append-only outputs whose worst-case concurrent
+behaviour is an interleaved log line.
+
+Each tool function takes its arguments as **top-level** parameters (not a
+wrapped `params:` model) so MCP clients send flat argument dicts. The
+corresponding Pydantic input models in `schemas.py` are used for validation
+inside each tool.
 """
 
 from __future__ import annotations
@@ -21,120 +36,132 @@ from dataclasses import dataclass
 from datetime import date as _date
 from typing import Literal
 
-import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
-from .auth import AuthManager
-from .client import KiteworksClient, make_http_client
+# Imported from `.bq` rather than `.warehouse`: `bq` is where the BigQuery data
+# layer actually lives, and `warehouse` is only a compatibility re-export kept
+# so `tools/query.py`'s `from ..warehouse import Warehouse, quote_ident` and its
+# `warehouse: Warehouse` annotations keep resolving.
+from .bq import BigQueryWarehouse
 from .config import Settings, get_settings
 from .logging_setup import configure_logging, get_logger
 from .schemas import (
-    AuthStatusInput,
-    CacheStatusInput,
-    ClearCacheInput,
+    BigQueryStatusInput,
+    DataFreshnessInput,
     DescribeSchemaInput,
     ExportQueryToCsvInput,
     ForecastVsActualInput,
-    GetFileMetadataInput,
     HealthCheckInput,
     InventorySnapshotInput,
-    KnownDataset,
     ListDatasetsInput,
-    ListFolderContentsInput,
-    ListTopFoldersInput,
     OpenOrdersInput,
-    RefreshDatasetInput,
-    ReingestLocalInput,
     ResponseFormat,
     RunSqlInput,
     SalesSummaryInput,
-    SearchFilesInput,
     SellThroughInput,
-    SyncNewFilesInput,
     ToolResponse,
     TopSkusInput,
     UpcomingPosInput,
 )
 from .tools import admin as admin_tools
-from .tools import files as files_tools
 from .tools import query as query_tools
-from .tools import sync as sync_tools
-from .warehouse import ReadOnlyView, Warehouse, cleanup_legacy_snapshot
 
 logger = get_logger("bpd_mcp.server")
 
 
 @dataclass
 class AppContext:
+    """Everything a tool call needs. Two fields, both process-local and shareable.
+
+    There is no writable/read-only warehouse pair any more. The old design
+    needed one because DuckDB read-only enforcement was a transaction wrapper
+    around a writable connection; here the service account holds
+    `dataViewer + jobUser` and gets a 403 on `bigquery.tables.create`, so
+    read-only is a property of the credential and cannot be turned off by a
+    code path.
+    """
+
     settings: Settings
-    http: httpx.AsyncClient
-    auth: AuthManager
-    client: KiteworksClient
-    warehouse_rw: Warehouse
-    warehouse_ro: ReadOnlyView
+    warehouse: BigQueryWarehouse
 
     async def aclose(self) -> None:
         global _active_app_context
         try:
-            self.warehouse_rw.close()
+            # Idempotent and never raises. Nothing to unlink: there is no file,
+            # no lock, and no snapshot — so a second server process closing at
+            # the same moment cannot affect this one.
+            self.warehouse.close()
         finally:
-            # ReadOnlyView is a facade; closing the writable Warehouse is what
-            # releases the connection.
-            try:
-                await self.http.aclose()
-            finally:
-                if _active_app_context is self:
-                    _active_app_context = None
+            if _active_app_context is self:
+                _active_app_context = None
 
 
 # FastMCP resources don't receive the lifespan context, so we keep a module-level
 # reference set by build_context() and cleared by AppContext.aclose(). Used by the
-# `bpd://schema` resource to read the live warehouse without opening a second one.
+# `bpd://schema` resource. This is per-PROCESS state, not cross-process state —
+# two concurrently running servers each hold their own and never interact.
 _active_app_context: AppContext | None = None
 
 
 async def build_context(settings: Settings | None = None) -> AppContext:
+    """Construct the app context. Safe to run in several processes at once.
+
+    Deliberately absent, and each one is a single-process assumption that used
+    to live here:
+
+      * `cleanup_legacy_snapshot()` — unlinked `bpd.duckdb.ro`; two servers
+        starting together raced on the same path.
+      * `Warehouse(db_path, read_only=False)` — took the DuckDB file lock, the
+        actual reported symptom (the second server would not start).
+      * `ReadOnlyView(...)` — a facade over that same locked handle.
+      * `make_http_client` / `AuthManager.load_from_disk` / `KiteworksClient` —
+        read and rewrote `~/.bpd-mcp/tokens.json`, so a refresh in one process
+        invalidated the other's in-flight token.
+      * the `bpd_auto_sync_on_start` branch in `lifespan` — two servers booting
+        together would both start downloading and writing.
+
+    What remains is a BigQuery client (a stateless HTTPS session) plus two
+    output directories.
+    """
     global _active_app_context
     s = settings or get_settings()
     s.ensure_dirs()
     configure_logging(s.bpd_log_level, s.log_dir)
 
-    # Patch #3: remove any leftover .ro snapshot file from the prior design BEFORE
-    # opening the writable warehouse, so a stale snapshot can never be picked up.
-    removed = cleanup_legacy_snapshot(s.db_path)
-    for path in removed:
-        logger.info("removed_legacy_snapshot", path=str(path))
+    warehouse = BigQueryWarehouse(
+        project=s.bpd_bq_project,
+        location=s.bpd_bq_location,
+        maximum_bytes_billed=s.bpd_bq_max_bytes_billed,
+        rowcount_ttl_s=s.bpd_bq_rowcount_ttl_s,
+        daterange_ttl_s=s.bpd_bq_daterange_ttl_s,
+    )
 
-    http = make_http_client(s)
-    auth = AuthManager.load_from_disk(s, http)
-    client = KiteworksClient(s, auth, http)
-    warehouse_rw = Warehouse(s.db_path, read_only=False)
-    warehouse_ro = ReadOnlyView(warehouse_rw)
-    # Patch #10: log-only startup pass over the role registry. Never fatal —
-    # tables are created lazily by sync, so empty installs legitimately have
-    # nothing to validate. The hard gate is the roles_resolvable health check.
+    # Log-only startup pass over the role registry. Never fatal, but the reason
+    # changed: under DuckDB, tables were created lazily by sync, so a fresh
+    # install legitimately had nothing to validate. Now every logical table
+    # exists at boot, so an unresolvable role means the registry projection and
+    # COLUMN_ROLES have genuinely drifted. It stays a warning here (a boot-time
+    # BigQuery outage must not make the server unstartable) and is a hard gate
+    # in the `roles_resolvable` health check.
     try:
         from .column_roles import validate_roles
 
-        for failure in validate_roles(warehouse_rw):
+        for failure in validate_roles(warehouse):
             logger.warning("role_unresolvable", **failure)
     except Exception as e:
         logger.warning("role_validation_failed", error=str(e))
+
     logger.info(
         "context_built",
-        base_url=s.base_url,
+        warehouse=warehouse.db_path,
+        project=s.bpd_bq_project,
+        location=s.bpd_bq_location,
+        credentials_source=warehouse.credentials_source,
+        logical_tables=len(warehouse.registry),
         vendor_id=s.bpd_vendor_id,
         tier=s.bpd_vendor_tier,
-        db=str(s.db_path),
     )
-    ctx = AppContext(
-        settings=s,
-        http=http,
-        auth=auth,
-        client=client,
-        warehouse_rw=warehouse_rw,
-        warehouse_ro=warehouse_ro,
-    )
+    ctx = AppContext(settings=s, warehouse=warehouse)
     _active_app_context = ctx
     return ctx
 
@@ -142,16 +169,6 @@ async def build_context(settings: Settings | None = None) -> AppContext:
 @asynccontextmanager
 async def lifespan(_server: FastMCP):
     ctx = await build_context()
-    if ctx.settings.bpd_auto_sync_on_start:
-        try:
-            from .sync import sync_new_files as _sync_new_files
-
-            logger.info("auto_sync_on_start")
-            await _sync_new_files(
-                ctx.client, ctx.warehouse_rw, ctx.settings, triggered_by="auto_sync_on_start"
-            )
-        except Exception as e:
-            logger.warning("auto_sync_on_start_failed", error=str(e))
     try:
         yield ctx
     finally:
@@ -166,246 +183,17 @@ def _ctx(c: Context) -> AppContext:
 
 
 # --------------------------------------------------------------------------------------
-# Files
+# Catalog
 # --------------------------------------------------------------------------------------
-
-
-@mcp.tool(
-    name="bpd_list_top_folders",
-    description=(
-        "List top-level Kiteworks folders. Use once during setup to find the vendor's "
-        "BPD folder (named with the BPID, e.g. 139440)."
-    ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def bpd_list_top_folders(
-    ctx: Context,
-    limit: int = 20,
-    offset: int = 0,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await files_tools.list_top_folders(
-        app.client,
-        ListTopFoldersInput(limit=limit, offset=offset, response_format=response_format),
-    )
-
-
-@mcp.tool(
-    name="bpd_list_folder_contents",
-    description=(
-        "Paginated listing of a Kiteworks folder. Supports name_contains and "
-        "extensions filters."
-    ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def bpd_list_folder_contents(
-    ctx: Context,
-    folder_id: str,
-    name_contains: str | None = None,
-    extensions: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await files_tools.list_folder_contents(
-        app.client,
-        ListFolderContentsInput(
-            folder_id=folder_id,
-            name_contains=name_contains,
-            extensions=extensions,
-            limit=limit,
-            offset=offset,
-            response_format=response_format,
-        ),
-    )
-
-
-@mcp.tool(
-    name="bpd_get_file_metadata",
-    description="Return size, fingerprint, dates, and parent folder for a Kiteworks file.",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def bpd_get_file_metadata(
-    ctx: Context,
-    file_id: str,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await files_tools.get_file_metadata(
-        app.client,
-        GetFileMetadataInput(file_id=file_id, response_format=response_format),
-    )
-
-
-@mcp.tool(
-    name="bpd_search_files",
-    description="Wrap Kiteworks /rest/query for ad-hoc file/folder/content search.",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def bpd_search_files(
-    ctx: Context,
-    query: str,
-    object_id: str | None = None,
-    search_type: Literal["f", "d", "e"] = "f",
-    include_content: bool = False,
-    limit: int = 20,
-    offset: int = 0,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await files_tools.search_files(
-        app.client,
-        SearchFilesInput(
-            query=query,
-            object_id=object_id,
-            search_type=search_type,
-            include_content=include_content,
-            limit=limit,
-            offset=offset,
-            response_format=response_format,
-        ),
-    )
-
-
-# --------------------------------------------------------------------------------------
-# Sync
-# --------------------------------------------------------------------------------------
-
-
-@mcp.tool(
-    name="bpd_sync_new_files",
-    description=(
-        "Main workhorse. Discovers any new BPD zip files in the vendor's Kiteworks "
-        "folder, downloads them, unzips, parses, and loads into the local DuckDB warehouse. "
-        "Optional `datasets` filter restricts which file patterns to process. "
-        "Set `dry_run=true` to preview without downloading."
-    ),
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def bpd_sync_new_files(
-    ctx: Context,
-    datasets: list[KnownDataset] | None = None,
-    dry_run: bool = False,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await sync_tools.sync_new_files(
-        app.client,
-        app.warehouse_rw,
-        app.settings,
-        SyncNewFilesInput(
-            datasets=datasets, dry_run=dry_run, response_format=response_format
-        ),
-    )
-
-
-@mcp.tool(
-    name="bpd_refresh_dataset",
-    description=(
-        "Re-load a single dataset. `full=true` clears the existing table and ledger for "
-        "that dataset first and re-downloads what Kiteworks still serves. DESTRUCTIVE: "
-        "Kiteworks retains only ~2 weeks of files, so full=true permanently discards "
-        "local history older than that. It requires confirm_destructive with the exact "
-        "phrase 'I understand this deletes local history', takes a mandatory pre-delete "
-        "backup, and refuses outright when the deletion would lose history Kiteworks "
-        "cannot re-serve (use bpd_reingest_local instead)."
-    ),
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def bpd_refresh_dataset(
-    ctx: Context,
-    dataset: KnownDataset,
-    full: bool = False,
-    confirm_destructive: str | None = None,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await sync_tools.refresh_dataset(
-        app.client,
-        app.warehouse_rw,
-        app.settings,
-        RefreshDatasetInput(
-            dataset=dataset,
-            full=full,
-            confirm_destructive=confirm_destructive,
-            response_format=response_format,
-        ),
-    )
-
-
-@mcp.tool(
-    name="bpd_reingest_local",
-    description=(
-        "Recovery tool: load BPD zips already in the local raw archive (~/.bpd-mcp/raw) "
-        "into the warehouse WITHOUT downloading anything. Use after data loss or to "
-        "ingest orphan zips that are no longer available in Kiteworks (~2-week source "
-        "retention makes the local archive the only copy of older history). Skips "
-        "already-loaded files by default; `dry_run=true` previews. Idempotent."
-    ),
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-async def bpd_reingest_local(
-    ctx: Context,
-    datasets: list[KnownDataset] | None = None,
-    only_unledgered: bool = True,
-    dry_run: bool = False,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await sync_tools.reingest_local(
-        app.warehouse_rw,
-        app.settings,
-        ReingestLocalInput(
-            datasets=datasets,
-            only_unledgered=only_unledgered,
-            dry_run=dry_run,
-            response_format=response_format,
-        ),
-    )
 
 
 @mcp.tool(
     name="bpd_list_datasets",
     description=(
-        "Summary of every loaded BPD dataset: row count, min/max data date, file count, "
-        "and last-loaded timestamp."
+        "Summary of every BPD dataset queryable in BigQuery: row count, snapshot "
+        "date range (freshness), content date range (how far order_d / fiscal "
+        "weeks / ETAs reach), the number of source files the upstream pipeline "
+        "has landed, and when it last landed one."
     ),
     annotations={
         "readOnlyHint": True,
@@ -419,8 +207,8 @@ async def bpd_list_datasets(
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
-    return await sync_tools.list_datasets(
-        app.warehouse_rw, ListDatasetsInput(response_format=response_format)
+    return await admin_tools.list_datasets(
+        app.warehouse, ListDatasetsInput(response_format=response_format)
     )
 
 
@@ -432,11 +220,14 @@ async def bpd_list_datasets(
 @mcp.tool(
     name="bpd_run_sql",
     description=(
-        "Execute arbitrary DuckDB SQL against the local warehouse. Read-only is "
-        "enforced at the engine level (each query runs inside BEGIN TRANSACTION "
-        "READ ONLY on a fresh cursor; DuckDB rejects writes at the engine layer) "
-        "AND at the input-validation level (multi-statement and DDL/DML tokens "
-        "rejected). Wraps the result in LIMIT to cap returned rows."
+        "Execute arbitrary BigQuery Standard SQL against the BPD logical tables "
+        "(sales_daily, sales_weekly, inventory_daily, orders_daily, "
+        "forecast_weekly, ... — see bpd_describe_schema). Reference them by bare "
+        "name; the server injects each referenced table as a CTE. Read-only is "
+        "enforced at the credential layer (the service account holds dataViewer "
+        "+ jobUser and cannot create or write anything) AND at the input "
+        "validator (multi-statement and DDL/DML tokens rejected). Every query is "
+        "dry-run first for cost, and the result is wrapped in LIMIT."
     ),
     annotations={
         "readOnlyHint": True,
@@ -453,7 +244,7 @@ async def bpd_run_sql(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.run_sql(
-        app.warehouse_ro,
+        app.warehouse,
         RunSqlInput(sql=sql, limit=limit, response_format=response_format),
     )
 
@@ -463,9 +254,9 @@ async def bpd_run_sql(
     description=(
         "Run a read-only SQL query and write the result to a CSV file in "
         "~/.bpd-mcp/exports/<filename>. Useful for sharing analytical results "
-        "with team members who don't have MCP access. Same read-only safety as "
-        "bpd_run_sql (engine + validator). Returns the absolute path so the user "
-        "can open the file in Finder."
+        "with team members who don't have MCP access. Same read-only safety and "
+        "cost gate as bpd_run_sql. Returns the absolute path so the user can "
+        "open the file in Finder."
     ),
     annotations={
         "readOnlyHint": False,
@@ -479,18 +270,21 @@ async def bpd_export_query_to_csv(
     sql: str,
     filename: str,
     include_header: bool = True,
-    max_rows: int = 1_000_000,
+    max_rows: int | None = None,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
+    # Default comes from settings (BPD_EXPORT_MAX_ROWS, 200k) rather than being
+    # hardcoded: on per-byte billing an unguarded export is a money question,
+    # not a disk question.
     return await query_tools.export_query_to_csv(
-        app.warehouse_ro,
+        app.warehouse,
         app.settings,
         ExportQueryToCsvInput(
             sql=sql,
             filename=filename,
             include_header=include_header,
-            max_rows=max_rows,
+            max_rows=max_rows if max_rows is not None else app.settings.bpd_export_max_rows,
             response_format=response_format,
         ),
     )
@@ -499,8 +293,9 @@ async def bpd_export_query_to_csv(
 @mcp.tool(
     name="bpd_describe_schema",
     description=(
-        "Return all tables, columns, and types in the local BPD warehouse. Also "
-        "exposed as the MCP resource `bpd://schema`."
+        "Return every BPD logical table, its columns and types, the BigQuery base "
+        "table behind it, and any latest-state reduction applied. Also exposed as "
+        "the MCP resource `bpd://schema`."
     ),
     annotations={
         "readOnlyHint": True,
@@ -514,7 +309,7 @@ async def bpd_describe_schema(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.describe_schema(
-        app.warehouse_ro, DescribeSchemaInput(response_format=response_format)
+        app.warehouse, DescribeSchemaInput(response_format=response_format)
     )
 
 
@@ -543,7 +338,7 @@ async def bpd_get_sales_summary(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_sales_summary(
-        app.warehouse_ro,
+        app.warehouse,
         SalesSummaryInput(
             grain=grain,
             start_date=start_date,
@@ -575,7 +370,7 @@ async def bpd_get_top_skus(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_top_skus(
-        app.warehouse_ro,
+        app.warehouse,
         TopSkusInput(
             by=by,
             start_date=start_date,
@@ -610,7 +405,7 @@ async def bpd_get_inventory_snapshot(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_inventory_snapshot(
-        app.warehouse_ro,
+        app.warehouse,
         InventorySnapshotInput(
             as_of=as_of,
             tcin=tcin,
@@ -646,7 +441,7 @@ async def bpd_get_sell_through(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_sell_through(
-        app.warehouse_ro,
+        app.warehouse,
         SellThroughInput(
             start_date=start_date,
             end_date=end_date,
@@ -659,17 +454,18 @@ async def bpd_get_sell_through(
 
 
 # --------------------------------------------------------------------------------------
-# S&OP analytics (May 2026 patch)
+# S&OP analytics
 # --------------------------------------------------------------------------------------
 
 
 @mcp.tool(
     name="bpd_get_open_orders",
     description=(
-        "Outstanding Target POs to the vendor, summed by SKU. orders_daily is a "
-        "latest-state order book (one row per PO line); open units are DERIVED as "
-        "revised_order_q - item_received_q - cancel_remaining_order_q, keeping "
-        "lines > 0. `as_of_date` filters by PO creation date (not time travel). "
+        "Outstanding Target POs to the vendor, summed by SKU. orders_daily is "
+        "reduced to a latest-state order book (one row per PO line, newest "
+        "snapshot_d wins); open units are DERIVED as revised_order_q - "
+        "item_received_q - cancel_remaining_order_q, keeping lines > 0. "
+        "`as_of_date` filters by PO creation date (not time travel). "
         "Returns po_count, open_units, line_count per TCIN; derivation in `extra`."
     ),
     annotations={
@@ -688,7 +484,7 @@ async def bpd_get_open_orders(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_open_orders(
-        app.warehouse_ro,
+        app.warehouse,
         OpenOrdersInput(
             as_of_date=as_of_date,
             location_filter=location_filter,
@@ -724,7 +520,7 @@ async def bpd_get_upcoming_pos(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_upcoming_pos(
-        app.warehouse_ro,
+        app.warehouse,
         UpcomingPosInput(
             weeks_forward=weeks_forward,
             tcin_filter=tcin_filter,
@@ -766,7 +562,7 @@ async def bpd_get_forecast_vs_actual(
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.get_forecast_vs_actual(
-        app.warehouse_ro,
+        app.warehouse,
         ForecastVsActualInput(
             weeks_back=weeks_back,
             tcin_filter=tcin_filter,
@@ -787,8 +583,13 @@ async def bpd_get_forecast_vs_actual(
 
 
 @mcp.tool(
-    name="bpd_auth_status",
-    description="Show Kiteworks authentication state, scope, and the user email via /rest/users/me.",
+    name="bpd_bigquery_status",
+    description=(
+        "Show which BigQuery identity this server is querying as (SESSION_USER()), "
+        "where the credential came from, the project and location it is pinned to, "
+        "which datasets are reachable, and the fact that the credential has NO write "
+        "capability. Replaces the old bpd_auth_status."
+    ),
     annotations={
         "readOnlyHint": True,
         "destructiveHint": False,
@@ -796,20 +597,24 @@ async def bpd_get_forecast_vs_actual(
         "openWorldHint": True,
     },
 )
-async def bpd_auth_status(
+async def bpd_bigquery_status(
     ctx: Context, response_format: ResponseFormat = "markdown"
 ) -> ToolResponse:
     app = _ctx(ctx)
-    return await admin_tools.auth_status(
-        app.auth, app.client, AuthStatusInput(response_format=response_format)
+    return await admin_tools.bigquery_status(
+        app.warehouse, BigQueryStatusInput(response_format=response_format)
     )
 
 
 @mcp.tool(
-    name="bpd_cache_status",
+    name="bpd_data_freshness",
     description=(
-        "Disk usage, row counts, oldest/newest data dates, and last sync time for the "
-        "local BPD cache."
+        "How current is the BPD data? Per-dataset snapshot and content date ranges "
+        "plus, from the upstream pipeline's own ledger (bpd_meta.ingestion_state), "
+        "per-pattern file counts, newest file date, last download time and lag in "
+        "days. Replaces the old bpd_cache_status (which measured local disk). Note "
+        "that a recent download means a FILE arrived, not that rows are queryable — "
+        "the per-dataset max_date is the authority on that."
     ),
     annotations={
         "readOnlyHint": True,
@@ -818,50 +623,27 @@ async def bpd_auth_status(
         "openWorldHint": False,
     },
 )
-async def bpd_cache_status(
+async def bpd_data_freshness(
     ctx: Context, response_format: ResponseFormat = "markdown"
 ) -> ToolResponse:
     app = _ctx(ctx)
-    return await admin_tools.cache_status(
-        app.warehouse_rw, app.settings, CacheStatusInput(response_format=response_format)
-    )
-
-
-@mcp.tool(
-    name="bpd_clear_cache",
-    description=(
-        "Destructive. Wipes raw zips, extracted files, and the DuckDB warehouse. "
-        "Requires `confirm=true`; otherwise returns a dry-run preview of what would "
-        "be deleted."
-    ),
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
-)
-async def bpd_clear_cache(
-    ctx: Context,
-    confirm: bool = False,
-    response_format: ResponseFormat = "markdown",
-) -> ToolResponse:
-    app = _ctx(ctx)
-    return await admin_tools.clear_cache(
-        app.warehouse_rw,
-        app.settings,
-        ClearCacheInput(confirm=confirm, response_format=response_format),
+    return await admin_tools.data_freshness(
+        app.warehouse, app.settings, DataFreshnessInput(response_format=response_format)
     )
 
 
 @mcp.tool(
     name="bpd_health_check",
     description=(
-        "Run a comprehensive multi-check health audit across auth, warehouse, sync ledger, "
-        "disk usage, and MCP self-state. Each check returns pass/warn/fail with a "
-        "human-readable detail. The aggregate `overall_status` is `fail` if any check "
-        "fails, `warn` if any warns and none fail, else `pass`. Use this as the first "
-        "call when diagnosing any MCP issue. Set `skip_network=true` for offline mode."
+        "Run a comprehensive multi-check audit across BigQuery credentials and "
+        "reachability, the logical-table registry, the column-role registry, "
+        "upstream feed freshness, and MCP self-state. Each check returns "
+        "pass/warn/fail with a human-readable detail. The aggregate "
+        "`overall_status` is `fail` if any check fails, `warn` if any warns and "
+        "none fail, else `pass`. Use this as the first call when diagnosing any "
+        "MCP issue. `skip_network=true` limits it to checks that need no "
+        "BigQuery call; `execute=true` makes the tool smoke test really run its "
+        "queries (billing bytes) instead of only dry-running them."
     ),
     annotations={
         "readOnlyHint": True,
@@ -873,16 +655,17 @@ async def bpd_clear_cache(
 async def bpd_health_check(
     ctx: Context,
     skip_network: bool = False,
+    execute: bool = False,
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await admin_tools.health_check(
-        auth=app.auth,
-        client=app.client,
-        warehouse=app.warehouse_rw,
+        warehouse=app.warehouse,
         settings=app.settings,
         params=HealthCheckInput(
-            skip_network=skip_network, response_format=response_format
+            skip_network=skip_network,
+            execute=execute,
+            response_format=response_format,
         ),
     )
 
@@ -892,16 +675,19 @@ async def bpd_health_check(
 # --------------------------------------------------------------------------------------
 
 
-@mcp.resource("bpd://schema", description="The current DuckDB warehouse schema as markdown.")
+@mcp.resource(
+    "bpd://schema",
+    description="The BPD logical-table schema (BigQuery-backed) as markdown.",
+)
 async def bpd_schema_resource() -> str:
     # FastMCP resources don't receive Context; reach into the module-level
-    # AppContext singleton set by build_context. This is the same writable
-    # warehouse the rest of the server uses, so the schema we report is the
-    # live schema (no snapshot drift).
+    # AppContext singleton set by build_context. Keep it: without it this
+    # resource has no way to find the live warehouse and would return the
+    # placeholder forever.
     if _active_app_context is None:
-        return "_(MCP server context not initialized yet — try again after first sync)_"
+        return "_(MCP server context not initialized yet — try again in a moment)_"
     resp = await query_tools.describe_schema(
-        _active_app_context.warehouse_ro, DescribeSchemaInput(response_format="markdown")
+        _active_app_context.warehouse, DescribeSchemaInput(response_format="markdown")
     )
     return resp.rendered
 

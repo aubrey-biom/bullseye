@@ -1,13 +1,15 @@
 #!/bin/bash
 # scripts/verify_install.sh
 #
-# Run after `git pull` to verify the install is healthy. The script ensures dev
-# dependencies (pytest, ruff) are installed by running `uv sync --all-extras` at
-# the top — so `git pull && ./scripts/verify_install.sh` always works in one step.
-# Exits 0 on pass, 1 on any failure.
+# Run after `git pull` to verify the install is healthy. Ensures dev
+# dependencies (pytest, ruff) are installed by running `uv sync --all-extras`
+# at the top — so `git pull && ./scripts/verify_install.sh` always works in one
+# step. Exits 0 on pass, 1 on any failure.
 #
-# Each check prints PASS/WARN/FAIL with a one-line explanation. Network calls
-# are avoided — this script verifies local install state only.
+# Local checks only. The one optional network step (a BigQuery reachability
+# probe) is skipped automatically when no credential is configured, so this
+# script is still useful offline. `bpd_health_check` inside the MCP is the
+# cross-cutting audit.
 
 set -e
 cd "$(dirname "$0")/.."
@@ -19,9 +21,7 @@ echo "=== bpd-mcp install verification ==="
 # Use whichever python launcher is available: prefer uv, then .venv/bin/python.
 if command -v uv >/dev/null 2>&1; then
     PY="uv run python"
-    # Patch #4 Issue 4: make sure dev extras (pytest, ruff) are installed before
-    # the script tries to use them. Idempotent — fast no-op if already current.
-    echo "[0/8] Ensuring dev dependencies are installed..."
+    echo "[0/7] Ensuring dev dependencies are installed..."
     uv sync --all-extras --quiet 2>&1 | sed 's/^/  /' || {
         echo "  WARN: 'uv sync --all-extras' did not run cleanly; continuing"
     }
@@ -32,28 +32,31 @@ else
     PY="python3"
 fi
 
-echo "[1/8] Python deps installed..."
+echo "[1/7] Python deps installed..."
 PYTHONPATH=src $PY -c "import bpd_mcp; print(f'  PASS  ({bpd_mcp.__version__})')" || { echo "  FAIL"; HAS_FAIL=1; }
 
-echo "[2/8] No legacy .ro snapshot..."
-if [ -f "$HOME/.bpd-mcp/bpd.duckdb.ro" ] || [ -f "$HOME/.bpd-mcp/bpd.duckdb.ro.wal" ]; then
-    echo "  FAIL: legacy bpd.duckdb.ro / .ro.wal exists. Kill MCP processes and delete them."
-    echo "        pkill -f bpd-mcp && rm -f ~/.bpd-mcp/bpd.duckdb.ro ~/.bpd-mcp/bpd.duckdb.ro.wal"
-    HAS_FAIL=1
+echo "[2/7] Server imports (this is the check that used to fail on the DuckDB lock)..."
+PYTHONPATH=src $PY -c "import bpd_mcp.server; print('  PASS')" || { echo "  FAIL"; HAS_FAIL=1; }
+
+echo "[3/7] No leftover DuckDB warehouse holding a lock..."
+# Purely informational. The BigQuery data layer takes no file lock, so a
+# leftover file cannot break anything — it is just dead bytes now.
+LEGACY=0
+for f in "$HOME/.bpd-mcp/bpd.duckdb" "$HOME/.bpd-mcp/bpd.duckdb.wal" \
+         "$HOME/.bpd-mcp/bpd.duckdb.ro" "$HOME/.bpd-mcp/bpd.duckdb.ro.wal"; do
+    [ -e "$f" ] && LEGACY=1
+done
+if [ "$LEGACY" = "1" ]; then
+    echo "  WARN: legacy DuckDB files remain in ~/.bpd-mcp. Nothing reads them."
+    echo "        Safe to remove once no old bpd-mcp process is running:"
+    echo "        rm -f ~/.bpd-mcp/bpd.duckdb*"
 else
     echo "  PASS"
 fi
 
-echo "[3/8] No orphan MCP processes..."
-if pgrep -f bpd-mcp >/dev/null 2>&1; then
-    echo "  WARN: bpd-mcp processes are running. Restart Claude Desktop after pulling."
-else
-    echo "  PASS"
-fi
-
-echo "[4/8] Tests pass..."
+echo "[4/7] Hermetic tests pass (no network, no credentials)..."
 if $PY -c "import pytest" 2>/dev/null; then
-    PYTHONPATH=src $PY -m pytest -q 2>&1 | tail -2
+    PYTHONPATH=src $PY -m pytest -q -m "not bq and not bq_live" 2>&1 | tail -2
     TEST_RC=${PIPESTATUS[0]}
     if [ "$TEST_RC" -ne 0 ]; then
         echo "  FAIL: pytest exit $TEST_RC"
@@ -64,7 +67,7 @@ else
     echo "        Run 'uv sync --all-extras' to enable."
 fi
 
-echo "[5/8] Ruff clean..."
+echo "[5/7] Ruff clean..."
 if $PY -c "import ruff" 2>/dev/null || command -v ruff >/dev/null 2>&1; then
     $PY -m ruff check src/ tests/ scripts/ >/dev/null 2>&1 \
         && echo "  PASS" \
@@ -74,70 +77,48 @@ else
     echo "        Run 'uv sync --all-extras' to enable."
 fi
 
-echo "[6/8] Warehouse schema up to date..."
+echo "[6/7] Tool count matches EXPECTED_TOOL_COUNT..."
 PYTHONPATH=src $PY <<'PYEOF'
-import os
-import duckdb
+from bpd_mcp.server import mcp
+from bpd_mcp.tools.admin import EXPECTED_TOOL_COUNT
 
-db = os.path.expanduser('~/.bpd-mcp/bpd.duckdb')
-if not os.path.exists(db):
-    print('  (no warehouse yet; will be built on first sync)')
-else:
-    try:
-        con = duckdb.connect(db, read_only=True)
-        cols = [
-            r[0]
-            for r in con.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = '_file_ledger'"
-            ).fetchall()
-        ]
-        con.close()
-    except Exception as e:
-        print(f'  FAIL: could not open {db}: {type(e).__name__}: {e}')
-        raise SystemExit(1)
-    required = [
-        'file_id', 'file_name', 'folder_id', 'dataset', 'file_date', 'bytes',
-        'fingerprint', 'downloaded_at', 'loaded_at', 'row_count', 'status',
-        'error_message', 'parse_method',
-    ]
-    missing = [c for c in required if c not in cols]
-    if missing:
-        print(f'  FAIL: _file_ledger missing columns: {missing}')
-        raise SystemExit(1)
-    print(f'  PASS ({len(cols)} columns)')
+tools = sorted(mcp._tool_manager._tools.keys())
+if len(tools) != EXPECTED_TOOL_COUNT:
+    print(f'  FAIL: {len(tools)} tools registered, expected {EXPECTED_TOOL_COUNT}')
+    print(f'        {tools}')
+    raise SystemExit(1)
+print(f'  PASS ({len(tools)} tools)')
 PYEOF
 [ "$?" -ne 0 ] && HAS_FAIL=1
 
-echo "[7/8] Tokens file 0600..."
-if [ -f "$HOME/.bpd-mcp/tokens.json" ]; then
-    PERMS=$(stat -c "%a" "$HOME/.bpd-mcp/tokens.json" 2>/dev/null || stat -f "%A" "$HOME/.bpd-mcp/tokens.json")
-    if [ "$PERMS" = "600" ]; then
-        echo "  PASS"
-    else
-        echo "  FAIL: tokens.json mode is $PERMS, expected 600"
-        HAS_FAIL=1
-    fi
-else
-    echo "  (no token yet; run uv run bpd-bootstrap to create)"
-fi
+echo "[7/7] BigQuery credential + reachability (skipped when unconfigured)..."
+PYTHONPATH=src $PY <<'PYEOF'
+import os
 
-echo "[8/8] MCP entry point..."
-# Importable + tool registration succeeds is enough; we don't actually start stdio.
-PYTHONPATH=src $PY -c "
-from bpd_mcp import server
-from bpd_mcp.tools.admin import EXPECTED_TOOL_COUNT
-n = len(server.mcp._tool_manager._tools)
-if n != EXPECTED_TOOL_COUNT:
-    print(f'  FAIL: tool count={n}, expected {EXPECTED_TOOL_COUNT}')
+if not (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GCP_SA_KEY_B64")):
+    print("  SKIP: neither GOOGLE_APPLICATION_CREDENTIALS nor GCP_SA_KEY_B64 is set.")
+    print("        The MCP needs one of them; see README Quickstart.")
+    raise SystemExit(0)
+
+from bpd_mcp.bq import BigQueryWarehouse
+from bpd_mcp.config import get_settings
+
+s = get_settings()
+try:
+    wh = BigQueryWarehouse(project=s.bpd_bq_project, location=s.bpd_bq_location)
+    _, rows = wh.execute_sql("SELECT SESSION_USER() AS u")
+    wh.close()
+except Exception as e:
+    print(f"  FAIL: {type(e).__name__}: {e}")
     raise SystemExit(1)
-print(f'  PASS ({n} tools registered)')
-" || HAS_FAIL=1
+print(f"  PASS (querying {s.bpd_bq_project}/{s.bpd_bq_location} as {rows[0][0]})")
+PYEOF
+[ "$?" -ne 0 ] && HAS_FAIL=1
 
-echo ""
-if [ "$HAS_FAIL" -ne 0 ]; then
-    echo "=== FAIL: some checks did not pass ==="
-    exit 1
+echo
+if [ "$HAS_FAIL" -eq 0 ]; then
+    echo "=== ALL CHECKS PASSED ==="
+    exit 0
 fi
-echo "=== All verifications passed ==="
-exit 0
+echo "=== SOME CHECKS FAILED (see above) ==="
+exit 1
