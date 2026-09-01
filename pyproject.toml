@@ -25,6 +25,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# scripts/pos_brief.py reads Target POS data from BigQuery, not from the local
+# DuckDB warehouse — it shares no code with the MCP server. Kept as an extra so
+# the server's runtime deps stay unchanged, but DECLARED, because it was only
+# ever installed ad-hoc into a container venv and vanished when that container
+# was recycled, which would have failed the scheduled brief silently.
+reporting = [
+    "google-cloud-bigquery>=3.20",
+]
+
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
