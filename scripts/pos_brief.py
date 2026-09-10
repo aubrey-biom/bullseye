@@ -59,6 +59,22 @@ NEW_SKU_MIN = 500.0
 OOS_GOAL = 5.0
 WIP_GOAL = 94.0
 
+# A SKU cannot ring up in-store sales from shelves the feed reports empty
+# everywhere: HS Go-Pack 20ct Santal read 100.0% OOS on 2026-09-06..09-08 while
+# still selling 36-54 units/day in-store, because the per-location stock-status
+# flags (instock_q/out_of_stock_q) dropped out for all but 2 of ~319 doors —
+# the item didn't sell out, the feed did. Gating on this keeps a coverage
+# collapse from rendering as a confident, actionable stockout.
+OOS_IMPLAUSIBLE = 90.0
+
+
+def _oos_implausible(s: Any) -> bool:
+    """True when a claimed near-total stockout contradicts the SKU's own sales
+    in the same window — evidence the stock-status feed dropped out rather
+    than the item actually going empty everywhere."""
+    return s.oos is not None and s.oos >= OOS_IMPLAUSIBLE and bool(s.units)
+
+
 # Category rollup used in leadership reporting: dispensers sit with the
 # cleaning franchise, Baby is broken out of Personal Care. Verified to
 # reproduce the 8/3 published mix exactly.
@@ -499,7 +515,9 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     # the goal math, not out of the in-stock flags. The sales floor keeps the
     # de-listed tail (Terracotta: 80% OOS on 2 units) from crowding the list.
     flagged = [s for s in skus if s.oos is not None and s.known and (s.amt or 0) >= NEW_SKU_MIN]
-    breaching = sorted([s for s in flagged if s.oos > OOS_GOAL], key=lambda s: -s.oos)
+    over_goal = [s for s in flagged if s.oos > OOS_GOAL]
+    breaching = sorted([s for s in over_goal if not _oos_implausible(s)], key=lambda s: -s.oos)
+    feed_gaps = sorted([s for s in over_goal if _oos_implausible(s)], key=lambda s: -s.oos)
     # Whatever is called out individually above is not repeated in the roll-up.
     worst_oos = sorted([s for s in flagged if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:3]
 
@@ -557,6 +575,13 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             f"• 🔴 **{s.name} is past the {OOS_GOAL:.1f}% in-stock goal** — "
             + ", ".join(bits)
             + f" on ${s.amt:,.0f} of sales."
+        )
+    for s in feed_gaps:
+        watch.append(
+            f"• 🟠 **{s.name} — inventory feed gap, not a confirmed stockout** — "
+            f"OOS reads {s.oos:.1f}% but it sold {int(s.units):,} units this week; "
+            "the stock-status feed likely dropped out rather than the item going "
+            "empty everywhere. Confirm before acting."
         )
     promo_now = cur.promo_amt / cur.amt * 100 if cur.amt else 0
     promo_then = (
@@ -750,7 +775,9 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
     # the weekly brief. Mid-week is when a developing stockout can still be acted
     # on, so rendering a 29% breach in the same flat format as a 3% one — which
     # is what this did — wastes the one report positioned to catch it.
-    breaching = sorted([s for s in flags if s.oos > OOS_GOAL], key=lambda s: -s.oos)
+    over_goal = [s for s in flags if s.oos > OOS_GOAL]
+    breaching = sorted([s for s in over_goal if not _oos_implausible(s)], key=lambda s: -s.oos)
+    feed_gaps = sorted([s for s in over_goal if _oos_implausible(s)], key=lambda s: -s.oos)
     for s in breaching:
         bits = [f"OOS {s.oos:.1f}%"]
         if s.prev_oos is not None:
@@ -762,6 +789,14 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
             f"🔴 **{s.name} is past the {OOS_GOAL:.1f}% in-stock goal** — "
             + ", ".join(bits)
             + ". Acting this week still changes the outcome.",
+        ]
+    for s in feed_gaps:
+        lines += [
+            "",
+            f"🟠 **{s.name} — inventory feed gap, not a confirmed stockout** — "
+            f"OOS reads {s.oos:.1f}% but it sold {int(s.units):,} units so far this "
+            "week; the stock-status feed likely dropped out rather than the item "
+            "going empty everywhere. Confirm before acting.",
         ]
 
     rest = sorted([s for s in flags if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:4]

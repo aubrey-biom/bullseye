@@ -309,6 +309,24 @@ def test_sku_past_the_in_stock_goal_gets_its_own_callout_with_the_trend() -> Non
     assert "Highest OOS" not in watch or "Dispenser - Black" not in watch.split("Highest OOS")[1]
 
 
+def test_weekly_flags_an_implausible_full_oos_as_a_feed_gap_not_a_breach() -> None:
+    """Same feed-dropout scenario as the pulse, in the weekly renderer: a SKU
+    that sold units this week cannot also be reported as universally OOS."""
+    d = _render_input(391_030.0, record_high=391_030.0)
+    gap = pos_brief._annotate([_sku("003-02-7872", amt=5_026.0, units=113.0)], CFG)[0]
+    gap.prev_amt, gap.eoh_ow = 5_143.0, 1_592.0
+    gap.wip, gap.oos = 0.0, 100.0
+    gap.prev_oos, gap.prev_eoh_ow = 41.7, 1_818.0
+    d["skus"] = [*d["skus"], gap]
+
+    main = pos_brief.render_weekly(d)["main"]
+    assert "🟠" in main
+    line = next(ln for ln in main.splitlines() if "inventory feed gap" in ln)
+    assert "Dispenser - Black" in line and "OOS reads 100.0%" in line
+    watch = main.split("**What to watch**")[1]
+    assert "past the" not in watch or "Dispenser - Black" not in watch.split("past the")[1]
+
+
 def test_render_reports_the_short_week_it_dropped() -> None:
     """Excluding a week from the averages is a judgement call, so it is stated
     in the footer rather than applied silently."""
@@ -363,6 +381,26 @@ def test_pulse_leads_with_a_breach_and_separates_the_watch_list() -> None:
     watch = main.split("Also watching")[1]
     assert "Disinf Refill 180ct Var" in watch
     assert "Dispenser - Black" not in watch, "a breach must not be repeated below"
+
+
+def test_pulse_flags_an_implausible_full_oos_as_a_feed_gap_not_a_breach() -> None:
+    """HS Go-Pack 20ct Santal read 100.0% OOS on 2026-09-06..09-08 while still
+    selling 36-54 units/day in-store — the per-location stock-status flags had
+    dropped out for all but 2 of ~319 doors, not the item going empty
+    everywhere. A SKU that is still selling cannot also be universally out of
+    stock, so it must not render as an actionable breach."""
+    gap = _pulse_sku("003-02-7872", 5_026.0, 100.0, 41.7, 1_592.0, 1_818.0)
+    gap.units = 113.0
+    minor = _pulse_sku("003-02-5627", 7_016.0, 3.7, 3.1, 8_499.0, 8_800.0)
+    main = pos_brief.render_pulse(_pulse_input([gap, minor]))["main"]
+
+    assert "past the" not in main
+    assert "🟠" in main
+    line = next(ln for ln in main.splitlines() if "inventory feed gap" in ln)
+    assert "Dispenser - Black" in line
+    assert "OOS reads 100.0%" in line and "sold 113 units" in line
+    watch = main.split("Also watching")[1]
+    assert "Dispenser - Black" not in watch
 
 
 def test_pulse_omits_the_breach_section_when_everything_is_in_stock() -> None:

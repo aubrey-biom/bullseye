@@ -12,11 +12,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EXTRAS="reporting"
-[ "${1:-}" = "dev" ] && EXTRAS="reporting,dev"
+CHECK_IMPORT="google.cloud.bigquery"
+[ "${1:-}" = "dev" ] && { EXTRAS="reporting,dev"; CHECK_IMPORT="google.cloud.bigquery, pytest"; }
 
 [ -x .venv/bin/python ] || uv venv .venv
 
-if ! .venv/bin/python -c 'import google.cloud.bigquery' 2>/dev/null; then
+if ! .venv/bin/python -c "import ${CHECK_IMPORT}" 2>/dev/null; then
   uv pip install --quiet --python .venv/bin/python -e ".[${EXTRAS}]"
 fi
 
