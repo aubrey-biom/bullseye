@@ -75,6 +75,33 @@ def _oos_implausible(s: Any) -> bool:
     return s.oos is not None and s.oos >= OOS_IMPLAUSIBLE and bool(s.units)
 
 
+def _lto_split(flagged: list[Any]) -> tuple[list[Any], list[Any]]:
+    """Separate limited-time items from the SKUs whose in-stock rate is a miss.
+
+    The HS 20ct go-pack and the LGR+PUR baby kits (Seafoam Grn, Lilac) are
+    limited-time items: selling out IS the plan, so a rising OOS on them is
+    the buy working, not an execution problem. Raising them as breaches puts
+    an expected sell-out next to a genuine one and trains the reader to skim
+    past the flags that do need acting on — so they get a neutral sell-through
+    line instead, and are dropped from every alert bucket.
+
+    Returns (limited-time, everything else), the first sorted by depletion.
+    """
+    lto = sorted([s for s in flagged if s.limited_time], key=lambda s: -s.oos)
+    return lto, [s for s in flagged if not s.limited_time]
+
+
+def _lto_line(s: Any, window: str) -> str:
+    """Sell-through for a limited-time item: units moved and cover left.
+
+    Deliberately does NOT print OOS%. For a sunsetting item that rate is both
+    expected and, once its doors start dropping out of the stock-status feed,
+    unreliable — while units sold and EOH+OW stay trustworthy.
+    """
+    left = f", {int(s.eoh_ow):,} units of cover left" if s.eoh_ow else ""
+    return f"  {s.name} — {int(s.units):,} units {window}{left}"
+
+
 # Category rollup used in leadership reporting: dispensers sit with the
 # cleaning franchise, Baby is broken out of Personal Care. Verified to
 # reproduce the 8/3 published mix exactly.
@@ -145,6 +172,8 @@ def _annotate(skus: list[Any], cfg: dict[str, Any]) -> list[Any]:
         s.doors_pog = meta.get("pog_doors") if s.dpci in ref else getattr(s, "doors", None)
         s.in_assortment = s.dpci in cfg["assortment"]
         s.known = s.dpci in ref
+        # Limited-time items are meant to sell out; see _lto_split.
+        s.limited_time = bool(meta.get("limited_time"))
         s.pspw = (s.amt / s.doors_pog) if s.doors_pog else None
         s.upspw = (s.units / s.doors_pog) if s.doors_pog else None
         s.pct_goal = (s.pspw / s.goal * 100) if (s.goal and s.pspw) else None
@@ -515,11 +544,12 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     # the goal math, not out of the in-stock flags. The sales floor keeps the
     # de-listed tail (Terracotta: 80% OOS on 2 units) from crowding the list.
     flagged = [s for s in skus if s.oos is not None and s.known and (s.amt or 0) >= NEW_SKU_MIN]
-    over_goal = [s for s in flagged if s.oos > OOS_GOAL]
+    lto, actionable = _lto_split(flagged)
+    over_goal = [s for s in actionable if s.oos > OOS_GOAL]
     breaching = sorted([s for s in over_goal if not _oos_implausible(s)], key=lambda s: -s.oos)
     feed_gaps = sorted([s for s in over_goal if _oos_implausible(s)], key=lambda s: -s.oos)
     # Whatever is called out individually above is not repeated in the roll-up.
-    worst_oos = sorted([s for s in flagged if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:3]
+    worst_oos = sorted([s for s in actionable if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:3]
 
     wos = inv[wk].eoh_ow / cur.units if wk in inv and cur.units else None
     wos_4ago = (
@@ -582,6 +612,12 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             f"OOS reads {s.oos:.1f}% but it sold {int(s.units):,} units this week; "
             "the stock-status feed likely dropped out rather than the item going "
             "empty everywhere. Confirm before acting."
+        )
+    if lto:
+        watch.append(
+            "• 🏁 **Limited-time items — selling through as intended** "
+            "(going out of stock is the plan here, not a miss):\n"
+            + "\n".join(_lto_line(s, "this week") for s in lto)
         )
     promo_now = cur.promo_amt / cur.amt * 100 if cur.amt else 0
     promo_then = (
@@ -775,7 +811,8 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
     # the weekly brief. Mid-week is when a developing stockout can still be acted
     # on, so rendering a 29% breach in the same flat format as a 3% one — which
     # is what this did — wastes the one report positioned to catch it.
-    over_goal = [s for s in flags if s.oos > OOS_GOAL]
+    lto, actionable = _lto_split(flags)
+    over_goal = [s for s in actionable if s.oos > OOS_GOAL]
     breaching = sorted([s for s in over_goal if not _oos_implausible(s)], key=lambda s: -s.oos)
     feed_gaps = sorted([s for s in over_goal if _oos_implausible(s)], key=lambda s: -s.oos)
     for s in breaching:
@@ -798,8 +835,15 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
             "week; the stock-status feed likely dropped out rather than the item "
             "going empty everywhere. Confirm before acting.",
         ]
+    if lto:
+        lines += [
+            "",
+            "🏁 **Limited-time items — selling through as intended** "
+            "(going out of stock is the plan here, not a miss):",
+            *[_lto_line(s, "so far this week") for s in lto],
+        ]
 
-    rest = sorted([s for s in flags if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:4]
+    rest = sorted([s for s in actionable if s.oos <= OOS_GOAL], key=lambda s: -s.oos)[:4]
     if rest:
         lines += ["", f"⚠️ **Also watching** (OOS over 2%, under the {OOS_GOAL:.1f}% goal):"]
         for s in rest:

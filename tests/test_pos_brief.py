@@ -132,7 +132,12 @@ CFG = {
     "as_of": "2026-08-03",
     "assortment": {
         "003-02-5627": {"name": "Disinf Refill 180ct Var", "goal_pspw": 51.96, "pog_doors": 1598},
-        "007-07-1897": {"name": "Baby Kit - Seafoam Grn", "goal_pspw": None, "pog_doors": 1387},
+        "007-07-1897": {
+            "name": "Baby Kit - Seafoam Grn",
+            "goal_pspw": None,
+            "pog_doors": 1387,
+            "limited_time": True,
+        },
     },
     "excluded": {
         "003-02-7872": {"name": "Dispenser - Black", "pog_doors": None, "reason": "online-only"},
@@ -327,6 +332,36 @@ def test_weekly_flags_an_implausible_full_oos_as_a_feed_gap_not_a_breach() -> No
     assert "past the" not in watch or "Dispenser - Black" not in watch.split("past the")[1]
 
 
+def test_weekly_reports_a_limited_time_item_as_sell_through_not_a_breach() -> None:
+    """Same limited-time rule in the weekly renderer: an LTO selling down is
+    the plan, so it must not land in the breach callouts or the Highest-OOS
+    roll-up alongside items that are genuinely missing the goal."""
+    d = _render_input(391_030.0, record_high=391_030.0)
+    lto = pos_brief._annotate([_sku("007-07-1897", amt=18_119.0, units=743.0)], CFG)[0]
+    lto.prev_amt, lto.eoh_ow = 17_000.0, 8_108.0
+    lto.wip, lto.oos = 94.4, 5.6
+    lto.prev_oos, lto.prev_eoh_ow = 5.3, 8_581.0
+    d["skus"] = [*d["skus"], lto]
+
+    watch = pos_brief.render_weekly(d)["main"].split("**What to watch**")[1]
+    sell = next(ln for ln in watch.splitlines() if "Baby Kit" in ln and "cover left" in ln)
+    assert "743 units this week" in sell and "8,108 units of cover left" in sell
+    assert "Baby Kit - Seafoam Grn is past the" not in watch
+    assert "Highest OOS" not in watch or "Baby Kit" not in watch.split("Highest OOS")[1]
+
+
+def test_shipped_goals_file_marks_the_limited_time_items() -> None:
+    """Pinned because the flag is what keeps an intended sell-out from paging
+    leadership: the HS 20ct go-pack and the two LGR+PUR baby kits."""
+    cfg = json.loads((ROOT / "config" / "pspw_goals.json").read_text())
+    ref = {**cfg["assortment"], **cfg["excluded"]}
+    assert {d for d, m in ref.items() if m.get("limited_time")} == {
+        "253-04-9259",  # HS Go-Pack 20ct Santal
+        "007-07-1897",  # Baby Kit - Seafoam Grn
+        "007-07-5306",  # Baby Kit - Lilac
+    }
+
+
 def test_render_reports_the_short_week_it_dropped() -> None:
     """Excluding a week from the averages is a judgement call, so it is stated
     in the footer rather than applied silently."""
@@ -401,6 +436,28 @@ def test_pulse_flags_an_implausible_full_oos_as_a_feed_gap_not_a_breach() -> Non
     assert "OOS reads 100.0%" in line and "sold 113 units" in line
     watch = main.split("Also watching")[1]
     assert "Dispenser - Black" not in watch
+
+
+def test_pulse_reports_a_limited_time_item_as_sell_through_not_a_breach() -> None:
+    """The HS 20ct go-pack and the LGR+PUR baby kits are limited-time buys that
+    are MEANT to sell out, so a rising OOS on them is the buy working. Raising
+    one as a breach puts an expected sell-out next to a genuine one and trains
+    the reader to skim past the flags that do need acting on."""
+    lto = _pulse_sku("007-07-1897", 6_117.0, 100.0, 41.7, 1_592.0, 1_818.0)
+    lto.units = 113.0
+    breach = _pulse_sku("003-02-5627", 7_016.0, 8.2, 6.0, 8_499.0, 8_800.0)
+    main = pos_brief.render_pulse(_pulse_input([lto, breach]))["main"]
+
+    sell = next(ln for ln in main.splitlines() if "Baby Kit" in ln and "cover left" in ln)
+    assert "113 units so far this week" in sell and "1,592 units of cover left" in sell
+    # An LTO's in-stock rate is both expected and — once its doors drop out of
+    # the stock-status feed — unreliable, so the rate itself is not printed.
+    assert "%" not in sell
+    # The genuine breach still leads; the LTO reaches no alert bucket at all.
+    assert "Disinf Refill 180ct Var is past the" in main
+    assert "Baby Kit - Seafoam Grn is past the" not in main
+    assert "inventory feed gap" not in main
+    assert "Also watching" not in main
 
 
 def test_pulse_omits_the_breach_section_when_everything_is_in_stock() -> None:
