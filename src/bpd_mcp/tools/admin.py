@@ -30,6 +30,7 @@ that is ~333 MB per call, and this module used to call `describe()` in a loop.
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -70,16 +71,20 @@ EXPECTED_DATA_GRAINS = frozenset({"daily", "weekly", "history_weekly"})
 # --------------------------------------------------------------------------------------
 
 
-async def list_datasets(
-    warehouse: BigQueryWarehouse, params: ListDatasetsInput
-) -> ToolResponse:
+async def list_datasets(warehouse: BigQueryWarehouse, params: ListDatasetsInput) -> ToolResponse:
     rows = warehouse.list_datasets()
     return make_table_response(
         rows=rows,
         columns=[
-            "dataset", "feed_kind", "status", "row_count",
-            "min_date", "max_date", "content_max_date",
-            "file_count", "last_loaded_at",
+            "dataset",
+            "feed_kind",
+            "status",
+            "row_count",
+            "min_date",
+            "max_date",
+            "content_max_date",
+            "file_count",
+            "last_loaded_at",
         ],
         extra={
             "notes": (
@@ -129,7 +134,7 @@ async def bigquery_status(
     # SESSION_USER() is the authoritative answer to "which service account?" —
     # it comes back from the server, not from the local credential file.
     try:
-        _, rows = warehouse.execute_sql("SELECT SESSION_USER() AS session_user")
+        _cols, rows = warehouse.execute_sql("SELECT SESSION_USER() AS session_user")
         data["session_user"] = rows[0][0] if rows else None
     except Exception as e:
         data["session_user_error"] = f"{type(e).__name__}: {e}"
@@ -139,9 +144,7 @@ async def bigquery_status(
         )
     except Exception as e:
         data["datasets_reachable_error"] = f"{type(e).__name__}: {e}"
-    return make_kv_response(
-        data=data, title="BigQuery status", fmt=params.response_format
-    )
+    return make_kv_response(data=data, title="BigQuery status", fmt=params.response_format)
 
 
 # --------------------------------------------------------------------------------------
@@ -235,9 +238,7 @@ async def data_freshness(
         ),
         "exports_dir": str(settings.exports_dir),
     }
-    return make_kv_response(
-        data=payload, title="BPD data freshness", fmt=params.response_format
-    )
+    return make_kv_response(data=payload, title="BPD data freshness", fmt=params.response_format)
 
 
 # --------------------------------------------------------------------------------------
@@ -253,10 +254,13 @@ async def data_freshness(
 EXPECTED_TOOL_COUNT = 17
 
 
-def _timed(fn):
+_CheckFn = Callable[..., Awaitable[HealthCheckResult]]
+
+
+def _timed(fn: _CheckFn) -> _CheckFn:
     """Decorator: wrap a check coroutine so it records duration_ms automatically."""
 
-    async def wrapper(*args, **kwargs) -> HealthCheckResult:
+    async def wrapper(*args: Any, **kwargs: Any) -> HealthCheckResult:
         t0 = time.perf_counter()
         try:
             result = await fn(*args, **kwargs)
@@ -277,9 +281,7 @@ def _timed(fn):
 
 
 @_timed
-async def _bq_credentials_present(
-    warehouse: BigQueryWarehouse, **_: Any
-) -> HealthCheckResult:
+async def _bq_credentials_present(warehouse: BigQueryWarehouse, **_: Any) -> HealthCheckResult:
     """A usable credential resolves. Reports its SOURCE, never its contents."""
     try:
         path, source = resolve_credentials()
@@ -296,9 +298,7 @@ async def _bq_credentials_present(
     if path is not None:
         detail += f" ({path})"
     detail += f"; warehouse is using: {warehouse.credentials_source}"
-    return HealthCheckResult(
-        name="bq_credentials_present", status="pass", detail=detail
-    )
+    return HealthCheckResult(name="bq_credentials_present", status="pass", detail=detail)
 
 
 @_timed
@@ -354,9 +354,7 @@ async def _config_validity(
             "threshold can never fire before the hard cap rejects the job"
         )
     if issues:
-        return HealthCheckResult(
-            name="config_validity", status="fail", detail="; ".join(issues)
-        )
+        return HealthCheckResult(name="config_validity", status="fail", detail="; ".join(issues))
     cap_gib = settings.bpd_bq_max_bytes_billed / (1024**3)
     warn_gib = settings.bpd_bq_warn_bytes / (1024**3)
     return HealthCheckResult(
@@ -380,10 +378,7 @@ async def _mcp_self_check(**_: Any) -> HealthCheckResult:
         return HealthCheckResult(
             name="mcp_self_check",
             status="fail",
-            detail=(
-                f"only {len(tools)}/{EXPECTED_TOOL_COUNT} tools registered. "
-                f"Tools: {tools}"
-            ),
+            detail=(f"only {len(tools)}/{EXPECTED_TOOL_COUNT} tools registered. Tools: {tools}"),
         )
     if len(tools) > EXPECTED_TOOL_COUNT:
         return HealthCheckResult(
@@ -409,7 +404,7 @@ async def _bq_reachable_as(warehouse: BigQueryWarehouse, **_: Any) -> HealthChec
     """A real query round-trips, and we learn which identity ran it."""
     expected_project = warehouse.project
     try:
-        _, rows = warehouse.execute_sql("SELECT SESSION_USER() AS session_user")
+        _cols, rows = warehouse.execute_sql("SELECT SESSION_USER() AS session_user")
     except Exception as e:
         return HealthCheckResult(
             name="bq_reachable_as",
@@ -432,15 +427,11 @@ async def _bq_reachable_as(warehouse: BigQueryWarehouse, **_: Any) -> HealthChec
                 f"{expected_project}. Check GOOGLE_APPLICATION_CREDENTIALS."
             ),
         )
-    return HealthCheckResult(
-        name="bq_reachable_as", status="pass", detail=f"querying as {who}"
-    )
+    return HealthCheckResult(name="bq_reachable_as", status="pass", detail=f"querying as {who}")
 
 
 @_timed
-async def _bq_datasets_reachable(
-    warehouse: BigQueryWarehouse, **_: Any
-) -> HealthCheckResult:
+async def _bq_datasets_reachable(warehouse: BigQueryWarehouse, **_: Any) -> HealthCheckResult:
     """The three datasets the server reads must all be listable."""
     from ..bq import base_datasets
 
@@ -472,9 +463,7 @@ async def _bq_datasets_reachable(
 
 
 @_timed
-async def _registry_tables_resolve(
-    warehouse: BigQueryWarehouse, **_: Any
-) -> HealthCheckResult:
+async def _registry_tables_resolve(warehouse: BigQueryWarehouse, **_: Any) -> HealthCheckResult:
     """Every logical table's body compiles, and every base table exists.
 
     This is the new central failure surface: the registry projection replaced
@@ -532,14 +521,12 @@ async def _registry_tables_resolve(
             f"SELECT DISTINCT '{fq}' AS src, data_grain FROM `{fq}`" for fq in grain_sources
         )
         try:
-            _, rows = warehouse.execute_sql(union)
+            _cols, rows = warehouse.execute_sql(union)
         except Exception as e:
             grain_note = f"; data_grain guard could not run ({type(e).__name__})"
         else:
             unexpected = sorted(
-                f"{r[0]}.data_grain={r[1]!r}"
-                for r in rows
-                if r[1] not in EXPECTED_DATA_GRAINS
+                f"{r[0]}.data_grain={r[1]!r}" for r in rows if r[1] not in EXPECTED_DATA_GRAINS
             )
             if unexpected:
                 return HealthCheckResult(
@@ -586,8 +573,7 @@ async def _roles_resolvable(warehouse: BigQueryWarehouse, **_: Any) -> HealthChe
 
     def _fmt(fs: list[dict[str, Any]]) -> str:
         return "; ".join(
-            f"{f['dataset']}.{f['role']} (tried {f['candidates']}; "
-            f"table has {f['actual_columns']})"
+            f"{f['dataset']}.{f['role']} (tried {f['candidates']}; table has {f['actual_columns']})"
             for f in fs
         )
 
@@ -714,9 +700,7 @@ async def _feed_freshness(warehouse: BigQueryWarehouse, **_: Any) -> HealthCheck
 
 
 @_timed
-async def _known_unpopulated_columns(
-    warehouse: BigQueryWarehouse, **_: Any
-) -> HealthCheckResult:
+async def _known_unpopulated_columns(warehouse: BigQueryWarehouse, **_: Any) -> HealthCheckResult:
     """Reverse drift detection for KNOWN_UNPOPULATED_AT_SOURCE columns.
 
     These columns ship as Target's `""` NULL placeholder — a data-source fact,
@@ -743,7 +727,7 @@ async def _known_unpopulated_columns(
             if col not in present:
                 continue
             ident = quote_ident(col)
-            _, rows = warehouse.execute_sql(
+            _cols, rows = warehouse.execute_sql(
                 f"SELECT COUNT(*) AS total, "
                 f"COUNTIF({ident} IS NULL OR TRIM(CAST({ident} AS STRING)) IN ('\"\"', '')) "
                 f"AS placeholder FROM {dataset}"
@@ -765,7 +749,8 @@ async def _known_unpopulated_columns(
             status="warn",
             detail=(
                 "Target has started meaningfully populating column(s) we treat as "
-                "always-NULL: " + ", ".join(newly_populated)
+                "always-NULL: "
+                + ", ".join(newly_populated)
                 + " — consider promoting to a column_roles role (but do NOT start "
                 "filtering on it without checking how much of the table it drops)"
             ),
@@ -851,14 +836,29 @@ async def _tools_smoke_test(
         ("bpd_describe_schema", lambda: query_tools.describe_schema(wh, DescribeSchemaInput())),
         ("bpd_get_sales_summary", lambda: query_tools.get_sales_summary(wh, SalesSummaryInput())),
         ("bpd_get_top_skus", lambda: query_tools.get_top_skus(wh, TopSkusInput(top_n=1))),
-        ("bpd_get_inventory_snapshot", lambda: query_tools.get_inventory_snapshot(wh, InventorySnapshotInput(limit=1))),
+        (
+            "bpd_get_inventory_snapshot",
+            lambda: query_tools.get_inventory_snapshot(wh, InventorySnapshotInput(limit=1)),
+        ),
         ("bpd_get_sell_through", lambda: query_tools.get_sell_through(wh, SellThroughInput())),
         ("bpd_get_open_orders", lambda: query_tools.get_open_orders(wh, OpenOrdersInput())),
         ("bpd_get_upcoming_pos", lambda: query_tools.get_upcoming_pos(wh, UpcomingPosInput())),
-        ("bpd_get_forecast_vs_actual", lambda: query_tools.get_forecast_vs_actual(wh, ForecastVsActualInput())),
-        ("bpd_get_dtc_sales_summary", lambda: dtc_tools.get_dtc_sales_summary(wh, DtcSalesSummaryInput())),
-        ("bpd_get_ads_performance", lambda: dtc_tools.get_ads_performance(wh, AdsPerformanceInput())),
-        ("bpd_get_marketing_efficiency", lambda: dtc_tools.get_marketing_efficiency(wh, MarketingEfficiencyInput())),
+        (
+            "bpd_get_forecast_vs_actual",
+            lambda: query_tools.get_forecast_vs_actual(wh, ForecastVsActualInput()),
+        ),
+        (
+            "bpd_get_dtc_sales_summary",
+            lambda: dtc_tools.get_dtc_sales_summary(wh, DtcSalesSummaryInput()),
+        ),
+        (
+            "bpd_get_ads_performance",
+            lambda: dtc_tools.get_ads_performance(wh, AdsPerformanceInput()),
+        ),
+        (
+            "bpd_get_marketing_efficiency",
+            lambda: dtc_tools.get_marketing_efficiency(wh, MarketingEfficiencyInput()),
+        ),
         ("bpd_list_datasets", lambda: list_datasets(warehouse, ListDatasetsInput())),
         ("bpd_data_freshness", lambda: data_freshness(warehouse, settings, DataFreshnessInput())),
     ]

@@ -44,7 +44,7 @@ from ..column_roles import (
     resolve_column,
     table_exists,
 )
-from ..config import get_settings
+from ..config import Settings, get_settings
 from ..formatting import (
     make_error_response,
     make_kv_response,
@@ -80,8 +80,7 @@ log = get_logger(__name__)
 # advice. Every logical table is a view over a BigQuery table that an
 # independent pipeline fills.
 _PIPELINE_NOTE = (
-    "the upstream Kiteworks -> GCS -> BigQuery pipeline loads it daily around "
-    "06:47 UTC"
+    "the upstream Kiteworks -> GCS -> BigQuery pipeline loads it daily around 06:47 UTC"
 )
 
 
@@ -91,9 +90,7 @@ def _backing_source(table: str) -> str | None:
     return entry.primary_base_table if entry is not None else None
 
 
-def _missing_table_error(
-    *, table: str, fmt: str, hint: str | None = None
-) -> ToolResponse:
+def _missing_table_error(*, table: str, fmt: str, hint: str | None = None) -> ToolResponse:
     src = _backing_source(table)
     if src is not None:
         why = f"{table!r} is backed by `{src}`, but {_PIPELINE_NOTE} and has "
@@ -173,9 +170,7 @@ def _effective_date_range(
     return None, None
 
 
-def _alternative_sales_source(
-    warehouse: Warehouse, chosen: str
-) -> dict[str, Any] | None:
+def _alternative_sales_source(warehouse: Warehouse, chosen: str) -> dict[str, Any] | None:
     """Coverage of the sales table NOT chosen, so callers can see when the
     other grain reaches further back and opt in via `grain` (Patch #12)."""
     other = "sales_daily" if chosen == "sales_weekly" else "sales_weekly"
@@ -375,9 +370,7 @@ def _pick_sales_table(warehouse: Warehouse, grain: str) -> str | None:
     return None
 
 
-async def get_sales_summary(
-    warehouse: Warehouse, params: SalesSummaryInput
-) -> ToolResponse:
+async def get_sales_summary(warehouse: Warehouse, params: SalesSummaryInput) -> ToolResponse:
     fmt = params.response_format
     table = _pick_sales_table(warehouse, params.grain)
     if table is None:
@@ -435,17 +428,13 @@ async def get_sales_summary(
     if params.tcin is not None:
         try:
             tcin_col = resolve_column(warehouse, table, "tcin")
-            where_clauses.append(
-                f"{quote_ident(tcin_col.name)} = {int(params.tcin)}"
-            )
+            where_clauses.append(f"{quote_ident(tcin_col.name)} = {int(params.tcin)}")
         except ColumnNotFound:
             where_clauses.append(f"tcin = {int(params.tcin)}")
     if params.location_id is not None:
         try:
             loc_col = resolve_column(warehouse, table, "location")
-            where_clauses.append(
-                f"{quote_ident(loc_col.name)} = {int(params.location_id)}"
-            )
+            where_clauses.append(f"{quote_ident(loc_col.name)} = {int(params.location_id)}")
         except ColumnNotFound:
             return make_error_response(
                 code="SCHEMA_INCOMPATIBLE",
@@ -517,17 +506,17 @@ async def get_sales_summary(
         # (unknowable) rather than False.
         for r in dict_rows:
             r["partial_bucket"] = False if _bounds(r["bucket"]) else None
-        dated = [r for r in dict_rows if _bounds(r["bucket"]) is not None]
-        first = min(dated, key=lambda r: _bounds(r["bucket"])[0], default=None)
-        last = max(dated, key=lambda r: _bounds(r["bucket"])[1], default=None)
+        dated = [(r, b) for r in dict_rows if (b := _bounds(r["bucket"])) is not None]
+        first = min(dated, key=lambda rb: rb[1][0], default=None)
+        last = max(dated, key=lambda rb: rb[1][1], default=None)
         if first is not None:
-            fb = _bounds(first["bucket"])
+            first_row, fb = first
             if eff_min > fb[0] + tol:
-                first["partial_bucket"] = True
+                first_row["partial_bucket"] = True
         if last is not None:
-            lb = _bounds(last["bucket"])
+            last_row, lb = last
             if eff_max < lb[1] - tol:
-                last["partial_bucket"] = True
+                last_row["partial_bucket"] = True
 
     extra: dict[str, Any] = {
         "table": table,
@@ -552,7 +541,9 @@ async def get_sales_summary(
     range_str = f", {eff_min}..{eff_max}" if eff_min and eff_max else ""
     return make_table_response(
         rows=dict_rows,
-        columns=[*cols, "partial_bucket"] if dict_rows and "partial_bucket" in dict_rows[0] else cols,
+        columns=[*cols, "partial_bucket"]
+        if dict_rows and "partial_bucket" in dict_rows[0]
+        else cols,
         title=f"Sales summary ({params.grain}, table={table}{range_str})",
         extra=extra,
         fmt=fmt,
@@ -697,7 +688,7 @@ async def get_inventory_snapshot(
                        ORDER BY {date_expr} DESC
                    ) AS rn
             FROM {quote_ident(table)}
-            WHERE {' AND '.join(where)}
+            WHERE {" AND ".join(where)}
         )
         SELECT tcin, location_id, dt AS as_of_date, on_hand
         FROM ranked WHERE rn = 1 {stale_filter}
@@ -723,12 +714,11 @@ async def get_inventory_snapshot(
         # Staleness is per-pair vs the feed's newest in-window day; feed lag
         # (as_of vs that day) is a separate number — surfaced so "0 days
         # stale" next to a newer as_of can't read as same-day data.
-        "feed_lag_days_vs_as_of": (
-            (as_of - window_max).days if window_max is not None else None
-        ),
+        "feed_lag_days_vs_as_of": ((as_of - window_max).days if window_max is not None else None),
         "max_staleness_days_filter": params.max_staleness_days,
     }
     if window_max is not None and dict_rows:
+
         def _days_old(v: Any) -> int | None:
             d = _as_pydate(v)
             return (window_max - d).days if d is not None else None
@@ -895,7 +885,8 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
             },
             "inventory_max_date": str(
                 _effective_date_range(warehouse, inv_table, inv_date_expr)[1] or ""
-            ) or None,
+            )
+            or None,
             "max_staleness_days_filter": params.max_staleness_days,
             "sql": sql,
         },
@@ -915,9 +906,7 @@ async def get_sell_through(warehouse: Warehouse, params: SellThroughInput) -> To
 # Target orders/po_plan columns.
 
 
-def _try_resolve(
-    warehouse: Warehouse, dataset: str, role: str
-) -> ResolvedColumn | None:
+def _try_resolve(warehouse: Warehouse, dataset: str, role: str) -> ResolvedColumn | None:
     """`resolve_column`, but None instead of raising — for optional roles."""
     try:
         return resolve_column(warehouse, dataset, role)
@@ -936,9 +925,7 @@ def _in_list_sql(col: str, values: list[int] | None) -> str | None:
 # ---------- bpd_get_open_orders ----------
 
 
-async def get_open_orders(
-    warehouse: Warehouse, params: OpenOrdersInput
-) -> ToolResponse:
+async def get_open_orders(warehouse: Warehouse, params: OpenOrdersInput) -> ToolResponse:
     """Outstanding Target POs summed by SKU, derived from the latest-state order book.
 
     orders_daily is a delta feed that DuckDB materialized as LATEST STATE: each
@@ -1018,8 +1005,7 @@ async def get_open_orders(
         ") "
     )
     sql = (
-        lines_cte
-        + "SELECT tcin, COUNT(DISTINCT po_id) AS po_count, "
+        lines_cte + "SELECT tcin, COUNT(DISTINCT po_id) AS po_count, "
         "SUM(open_units) AS open_units, COUNT(*) AS line_count "
         "FROM lines WHERE open_units > 0 "
         "GROUP BY tcin ORDER BY open_units DESC NULLS LAST"
@@ -1041,8 +1027,7 @@ async def get_open_orders(
     over_received: dict[str, Any] | None = None
     try:
         _, ov = warehouse.execute_sql(
-            lines_cte
-            + "SELECT COUNT(*), COALESCE(SUM(-open_units), 0) "
+            lines_cte + "SELECT COUNT(*), COALESCE(SUM(-open_units), 0) "
             "FROM lines WHERE open_units < 0"
         )
         if ov:
@@ -1083,9 +1068,7 @@ async def get_open_orders(
 # ---------- bpd_get_upcoming_pos ----------
 
 
-async def get_upcoming_pos(
-    warehouse: Warehouse, params: UpcomingPosInput
-) -> ToolResponse:
+async def get_upcoming_pos(warehouse: Warehouse, params: UpcomingPosInput) -> ToolResponse:
     """Forward-looking PO plan from po_plan_daily + po_plan_biweekly.
 
     Both po_plan tables ACCUMULATE snapshots: their natural key includes
@@ -1100,9 +1083,7 @@ async def get_upcoming_pos(
     the same planned order. Per-source totals are in `extra.source_totals`.
     """
     fmt = params.response_format
-    tables = [
-        t for t in ("po_plan_daily", "po_plan_biweekly") if table_exists(warehouse, t)
-    ]
+    tables = [t for t in ("po_plan_daily", "po_plan_biweekly") if table_exists(warehouse, t)]
     if not tables:
         return make_error_response(
             code="DATA_UNAVAILABLE",
@@ -1132,13 +1113,9 @@ async def get_upcoming_pos(
         # aborting the tool (review fix).
         snap_day = f"SAFE_CAST({snap.select_as_date()} AS DATE)"
         try:
-            _, mx = warehouse.execute_sql(
-                f"SELECT MAX({snap_day}) FROM {quote_ident(table)}"
-            )
+            _, mx = warehouse.execute_sql(f"SELECT MAX({snap_day}) FROM {quote_ident(table)}")
         except Exception as e:
-            skipped_tables[table] = (
-                f"latest-snapshot probe failed: {type(e).__name__}: {e}"
-            )
+            skipped_tables[table] = f"latest-snapshot probe failed: {type(e).__name__}: {e}"
             continue
         latest_snapshot = mx[0][0] if mx else None
         if latest_snapshot is None:
@@ -1166,8 +1143,7 @@ async def get_upcoming_pos(
         where = [
             f"{snap_day} = DATE '{latest_iso}'",
             f"{order_expr} >= CURRENT_DATE()",
-            f"{order_expr} < DATE_ADD(CURRENT_DATE(), "
-            f"INTERVAL {int(params.weeks_forward)} WEEK)",
+            f"{order_expr} < DATE_ADD(CURRENT_DATE(), INTERVAL {int(params.weeks_forward)} WEEK)",
         ]
         tcin_filter = _in_list_sql(tcin_col.name, params.tcin_filter)
         if tcin_filter:
@@ -1238,9 +1214,7 @@ async def get_upcoming_pos(
     dict_rows = _rows_to_dicts(out_cols, rows)
     source_totals: dict[str, Any] = {}
     for r in dict_rows:
-        source_totals[r["source"]] = (
-            source_totals.get(r["source"], 0) + (r["planned_units"] or 0)
-        )
+        source_totals[r["source"]] = source_totals.get(r["source"], 0) + (r["planned_units"] or 0)
     extra: dict[str, Any] = {
         "resolved_columns": resolved_cols,
         "source_totals": source_totals,
@@ -1266,10 +1240,7 @@ async def get_upcoming_pos(
     return make_table_response(
         rows=dict_rows,
         columns=out_cols,
-        title=(
-            f"Upcoming POs (next {params.weeks_forward} weeks, "
-            "latest snapshot per source)"
-        ),
+        title=(f"Upcoming POs (next {params.weeks_forward} weeks, latest snapshot per source)"),
         extra=extra,
         fmt=fmt,
     )
@@ -1325,7 +1296,7 @@ def _classify_forecast_drops(
         # The earlier +7d forward tolerance swallowed the retro pattern and
         # labeled every drop forward_horizon; retro must be tested FIRST on
         # the week-END side.
-        if snap is None or min_week is None:
+        if snap is None or min_week is None or max_week is None:
             kind = "anomalous"
         elif snap > max_week + _td(days=6):
             kind = "weekly_retrospective"
@@ -1433,7 +1404,7 @@ async def get_forecast_vs_actual(
             message=f"actuals coverage probe failed: {e}",
             fmt=fmt,
         )
-    act_min, act_max = (cov[0] if cov else (None, None))
+    act_min, act_max = cov[0] if cov else (None, None)
     if act_min is None:
         return make_error_response(
             code="DATA_UNAVAILABLE",
@@ -1507,6 +1478,12 @@ async def get_forecast_vs_actual(
         fc_where.append(f"{quote_ident(fc_tcin.name)} IN ({tcin_in})")
         act_where.append(f"{quote_ident(act_tcin.name)} IN ({tcin_in})")
     if params.location_filter:
+        if fc_loc is None or act_loc is None:
+            return make_error_response(
+                code="SCHEMA_INCOMPATIBLE",
+                message="location_filter requires a location column on both tables.",
+                fmt=fmt,
+            )
         loc_in = ",".join(str(int(v)) for v in params.location_filter)
         fc_where.append(f"{quote_ident(fc_loc.name)} IN ({loc_in})")
         act_where.append(f"{quote_ident(act_loc.name)} IN ({loc_in})")
@@ -1556,9 +1533,7 @@ async def get_forecast_vs_actual(
             cutoff_sql = f"DATE_SUB({fc_week_begin_expr}, INTERVAL {lead} DAY)"
         else:
             cutoff_sql = f"DATE_ADD({fc_week_begin_expr}, INTERVAL {-lead} DAY)"
-        cutoff_desc = (
-            f"pre_week (snapshot at least {lead} day(s) before each week began)"
-        )
+        cutoff_desc = f"pre_week (snapshot at least {lead} day(s) before each week began)"
     elif fc_snap is None:
         cutoff_sql = None
         cutoff_desc = "latest_available (table has no snapshot column)"
@@ -1601,10 +1576,14 @@ async def get_forecast_vs_actual(
         fc_cells_where = f"WHERE {' AND '.join(fc_where)}"
 
     fc_loc_proj = (
-        f"{quote_ident(fc_loc.name)} AS location_id, " if spine_has_location else ""
+        f"{quote_ident(fc_loc.name)} AS location_id, "
+        if spine_has_location and fc_loc is not None
+        else ""
     )
     act_loc_proj = (
-        f"{quote_ident(act_loc.name)} AS location_id, " if spine_has_location else ""
+        f"{quote_ident(act_loc.name)} AS location_id, "
+        if spine_has_location and act_loc is not None
+        else ""
     )
 
     cte_prefix = f"""
@@ -1730,8 +1709,9 @@ async def get_forecast_vs_actual(
     kind_ix = all_cols.index("_kind")
     out_cols = [c for c in all_cols if c != "_kind"]
     assert out_cols == result_cols, (out_cols, result_cols)
-    cov_ix = {c: all_cols.index(c) for c in ("coverage", "forecast_units",
-                                             "actual_units", "cell_count")}
+    cov_ix = {
+        c: all_cols.index(c) for c in ("coverage", "forecast_units", "actual_units", "cell_count")
+    }
     rows = [
         tuple(v for i, v in enumerate(r) if i != kind_ix)
         for r in all_rows
@@ -1873,7 +1853,7 @@ def _validate_export_filename(name: str) -> str | None:
 
 async def export_query_to_csv(
     read_only_warehouse: Warehouse,
-    settings,  # avoid circular import on Settings type
+    settings: Settings,
     params: ExportQueryToCsvInput,
 ) -> ToolResponse:
     """Run a read-only SQL query and write the result to ~/.bpd-mcp/exports/<filename>.
@@ -1938,6 +1918,7 @@ async def export_query_to_csv(
             writer.writerow(row)
 
     import os
+
     os.chmod(target, 0o644)
     bytes_written = target.stat().st_size
 
