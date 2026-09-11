@@ -251,7 +251,7 @@ async def data_freshness(
 # clear_cache = 14. Kept in lockstep with server.py by `_mcp_self_check` and by
 # a drift guard in the test suite — bump it in the SAME commit as any tool
 # addition or removal, or every user's health check hard-fails.
-EXPECTED_TOOL_COUNT = 17
+EXPECTED_TOOL_COUNT = 18
 
 
 _CheckFn = Callable[..., Awaitable[HealthCheckResult]]
@@ -770,7 +770,7 @@ class _DryRunWarehouse:
 
     Used by the tool smoke test. It proves the SQL each tool composes actually
     compiles against BigQuery — including every dialect translation and every
-    resolved column name — at 0 bytes billed, where really invoking 14 tools
+    resolved column name — at 0 bytes billed, where really invoking 15 tools
     scans real data on every health check.
 
     Returns the dry run's own schema with ZERO rows, so tools take their
@@ -816,6 +816,7 @@ async def _tools_smoke_test(
     from ..schemas import (
         AdsPerformanceInput,
         DescribeSchemaInput,
+        DtcPacingInput,
         DtcSalesSummaryInput,
         ForecastVsActualInput,
         InventorySnapshotInput,
@@ -861,6 +862,7 @@ async def _tools_smoke_test(
         ),
         ("bpd_list_datasets", lambda: list_datasets(warehouse, ListDatasetsInput())),
         ("bpd_data_freshness", lambda: data_freshness(warehouse, settings, DataFreshnessInput())),
+        ("bpd_get_dtc_pacing", lambda: dtc_tools.get_dtc_pacing(wh, DtcPacingInput())),
     ]
 
     invoked: list[str] = []

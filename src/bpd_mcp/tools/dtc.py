@@ -14,6 +14,10 @@ to the registry (the "DTC + ads" block of bq.py):
                                 core-D2C sales and new customers per period
                                 (MER, blended CAC, cost per order) beside the
                                 platforms' own attributed ROAS.
+  * `get_dtc_pacing`          — month-to-date pacing of demand, spend and new
+                                customers against the ecomm team's daily
+                                forecast (config/dtc_pacing_targets.json), the
+                                prior period, last month and last year.
 
 Definitions are the registry's, never re-derived here:
 
@@ -56,17 +60,21 @@ SCHEMA_INCOMPATIBLE with the candidates tried, exactly like the Target tools.
 
 from __future__ import annotations
 
+import calendar
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..bq import DTC_SOURCE_BUCKETS
 from ..column_roles import ColumnNotFound, ResolvedColumn, resolve_column, table_exists
-from ..formatting import make_error_response, make_table_response
+from ..formatting import make_error_response, make_table_response, render_markdown_table
 from ..logging_setup import get_logger
+from ..pacing_targets import REFRESH_COMMAND, PacingTargets, TargetsUnavailable, load_targets
 from ..schemas import (
     AdsPerformanceInput,
+    DtcPacingInput,
     DtcSalesSummaryInput,
     MarketingEfficiencyInput,
     ToolResponse,
@@ -974,3 +982,564 @@ LIMIT {ROW_CAP}
     return make_table_response(
         rows=rows, columns=list(_EFFICIENCY_MARKDOWN_COLUMNS), title=title, extra=extra, fmt=fmt
     )
+
+
+# --------------------------------------------------------------------------------------
+# bpd_get_dtc_pacing
+# --------------------------------------------------------------------------------------
+#
+# Month-to-date pacing of core-D2C demand, spend and new customers against three
+# yardsticks: the ecomm team's daily forecast (config/dtc_pacing_targets.json,
+# regenerated from their pacing sheet — see pacing_targets.py), the equivalent
+# span immediately before the month and the same day-of-month span last month
+# (period over period), and the weekday-aligned span a year earlier.
+#
+# "Demand" here is deliberately the SHEET's definition, not gross_sales: the
+# order-level subtotal after discounts plus shipping, i.e. Shopify's total less
+# tax, over paid core-D2C orders reduced to one row per order. Reconciled
+# against the sheet's Actual DMD for 2026-09-01..09 it lands within 0-1.3% on
+# seven of nine days and within 7% on the other two (the sheet's pull runs on a
+# different clock). The remaining gap is reported per day as
+# `sheet_vs_warehouse_pct` wherever the config carries the sheet's own actual.
+
+#: 52 weeks, so "last year" compares Tuesday with Tuesday, not the 1st with the 1st.
+LY_SHIFT_DAYS = 364
+
+
+@dataclass(frozen=True)
+class PacingWindows:
+    as_of: date
+    month: str
+    month_start: date
+    month_end: date
+    days_in_month: int
+    mtd_end: date
+    """The last COMPLETE day being paced."""
+    elapsed: int
+    days_left: int
+    prior_start: date
+    prior_end: date
+    """The `elapsed` days immediately before the month (trend)."""
+    prior_month_start: date
+    prior_month_end: date
+    """The same day-of-month span in the previous month, clipped to its length (MoM)."""
+    ly_mtd_start: date
+    ly_mtd_end: date
+    ly_month_start: date
+    ly_month_end: date
+
+    @property
+    def query_start(self) -> date:
+        return min(self.prior_start, self.prior_month_start, self.ly_month_start)
+
+    @property
+    def query_end(self) -> date:
+        return max(self.mtd_end, self.ly_month_end)
+
+
+def month_bounds(ym: str) -> tuple[date, date]:
+    y, m = (int(x) for x in ym.split("-"))
+    first = date(y, m, 1)
+    return first, date(y, m, calendar.monthrange(y, m)[1])
+
+
+def resolve_pacing_windows(as_of: date | None, month: str | None, today: date) -> PacingWindows:
+    """Turn (as_of, month) into every window the tool needs. Raises ValueError when
+    the month has no complete day on or before as_of."""
+    as_of_d = as_of or today
+    complete_through = as_of_d - timedelta(days=1) if as_of_d >= today else as_of_d
+    ym = month or complete_through.strftime("%Y-%m")
+    month_start, month_end = month_bounds(ym)
+    mtd_end = min(complete_through, month_end)
+    if mtd_end < month_start:
+        raise ValueError(
+            f"{ym} has no complete day on or before {complete_through} (as_of {as_of_d})"
+        )
+    days_in_month = (month_end - month_start).days + 1
+    elapsed = (mtd_end - month_start).days + 1
+    prior_end = month_start - timedelta(days=1)
+    prior_start = prior_end - timedelta(days=elapsed - 1)
+    pm_start, pm_last = month_bounds(prior_end.strftime("%Y-%m"))
+    pm_end = min(pm_start + timedelta(days=elapsed - 1), pm_last)
+    shift = timedelta(days=LY_SHIFT_DAYS)
+    return PacingWindows(
+        as_of=as_of_d,
+        month=ym,
+        month_start=month_start,
+        month_end=month_end,
+        days_in_month=days_in_month,
+        mtd_end=mtd_end,
+        elapsed=elapsed,
+        days_left=days_in_month - elapsed,
+        prior_start=prior_start,
+        prior_end=prior_end,
+        prior_month_start=pm_start,
+        prior_month_end=pm_end,
+        ly_mtd_start=month_start - shift,
+        ly_mtd_end=mtd_end - shift,
+        ly_month_start=month_start - shift,
+        ly_month_end=month_end - shift,
+    )
+
+
+_DAILY_MEASURES: tuple[str, ...] = (
+    "demand",
+    "net_sales",
+    "shipping",
+    "orders",
+    "new_customers",
+    "spend",
+    "platform_conversion_value",
+)
+
+
+def _pct_change(actual: float | None, base: float | None) -> float | None:
+    """(actual - base) / base as a true percent; None when base is 0/None."""
+    if actual is None or base is None or base == 0:
+        return None
+    return round((actual - base) / base * 100.0, 2)
+
+
+def _ratio(num: float | None, den: float | None) -> float | None:
+    if num is None or den is None or den == 0:
+        return None
+    return num / den
+
+
+def _window_totals(
+    daily: Mapping[date, Mapping[str, Any]], start: date, end: date
+) -> dict[str, Any]:
+    """Sum the daily measures over [start, end], missing days counting as zero, plus ratios."""
+    tot: dict[str, Any] = dict.fromkeys(_DAILY_MEASURES, 0.0)
+    d = start
+    while d <= end:
+        row = daily.get(d)
+        if row:
+            for m in _DAILY_MEASURES:
+                tot[m] += _f(row.get(m))
+        d += timedelta(days=1)
+    for m in ("demand", "net_sales", "shipping", "spend", "platform_conversion_value"):
+        tot[m] = round(tot[m], 2)
+    tot["orders"] = int(tot["orders"])
+    tot["new_customers"] = int(tot["new_customers"])
+    tot["days"] = (end - start).days + 1
+    tot["window"] = {"start": str(start), "end": str(end)}
+    tot["aov"] = _ratio(tot["demand"], tot["orders"])
+    tot["mer"] = _ratio(tot["demand"], tot["spend"])
+    tot["cac"] = _ratio(tot["spend"], tot["new_customers"])
+    tot["platform_roas"] = _ratio(tot["platform_conversion_value"], tot["spend"])
+    return tot
+
+
+def _compare(current: Mapping[str, Any], base: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for m in ("demand", "orders", "new_customers", "spend"):
+        out[f"{m}_change_pct"] = _pct_change(current[m], base[m])
+    return out
+
+
+def _money(v: Any) -> str:
+    return "n/a" if v is None else f"${v:,.0f}"
+
+
+def _pct(v: Any) -> str:
+    return "n/a" if v is None else f"{v:+.1f}%"
+
+
+def _num(v: Any, nd: int = 0) -> str:
+    return "n/a" if v is None else f"{v:,.{nd}f}"
+
+
+_PACING_DAILY_MARKDOWN = [
+    "day",
+    "dow",
+    "demand",
+    "forecast_demand",
+    "act_vs_fcst_pct",
+    "ly_demand",
+    "act_vs_ly_pct",
+    "spend",
+    "new_customers",
+]
+
+_PACING_WEEKLY_MARKDOWN = [
+    "week",
+    "week_start",
+    "days",
+    "demand",
+    "forecast_demand",
+    "act_vs_fcst_pct",
+    "ly_demand",
+    "act_vs_ly_pct",
+    "spend",
+    "new_customers",
+    "partial",
+]
+
+_PACING_DEFINITIONS = {
+    "demand": (
+        "SUM over PAID core-D2C orders (one row per order_id) of order_subtotal + "
+        "order_shipping — Shopify total less tax; the ecomm sheet's 'Actual DMD'"
+    ),
+    "net_sales": "the same orders' order_subtotal (after discounts, before shipping and tax)",
+    "orders": "COUNT of those orders",
+    "new_customers": "rows of dtc_customer_first_order (first PAID core-D2C order)",
+    "spend": "all-channel SUM(spend) from ads_spend_daily",
+    "aov / mer / cac / platform_roas": "demand/orders, demand/spend, spend/new_customers, platform value/spend",
+    "forecast_*": "the ecomm team's daily targets from config/dtc_pacing_targets.json (see extra.targets)",
+    "act_vs_fcst_pct / act_vs_ly_pct / *_change_pct": "(actual - base) / base * 100",
+    "prior_period": "the same number of elapsed days immediately before the month started",
+    "prior_month_to_date": "the same day-of-month span in the previous month, clipped to its length",
+    "last_year": f"the span {LY_SHIFT_DAYS} days earlier, so weekdays align",
+    "run_rate_projection": "MTD actual / elapsed days * days in month",
+    "required_daily_average": "(month forecast - MTD actual) / days left",
+    "weeks": "Monday-anchored, numbered within the month; the first and last are usually partial",
+    "sheet_actual_demand": "the sheet's own Actual DMD as of the config refresh — reconciliation only, never the source of a number here",
+}
+
+
+async def get_dtc_pacing(
+    warehouse: Warehouse,
+    params: DtcPacingInput,
+    *,
+    targets: PacingTargets | None = None,
+) -> ToolResponse:
+    fmt = params.response_format
+    today = today_reporting()
+    try:
+        w = resolve_pacing_windows(params.as_of, params.month, today)
+    except ValueError as e:
+        return make_error_response(
+            code="INVALID_DATE_RANGE",
+            message=str(e),
+            details={"as_of": str(params.as_of), "month": params.month, "today": str(today)},
+            fmt=fmt,
+        )
+    if err := _require_tables(
+        warehouse, ("dtc_order_lines", "dtc_customer_first_order", "ads_spend_daily"), fmt
+    ):
+        return err
+    try:
+        o = _cols(
+            warehouse,
+            "dtc_order_lines",
+            ("date", "order_id", "bucket", "paid", "order_subtotal", "order_shipping"),
+        )
+        n = _cols(warehouse, "dtc_customer_first_order", ("date", "customer_id"))
+        s = _cols(warehouse, "ads_spend_daily", ("date", "spend", "conversion_value"))
+    except ColumnNotFound as e:
+        return _column_not_found_error(e, fmt=fmt)
+
+    # ---- targets: never fatal. Actuals and the period comparisons stand on their own.
+    targets_status = "ok"
+    targets_note: str | None = None
+    month_targets = None
+    tgt = targets
+    if tgt is None:
+        try:
+            tgt = load_targets()
+        except TargetsUnavailable as e:
+            targets_status, targets_note = "unavailable", str(e)
+    if tgt is not None:
+        month_targets = tgt.month(w.month)
+        if month_targets is None:
+            targets_status = "missing_month"
+            targets_note = (
+                f"config/dtc_pacing_targets.json has no {w.month} tab (available: "
+                f"{', '.join(tgt.available_months) or 'none'}). The sheet gets a new tab "
+                f"each month — export it and run `{REFRESH_COMMAND}`."
+            )
+
+    o_date, n_date, s_date = (
+        o["date"].select_as_date(),
+        n["date"].select_as_date(),
+        s["date"].select_as_date(),
+    )
+    lo, hi = w.query_start, w.query_end
+    sql = f"""
+WITH o AS (
+    SELECT {o_date} AS d, {_q(o["order_id"])} AS order_id,
+           ANY_VALUE({_q(o["order_subtotal"])}) AS order_subtotal,
+           ANY_VALUE({_q(o["order_shipping"])}) AS order_shipping
+    FROM dtc_order_lines
+    WHERE {_date_pred(o_date, lo, hi)}
+      AND {_q(o["bucket"])} = '{CORE_BUCKET}' AND {_q(o["paid"])}
+    GROUP BY d, order_id
+),
+sales AS (
+    SELECT d, COUNT(*) AS orders,
+           SUM(COALESCE(order_subtotal, 0.0) + COALESCE(order_shipping, 0.0)) AS demand,
+           SUM(COALESCE(order_subtotal, 0.0)) AS net_sales,
+           SUM(COALESCE(order_shipping, 0.0)) AS shipping
+    FROM o
+    GROUP BY d
+),
+newc AS (
+    SELECT {n_date} AS d, COUNT(DISTINCT {_q(n["customer_id"])}) AS new_customers
+    FROM dtc_customer_first_order
+    WHERE {_date_pred(n_date, lo, hi)}
+    GROUP BY d
+),
+spend AS (
+    SELECT {s_date} AS d, SUM({_q(s["spend"])}) AS spend,
+           SUM({_q(s["conversion_value"])}) AS platform_conversion_value
+    FROM ads_spend_daily
+    WHERE {_date_pred(s_date, lo, hi)}
+    GROUP BY d
+),
+spine AS (
+    SELECT d FROM sales UNION DISTINCT
+    SELECT d FROM newc UNION DISTINCT
+    SELECT d FROM spend
+)
+SELECT k.d AS day,
+       COALESCE(sales.orders, 0) AS orders,
+       COALESCE(sales.demand, 0.0) AS demand,
+       COALESCE(sales.net_sales, 0.0) AS net_sales,
+       COALESCE(sales.shipping, 0.0) AS shipping,
+       COALESCE(newc.new_customers, 0) AS new_customers,
+       COALESCE(spend.spend, 0.0) AS spend,
+       COALESCE(spend.platform_conversion_value, 0.0) AS platform_conversion_value
+FROM spine k
+LEFT JOIN sales USING (d)
+LEFT JOIN newc USING (d)
+LEFT JOIN spend USING (d)
+ORDER BY k.d
+LIMIT 5000
+"""
+    rows, err = _execute(warehouse, sql, fmt)
+    if err is not None or rows is None:
+        return err  # type: ignore[return-value]
+    daily: dict[date, dict[str, Any]] = {}
+    for r in rows:
+        d = _as_pydate(r.get("day"))
+        if d is not None:
+            daily[d] = r
+
+    # ---- windows
+    mtd = _window_totals(daily, w.month_start, w.mtd_end)
+    prior = _compare(mtd, _window_totals(daily, w.prior_start, w.prior_end))
+    prior_month = _compare(mtd, _window_totals(daily, w.prior_month_start, w.prior_month_end))
+    ly_mtd = _compare(mtd, _window_totals(daily, w.ly_mtd_start, w.ly_mtd_end))
+    ly_month = _window_totals(daily, w.ly_month_start, w.ly_month_end)
+
+    # ---- forecast (MTD and month) and everything derived from it
+    fc_mtd: dict[str, Any] | None = None
+    fc_month: dict[str, Any] | None = None
+    variance: dict[str, Any] | None = None
+    to_go: dict[str, Any] | None = None
+    required_daily: dict[str, Any] | None = None
+    run_rate: dict[str, Any] = {
+        m: (mtd[m] / w.elapsed * w.days_in_month) if w.elapsed else None
+        for m in ("demand", "spend", "new_customers")
+    }
+    projection_vs_forecast: dict[str, Any] | None = None
+    if month_targets is not None:
+        fc_mtd = {
+            "demand": month_targets.series_sum("forecast_demand", w.month_start, w.mtd_end),
+            "spend": month_targets.series_sum("forecast_spend", w.month_start, w.mtd_end),
+            "new_customers": month_targets.series_sum(
+                "forecast_new_customers", w.month_start, w.mtd_end
+            ),
+        }
+        fc_mtd["mer"] = _ratio(fc_mtd["demand"], fc_mtd["spend"])
+        fc_mtd["cac"] = _ratio(fc_mtd["spend"], fc_mtd["new_customers"])
+        fc_month = {
+            "demand": month_targets.month_total("forecast_demand"),
+            "spend": month_targets.month_total("forecast_spend"),
+            "new_customers": month_targets.month_total("forecast_new_customers"),
+        }
+        variance = {
+            f"{m}_pct": _pct_change(mtd[m], fc_mtd[m]) for m in ("demand", "spend", "new_customers")
+        }
+        to_go = {
+            m: (fc_month[m] - mtd[m]) if fc_month[m] is not None else None
+            for m in ("demand", "spend", "new_customers")
+        }
+        required_daily = {
+            m: (to_go[m] / w.days_left) if (to_go[m] is not None and w.days_left > 0) else None
+            for m in ("demand", "spend", "new_customers")
+        }
+        projection_vs_forecast = {
+            f"{m}_pct": _pct_change(run_rate[m], fc_month[m])
+            for m in ("demand", "spend", "new_customers")
+        }
+
+    # ---- daily rows for the MTD span
+    daily_rows: list[dict[str, Any]] = []
+    d = w.month_start
+    while d <= w.mtd_end:
+        row = daily.get(d, {})
+        ly_row = daily.get(d - timedelta(days=LY_SHIFT_DAYS), {})
+        t = month_targets.days.get(d) if month_targets is not None else None
+        fc_demand = t.get("forecast_demand") if t else None
+        sheet_actual = t.get("sheet_actual_demand") if t else None
+        demand = round(_f(row.get("demand")), 2)
+        ly_demand = round(_f(ly_row.get("demand")), 2)
+        daily_rows.append(
+            {
+                "day": d,
+                "dow": d.strftime("%a"),
+                "demand": demand,
+                "net_sales": round(_f(row.get("net_sales")), 2),
+                "shipping": round(_f(row.get("shipping")), 2),
+                "orders": int(_f(row.get("orders"))),
+                "new_customers": int(_f(row.get("new_customers"))),
+                "spend": round(_f(row.get("spend")), 2),
+                "forecast_demand": fc_demand,
+                "forecast_spend": t.get("forecast_spend") if t else None,
+                "forecast_new_customers": t.get("forecast_new_customers") if t else None,
+                "act_vs_fcst_pct": _pct_change(demand, fc_demand),
+                "ly_day": d - timedelta(days=LY_SHIFT_DAYS),
+                "ly_demand": ly_demand,
+                "act_vs_ly_pct": _pct_change(demand, ly_demand or None),
+                "sheet_actual_demand": sheet_actual,
+                "sheet_vs_warehouse_pct": _pct_change(sheet_actual, demand or None),
+            }
+        )
+        d += timedelta(days=1)
+
+    # ---- weekly rows: Monday-anchored weeks intersecting the month, through mtd_end
+    weekly_rows: list[dict[str, Any]] = []
+    wk_start = w.month_start - timedelta(days=w.month_start.weekday())
+    n_week = 0
+    while wk_start <= w.mtd_end:
+        n_week += 1
+        lo_d, hi_d = max(wk_start, w.month_start), min(wk_start + timedelta(days=6), w.mtd_end)
+        tot = _window_totals(daily, lo_d, hi_d)
+        ly = _window_totals(
+            daily, lo_d - timedelta(days=LY_SHIFT_DAYS), hi_d - timedelta(days=LY_SHIFT_DAYS)
+        )
+        fc = month_targets.series_sum("forecast_demand", lo_d, hi_d) if month_targets else None
+        weekly_rows.append(
+            {
+                "week": f"wk {n_week}",
+                "week_start": wk_start,
+                "days": tot["days"],
+                "demand": tot["demand"],
+                "forecast_demand": fc,
+                "act_vs_fcst_pct": _pct_change(tot["demand"], fc),
+                "ly_demand": ly["demand"],
+                "act_vs_ly_pct": _pct_change(tot["demand"], ly["demand"] or None),
+                "orders": tot["orders"],
+                "spend": tot["spend"],
+                "new_customers": tot["new_customers"],
+                "partial": (wk_start + timedelta(days=6)) > min(w.mtd_end, w.month_end)
+                or wk_start < w.month_start,
+            }
+        )
+        wk_start += timedelta(days=7)
+
+    summary: dict[str, Any] = {
+        "month": w.month,
+        "as_of": str(w.as_of),
+        "complete_through": str(w.mtd_end),
+        "elapsed_days": w.elapsed,
+        "days_left": w.days_left,
+        "days_in_month": w.days_in_month,
+        "mtd": mtd,
+        "forecast_mtd": fc_mtd,
+        "variance_vs_forecast_mtd": variance,
+        "month_forecast": fc_month,
+        "to_go": to_go,
+        "required_daily_average": required_daily,
+        "run_rate_projection": run_rate,
+        "projection_vs_forecast": projection_vs_forecast,
+        "prior_period": prior,
+        "prior_month_to_date": prior_month,
+        "last_year_mtd": ly_mtd,
+        "last_year_month": ly_month,
+    }
+    extra: dict[str, Any] = {
+        "summary": summary,
+        "weekly": weekly_rows,
+        "targets": {
+            "status": targets_status,
+            "note": targets_note,
+            "month_tab": month_targets.tab if month_targets else None,
+            "source": tgt.source if tgt is not None else None,
+            "path": str(tgt.path) if tgt is not None and tgt.path else None,
+        },
+        "definitions": _PACING_DEFINITIONS,
+        "resolved_columns": _names(
+            {"dtc_order_lines": o, "dtc_customer_first_order": n, "ads_spend_daily": s}
+        ),
+        "sql": sql,
+    }
+    if params.include_daily:
+        extra["daily"] = daily_rows
+
+    title = (
+        f"DTC pacing — {w.month}, through {w.mtd_end} "
+        f"({w.elapsed} of {w.days_in_month} days, {w.days_left} left)"
+    )
+    table_rows = daily_rows if params.include_daily else weekly_rows
+    columns = _PACING_DAILY_MARKDOWN if params.include_daily else _PACING_WEEKLY_MARKDOWN
+    resp = make_table_response(rows=table_rows, columns=columns, title=title, extra=extra, fmt=fmt)
+    if fmt == "markdown":
+        resp.rendered = _render_pacing_markdown(
+            title, summary, weekly_rows, extra["targets"], params.include_daily, resp.rendered
+        )
+    return resp
+
+
+def _render_pacing_markdown(
+    title: str,
+    s: Mapping[str, Any],
+    weekly: list[dict[str, Any]],
+    targets: Mapping[str, Any],
+    include_daily: bool,
+    table_md: str,
+) -> str:
+    mtd, fc, var = s["mtd"], s.get("forecast_mtd"), s.get("variance_vs_forecast_mtd")
+    ly, pp, pm = s["last_year_mtd"], s["prior_period"], s["prior_month_to_date"]
+    rr, fm, tg, rd = (
+        s["run_rate_projection"],
+        s.get("month_forecast"),
+        s.get("to_go"),
+        s.get("required_daily_average"),
+    )
+    lines = [f"### {title}", ""]
+    fc_bit = (
+        f" vs forecast {_money(fc['demand'])} ({_pct(var['demand_pct'])})" if fc and var else ""
+    )
+    lines.append(
+        f"- **Demand MTD** {_money(mtd['demand'])}{fc_bit} · LY {_money(ly['demand'])} "
+        f"({_pct(ly['demand_change_pct'])}) · prior {pp['days']}d {_money(pp['demand'])} "
+        f"({_pct(pp['demand_change_pct'])}) · last month same days {_money(pm['demand'])} "
+        f"({_pct(pm['demand_change_pct'])})"
+    )
+    if fm and tg and rd:
+        pvf = s.get("projection_vs_forecast") or {}
+        lines.append(
+            f"- **Month** run-rate {_money(rr['demand'])} vs forecast {_money(fm['demand'])} "
+            f"({_pct(pvf.get('demand_pct'))}) · to go {_money(tg['demand'])} · need "
+            f"{_money(rd['demand'])}/day over {s['days_left']} days"
+        )
+    else:
+        lines.append(f"- **Month** run-rate {_money(rr['demand'])} (no forecast loaded)")
+    sp_fc = f" vs {_money(fc['spend'])} ({_pct(var['spend_pct'])})" if fc and var else ""
+    nc_fc = (
+        f" vs {_num(fc['new_customers'])} ({_pct(var['new_customers_pct'])})" if fc and var else ""
+    )
+    lines.append(
+        f"- **Spend MTD** {_money(mtd['spend'])}{sp_fc} · MER {_num(mtd['mer'], 2)}"
+        + (f" (forecast {_num(fc['mer'], 2)})" if fc and fc.get("mer") is not None else "")
+    )
+    lines.append(
+        f"- **New customers MTD** {_num(mtd['new_customers'])}{nc_fc} · CAC {_money(mtd['cac'])}"
+        + (f" (forecast {_money(fc['cac'])})" if fc and fc.get("cac") is not None else "")
+        + f" · orders {_num(mtd['orders'])} · AOV {_money(mtd['aov'])}"
+    )
+    if targets.get("status") == "ok":
+        src = targets.get("source") or {}
+        lines.append(
+            f'- targets: tab "{targets.get("month_tab")}" of {src.get("title", "the pacing sheet")}, '
+            f"refreshed {str(src.get('refreshed_at', '?'))[:10]}"
+        )
+    else:
+        lines.append(f"- targets: **{targets.get('status')}** — {targets.get('note')}")
+    lines += ["", "#### Weeks", "", render_markdown_table(weekly, columns=_PACING_WEEKLY_MARKDOWN)]
+    if include_daily:
+        lines += ["", "#### Days", "", table_md.split("\n\n", 1)[-1]]
+    return "\n".join(lines)

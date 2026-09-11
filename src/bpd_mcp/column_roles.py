@@ -388,6 +388,10 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "gross": ["gross_line"],
         "net": ["net_line"],
         "order_total": ["order_total"],
+        "order_subtotal": ["order_subtotal"],
+        "order_shipping": ["order_shipping"],
+        "order_tax": ["order_tax"],
+        "order_discounts": ["order_discounts"],
         "variant": ["variant_id"],
     },
     "dtc_refunds": {

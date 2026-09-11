@@ -381,6 +381,30 @@ class MarketingEfficiencyInput(_BaseModel):
     response_format: ResponseFormat = "markdown"
 
 
+class DtcPacingInput(_BaseModel):
+    as_of: _date | None = Field(
+        default=None,
+        description=(
+            "Pace as of this date (Central). Default: today. The month-to-date "
+            "window ends on the last COMPLETE day: yesterday when as_of is today "
+            "or later, as_of itself when it is in the past."
+        ),
+    )
+    month: str | None = Field(
+        default=None,
+        pattern=r"^\d{4}-(0[1-9]|1[0-2])$",
+        description=(
+            "Month to pace, YYYY-MM. Default: the month of the last complete day. "
+            "A month that has already ended paces its full span."
+        ),
+    )
+    include_daily: bool = Field(
+        default=True,
+        description="Return the day-by-day rows. False returns only the summary and weekly rows.",
+    )
+    response_format: ResponseFormat = "markdown"
+
+
 # --------------------------------------------------------------------------------------
 # Admin tools
 # --------------------------------------------------------------------------------------

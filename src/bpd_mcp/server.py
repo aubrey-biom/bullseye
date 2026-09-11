@@ -51,6 +51,7 @@ from .schemas import (
     BigQueryStatusInput,
     DataFreshnessInput,
     DescribeSchemaInput,
+    DtcPacingInput,
     DtcSalesSummaryInput,
     ExportQueryToCsvInput,
     ForecastVsActualInput,
@@ -711,6 +712,46 @@ async def bpd_get_marketing_efficiency(
             grain=grain,
             start_date=start_date,
             end_date=end_date,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_get_dtc_pacing",
+    description=(
+        "Month-to-date pacing of core-D2C demand (Shopify total less tax over paid "
+        "orders — the ecomm team's 'Actual DMD'), ad spend and new customers against "
+        "the ecomm team's daily forecast from their pacing sheet "
+        "(config/dtc_pacing_targets.json), with run-rate projection, to-go and "
+        "required daily average, and period-over-period comparisons: the same "
+        "number of days immediately before the month, the same days last month, "
+        "and the weekday-aligned span last year. Returns a summary, Monday-anchored "
+        "weekly rows and (by default) day-by-day rows. Paces through the last "
+        "complete day. If the month's targets are not loaded the actuals and "
+        "comparisons still return, with extra.targets saying how to refresh."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def bpd_get_dtc_pacing(
+    ctx: Context[Any, Any, Any],
+    as_of: _date | None = None,
+    month: str | None = None,
+    include_daily: bool = True,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await dtc_tools.get_dtc_pacing(
+        app.warehouse,
+        DtcPacingInput(
+            as_of=as_of,
+            month=month,
+            include_daily=include_daily,
             response_format=response_format,
         ),
     )

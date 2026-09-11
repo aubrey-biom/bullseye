@@ -205,14 +205,15 @@ def test_expected_tool_count_matches_the_registered_tools() -> None:
     )
 
 
-def test_tool_roster_is_the_post_bigquery_fourteen_plus_the_phase_2_three() -> None:
+def test_tool_roster_is_the_post_bigquery_fourteen_plus_the_dtc_four() -> None:
     """Lineage: 22 tools before the swap, minus the four Kiteworks discovery
     tools, minus sync/refresh/reingest, minus clear_cache = 14; plus the three
-    DTC / paid-media analytics tools of Phase 2 = 17."""
+    DTC / paid-media analytics tools of Phase 2 and the pacing tool = 18."""
     from bpd_mcp.server import mcp
 
-    assert EXPECTED_TOOL_COUNT == 17
+    assert EXPECTED_TOOL_COUNT == 18
     assert set(mcp._tool_manager._tools) == {
+        "bpd_get_dtc_pacing",
         "bpd_get_dtc_sales_summary",
         "bpd_get_ads_performance",
         "bpd_get_marketing_efficiency",
