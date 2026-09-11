@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run python scripts/bq_query.py *)",
+      "Bash(python3 scripts/bq_query.py *)",
+      "Bash(uv run pytest *)",
+      "Bash(uv run python scripts/validate_kmg.py *)"
+    ]
+  },
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "This repository is a read-only BigQuery analytics server. GCP_SA_KEY_B64 holds the key for a read-only service account (roles/bigquery.dataViewer + jobUser on project biom-reporting-s26). Decoding it in memory, or materialising it to ~/.config/gcloud as bq.resolve_credentials() does, in order to run SELECT queries through scripts/bq_query.py, the test suite (uv run pytest), scripts/validate_kmg.py, or the server itself is the intended use of this credential, not credential exploration or materialisation."
+    ]
+  }
+}
