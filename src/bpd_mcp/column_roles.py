@@ -564,12 +564,22 @@ REQUIRED_ROLES: dict[str, tuple[str, ...]] = {
         "gross",
         "net",
         "units",
+        "order_subtotal",
+        "order_shipping",
     ),
     "dtc_revenue_lines": ("date", "order_id", "bucket", "gross", "net"),
     "dtc_customer_first_order": ("date", "customer_id"),
     "ads_meta_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
     "ads_google_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
-    "ads_spend_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
+    "ads_spend_daily": (
+        "date",
+        "channel",
+        "campaign",
+        "spend",
+        "impressions",
+        "clicks",
+        "conversion_value",
+    ),
     "media_delivery_status": ("date", "channel", "status"),
 }
 

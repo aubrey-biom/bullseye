@@ -46,6 +46,7 @@ from bpd_mcp.pacing_targets import (
     PACED_FIELDS,
     REFRESH_COMMAND,
     SCHEMA_VERSION,
+    coerce_number,
     parse_targets,
 )
 
@@ -74,20 +75,6 @@ def _norm(v: Any) -> str | None:
         return None
     s = " ".join(str(v).split())
     return s or None
-
-
-def _num(v: Any) -> float | None:
-    if v is None or isinstance(v, bool):
-        return None
-    if isinstance(v, int | float):
-        return float(v)
-    if isinstance(v, str):
-        s = v.strip().replace(",", "").replace("$", "").replace("%", "")
-        try:
-            return float(s)
-        except ValueError:
-            return None
-    return None
 
 
 def _as_date(v: Any) -> dt.date | None:
@@ -125,7 +112,9 @@ def read_month_tab(ws: Any) -> dict[str, Any] | None:
         d = _as_date(ws.cell(r, 3).value)
         if d is None:
             break
-        days[d.isoformat()] = {fld: _num(ws.cell(r, c).value) for fld, c in col_for.items()}
+        days[d.isoformat()] = {
+            fld: coerce_number(ws.cell(r, c).value) for fld, c in col_for.items()
+        }
         r += 1
     if not days:
         return None
@@ -136,7 +125,7 @@ def read_month_tab(ws: Any) -> dict[str, Any] | None:
             for fld in PACED_FIELDS:
                 c = col_for.get(fld)
                 if c is not None:
-                    totals[fld] = _num(ws.cell(rr, c).value)
+                    totals[fld] = coerce_number(ws.cell(rr, c).value)
             break
     return {
         "tab": ws.title,
@@ -216,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     for ym in parsed.available_months:
         mt = parsed.months[ym]
         stated = mt.totals.get("forecast_demand")
-        summed = mt.series_sum("forecast_demand")
+        summed = mt.series_sum("forecast_demand") or 0.0
         flag = ""
         if stated is not None and summed and abs(stated - summed) > 0.005 * max(abs(stated), 1):
             flag = f"  ** Total row {stated:,.2f} != day sum {summed:,.2f}"

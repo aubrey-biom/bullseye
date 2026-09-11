@@ -60,7 +60,6 @@ SCHEMA_INCOMPATIBLE with the candidates tried, exactly like the Target tools.
 
 from __future__ import annotations
 
-import calendar
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -1039,15 +1038,16 @@ class PacingWindows:
 
 def month_bounds(ym: str) -> tuple[date, date]:
     y, m = (int(x) for x in ym.split("-"))
-    first = date(y, m, 1)
-    return first, date(y, m, calendar.monthrange(y, m)[1])
+    return period_bounds("month", date(y, m, 1))
 
 
 def resolve_pacing_windows(as_of: date | None, month: str | None, today: date) -> PacingWindows:
     """Turn (as_of, month) into every window the tool needs. Raises ValueError when
     the month has no complete day on or before as_of."""
     as_of_d = as_of or today
-    complete_through = as_of_d - timedelta(days=1) if as_of_d >= today else as_of_d
+    # The last COMPLETE day: yesterday when as_of is today or later (a future
+    # as_of must not pace phantom zero-actual days), as_of itself when past.
+    complete_through = min(as_of_d, today - timedelta(days=1))
     ym = month or complete_through.strftime("%Y-%m")
     month_start, month_end = month_bounds(ym)
     mtd_end = min(complete_through, month_end)
@@ -1146,7 +1146,7 @@ def _pct(v: Any) -> str:
     return "n/a" if v is None else f"{v:+.1f}%"
 
 
-def _num(v: Any, nd: int = 0) -> str:
+def _fmt_num(v: Any, nd: int = 0) -> str:
     return "n/a" if v is None else f"{v:,.{nd}f}"
 
 
@@ -1449,6 +1449,12 @@ LIMIT 5000
         "prior_month_to_date": prior_month,
         "last_year_mtd": ly_mtd,
         "last_year_month": ly_month,
+        "last_year_note": (
+            f"last-year spend is Google-only before {META_HISTORY_START} (Meta history "
+            "starts there), so spend/MER/CAC comparisons to last year understate LY spend"
+            if w.ly_month_start < META_HISTORY_START
+            else None
+        ),
     }
     extra: dict[str, Any] = {
         "summary": summary,
@@ -1501,7 +1507,9 @@ def _render_pacing_markdown(
     )
     lines = [f"### {title}", ""]
     fc_bit = (
-        f" vs forecast {_money(fc['demand'])} ({_pct(var['demand_pct'])})" if fc and var else ""
+        f" vs forecast {_money(fc['demand'])} ({_pct(var['demand_pct'])})"
+        if fc is not None and var is not None and fc.get("demand") is not None
+        else ""
     )
     lines.append(
         f"- **Demand MTD** {_money(mtd['demand'])}{fc_bit} · LY {_money(ly['demand'])} "
@@ -1509,27 +1517,39 @@ def _render_pacing_markdown(
         f"({_pct(pp['demand_change_pct'])}) · last month same days {_money(pm['demand'])} "
         f"({_pct(pm['demand_change_pct'])})"
     )
-    if fm and tg and rd:
-        pvf = s.get("projection_vs_forecast") or {}
-        lines.append(
-            f"- **Month** run-rate {_money(rr['demand'])} vs forecast {_money(fm['demand'])} "
-            f"({_pct(pvf.get('demand_pct'))}) · to go {_money(tg['demand'])} · need "
-            f"{_money(rd['demand'])}/day over {s['days_left']} days"
-        )
+    pvf = s.get("projection_vs_forecast") or {}
+    if fm and fm.get("demand") is not None and tg and rd:
+        if s["days_left"] > 0:
+            lines.append(
+                f"- **Month** run-rate {_money(rr['demand'])} vs forecast {_money(fm['demand'])} "
+                f"({_pct(pvf.get('demand_pct'))}) · to go {_money(tg['demand'])} · need "
+                f"{_money(rd['demand'])}/day over {s['days_left']} days"
+            )
+        else:
+            lines.append(
+                f"- **Month complete** final {_money(mtd['demand'])} vs forecast "
+                f"{_money(fm['demand'])} ({_pct(pvf.get('demand_pct'))})"
+            )
     else:
         lines.append(f"- **Month** run-rate {_money(rr['demand'])} (no forecast loaded)")
-    sp_fc = f" vs {_money(fc['spend'])} ({_pct(var['spend_pct'])})" if fc and var else ""
+    sp_fc = (
+        f" vs {_money(fc['spend'])} ({_pct(var['spend_pct'])})"
+        if fc is not None and var is not None and fc.get("spend") is not None
+        else ""
+    )
     nc_fc = (
-        f" vs {_num(fc['new_customers'])} ({_pct(var['new_customers_pct'])})" if fc and var else ""
+        f" vs {_fmt_num(fc['new_customers'])} ({_pct(var['new_customers_pct'])})"
+        if fc is not None and var is not None and fc.get("new_customers") is not None
+        else ""
     )
     lines.append(
-        f"- **Spend MTD** {_money(mtd['spend'])}{sp_fc} · MER {_num(mtd['mer'], 2)}"
-        + (f" (forecast {_num(fc['mer'], 2)})" if fc and fc.get("mer") is not None else "")
+        f"- **Spend MTD** {_money(mtd['spend'])}{sp_fc} · MER {_fmt_num(mtd['mer'], 2)}"
+        + (f" (forecast {_fmt_num(fc['mer'], 2)})" if fc and fc.get("mer") is not None else "")
     )
     lines.append(
-        f"- **New customers MTD** {_num(mtd['new_customers'])}{nc_fc} · CAC {_money(mtd['cac'])}"
+        f"- **New customers MTD** {_fmt_num(mtd['new_customers'])}{nc_fc} · CAC {_money(mtd['cac'])}"
         + (f" (forecast {_money(fc['cac'])})" if fc and fc.get("cac") is not None else "")
-        + f" · orders {_num(mtd['orders'])} · AOV {_money(mtd['aov'])}"
+        + f" · orders {_fmt_num(mtd['orders'])} · AOV {_money(mtd['aov'])}"
     )
     if targets.get("status") == "ok":
         src = targets.get("source") or {}

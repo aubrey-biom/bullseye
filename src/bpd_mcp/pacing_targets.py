@@ -36,7 +36,7 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 
-#: Repo-relative default. Overridable per call (tests) or via BPD_PACING_TARGETS.
+#: Repo-relative default. Overridable per call (`load_targets(path)`; the tests do).
 DEFAULT_TARGETS_PATH = Path(__file__).resolve().parents[2] / "config" / "dtc_pacing_targets.json"
 
 REFRESH_COMMAND = "uv run python scripts/refresh_pacing_targets.py <export.xlsx>"
@@ -95,15 +95,23 @@ class MonthTargets:
     def last_day(self) -> date:
         return max(self.days)
 
-    def series_sum(self, name: str, start: date | None = None, end: date | None = None) -> float:
-        """Sum of one daily target series over [start, end] (inclusive, defaults to the month)."""
+    def series_sum(
+        self, name: str, start: date | None = None, end: date | None = None
+    ) -> float | None:
+        """Sum of one daily target series over [start, end] (inclusive, defaults to the month).
+
+        None when NO day in the window carries the series — an absent forecast
+        column is "no target", never a $0 target.
+        """
         total = 0.0
+        seen = False
         for d, t in self.days.items():
             if (start is None or d >= start) and (end is None or d <= end):
                 v = t.get(name)
                 if v is not None:
                     total += v
-        return total
+                    seen = True
+        return total if seen else None
 
     def month_total(self, name: str) -> float | None:
         """The sheet's stated Total for a paced field, else the sum of its days."""
@@ -129,11 +137,20 @@ class PacingTargets:
         return sorted(self.months)
 
 
-def _num(v: Any) -> float | None:
+def coerce_number(v: Any) -> float | None:
+    """A sheet or JSON cell as a float: numbers pass, numeric strings ("$1,234", "12%")
+    are parsed, everything else ("-", "#REF!", blanks, bools) is None. Shared by the
+    loader and the refresh script so the two can never disagree on a cell."""
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, int | float):
         return float(v)
+    if isinstance(v, str):
+        s = v.strip().replace(",", "").replace("$", "").replace("%", "")
+        try:
+            return float(s)
+        except ValueError:
+            return None
     return None
 
 
@@ -162,11 +179,15 @@ def parse_targets(payload: dict[str, Any], *, path: Path | None = None) -> Pacin
                 raise TargetsUnavailable(f"pacing targets: {ym}: day {ds} is outside the month")
             if not isinstance(vals, dict):
                 raise TargetsUnavailable(f"pacing targets: {ym}/{ds}: values must be an object")
-            days[d] = DayTarget({k: _num(v) for k, v in vals.items()})
+            days[d] = DayTarget({k: coerce_number(v) for k, v in vals.items()})
         if not days:
             raise TargetsUnavailable(f"pacing targets: month {ym!r} has no days")
-        totals_raw = m.get("totals") or {}
-        totals = {k: _num(totals_raw.get(k)) for k in PACED_FIELDS}
+        totals_raw = m.get("totals")
+        if totals_raw is None:
+            totals_raw = {}
+        if not isinstance(totals_raw, dict):
+            raise TargetsUnavailable(f"pacing targets: month {ym!r}: `totals` must be an object")
+        totals = {k: coerce_number(totals_raw.get(k)) for k in PACED_FIELDS}
         months[ym] = MonthTargets(month=ym, tab=str(m.get("tab", "")), days=days, totals=totals)
     source = payload.get("source") or {}
     if not isinstance(source, dict):
@@ -174,18 +195,31 @@ def parse_targets(payload: dict[str, Any], *, path: Path | None = None) -> Pacin
     return PacingTargets(source=source, months=months, path=path)
 
 
+# Parsed file keyed by (path, mtime_ns): the file changes once a month, the tool
+# is called far more often, and a refreshed file is still picked up without a
+# restart because the mtime moves.
+_CACHE: dict[Path, tuple[int, PacingTargets]] = {}
+
+
 def load_targets(path: Path | str | None = None) -> PacingTargets:
     """Read and parse the targets file. Raises TargetsUnavailable if absent or malformed."""
     p = Path(path) if path is not None else DEFAULT_TARGETS_PATH
-    if not p.exists():
+    try:
+        mtime = p.stat().st_mtime_ns
+    except FileNotFoundError:
         raise TargetsUnavailable(
             f"pacing targets file not found at {p}; export the pacing sheet to .xlsx and run "
             f"`{REFRESH_COMMAND}`"
-        )
+        ) from None
+    cached = _CACHE.get(p)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
     try:
         payload = json.loads(p.read_text())
     except (OSError, json.JSONDecodeError) as e:
         raise TargetsUnavailable(f"pacing targets at {p} could not be read: {e}") from e
     if not isinstance(payload, dict):
         raise TargetsUnavailable(f"pacing targets at {p}: top level must be an object")
-    return parse_targets(payload, path=p)
+    parsed = parse_targets(payload, path=p)
+    _CACHE[p] = (mtime, parsed)
+    return parsed
