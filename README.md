@@ -33,9 +33,11 @@ enumerates each single-process assumption that was removed and why.
 
 ## Repository map
 
-One repo, two deliverables that share a data source but no code: the **MCP
-server** (interactive analysis from Claude) and the **scheduled Target POS
-brief** (a script a Routine runs on a timer). Paths below are load-bearing —
+One repo, two kinds of deliverable that share a data source: the **MCP
+server** (interactive analysis from Claude) and the **scheduled briefs**
+(scripts a Routine runs on a timer — the Target POS brief, which has its own
+queries, and the DTC brief, which is a thin layer over the server's DTC tools).
+Paths below are load-bearing —
 the Routine definitions at claude.ai/code/routines invoke `scripts/*.py` and
 `scripts/setup_reporting.sh` by name, so moving them is a coordinated change
 with those definitions, not a tidy-up.
@@ -52,6 +54,8 @@ src/bpd_mcp/              the MCP server
   server.py               FastMCP entry point and tool roster
 scripts/
   pos_brief.py            scheduled Target POS brief (weekly + Thursday pulse) -> Slack text
+  dtc_brief.py            scheduled DTC brief (Monday weekly, Thursday pulse, 1st-of-month
+                          recap) -> Slack text, built from tools/dtc.py
   setup_reporting.sh      builds the venv the brief needs on a fresh container
   validate_kmg.py         KMG POS-report tie-out: the migration's acceptance gate
   bq_query.py             read-only ad-hoc query runner through the server's data layer
@@ -318,7 +322,7 @@ definitions, stated in each response's `extra.definitions`:
 | ------------------------------- | ------- |
 | `bpd_get_dtc_sales_summary`     | Shopify DTC by `day`/`week`/`month` × bucket (default `core_d2c`): paid orders, customers, new customers, product units, gross and net line sales, AOV, and `admin_net_revenue` with its allocated refunds. Unpaid orders and their list value are reported beside the paid figures. `by_purchase_type` splits One Time / Subscription (new customers are then NULL rather than repeated). |
 | `bpd_get_ads_performance`       | Spend, impressions, clicks, platform conversions and value by period × channel with CTR/CPC/CPM/CPA/platform ROAS, plus each period's delivery integrity: delivered, confirmed-zero, undiagnosed-gap and unclassified days, summarised as `delivery_flag`. `by_campaign` returns the top-N campaigns by window spend with names and status from `ads_campaigns`. |
-| `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — MER on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
+| `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — **demand** (order-level subtotal + shipping, the pacing sheet's definition) with MER on demand, on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
 | `bpd_get_dtc_pacing`            | Month-to-date pacing through the last complete day. **Demand** is the ecomm sheet's definition — order-level subtotal + shipping (Shopify total less tax) over paid core-D2C orders, one row per order — plus spend and new customers, each against the team's daily **forecast** from `config/dtc_pacing_targets.json`: MTD variance, month forecast, to-go, required daily average, run-rate projection. Period over period: the same number of days immediately before the month, the same days last month, and the weekday-aligned (364-day) span last year. Monday-anchored weekly rows and daily rows; `sheet_vs_warehouse_pct` shows the reconciliation to the sheet's own actuals where the config carries them. Targets missing → actuals still return, `extra.targets` says how to refresh. |
 
 #### Pacing targets: the ecomm team's sheet as config
@@ -347,6 +351,66 @@ the warehouse is the source of every actual the tool reports. Reconciled for
 2026-09-01..09, the warehouse demand lands within 0–1.3% of the sheet's
 `Actual DMD` on seven of nine days and within 7% on the other two; spend agrees
 to ~0.2% and new customers to a few per day.
+
+#### The scheduled DTC brief
+
+`scripts/dtc_brief.py` turns the DTC tools into the ecomm team's Slack update.
+It runs no SQL of its own: every number is a `bpd_get_dtc_pacing` or
+`bpd_get_marketing_efficiency` payload, so the brief and an interactive
+question to the server can never disagree. Three modes, each a `main` message
+plus zero or more threaded `replies`:
+
+| Mode | When | What it says |
+| ---- | ---- | ------------ |
+| `weekly` | Monday morning ET | The Monday–Sunday week just closed: demand, spend, MER, new customers and CAC week-over-week, demand also against the trailing four-week average; then the month's pacing block; then a **Watch** list. Reply: the 8-week trend table. |
+| `pulse` | Thursday morning ET | The week so far (Monday through yesterday) against the same weekdays a week earlier, then the same pacing block and Watch list. Shorter, no reply. |
+| `recap` | The 1st of the month | The month that just closed: demand against the sheet's forecast and last year, spend, MER, acquisition against goal, best and softest day, and the reconciliation to the sheet's own actuals. Reply: the week-by-week build. |
+
+"Demand" means one thing everywhere in a message: the sheet's Actual DMD
+(order subtotal + shipping on paid core-D2C orders), taken as `demand` from the
+efficiency tool for the week figures and from the pacing tool for the month,
+and MER is demand over spend on both. The **pacing block** reads the ecomm
+team's own sheet columns back to them —
+demand, spend, NCs and NC demand month-to-date against plan, run-rate against
+the month's forecast, to-go and the required daily average — with the
+`:large_green_circle:` / `:large_yellow_circle:` / `:red_circle:` idiom their
+updates already use (green at or above plan, yellow within 10%). **Watch**
+flags only what is material: a series ≥10% behind plan, spend ≥10% off plan
+either way, a sheet-vs-warehouse gap ≥5% on a settled day, a month with no
+targets loaded. "Settled" excludes the two days before the export was taken:
+the team keys the sheet's actuals by hand the next morning, so the export's
+last row is routinely partial, and comparing it produced a false flag every run.
+
+```bash
+uv run python scripts/dtc_brief.py --mode weekly            # prints main + [threaded reply]
+uv run python scripts/dtc_brief.py --mode recap --json      # {"main": ..., "replies": [...]}
+uv run python scripts/dtc_brief.py --mode pulse --as-of 2026-09-03   # backtest a past Thursday
+```
+
+`--as-of` runs as if today were that date (Central); the pacing block still
+paces through the day before it. Off schedule, the footer shows both dates
+("data through Sun Sep 6 (pacing through Thu Sep 10)").
+
+**Routines.** Four fresh-session Routines at claude.ai/code/routines, all with
+the Slack connector, all posting to **#ecommerce** after the ads data has
+landed (≥13:00 UTC), each following the Target POS brief's SETUP / VERIFY /
+POST / IF-WRONG prompt pattern:
+
+| Routine | Cron (UTC) | Runs |
+| ------- | ---------- | ---- |
+| DTC weekly brief | `30 13 * * 1` | `dtc_brief.py --mode weekly --json`; posts `main`, then each reply in the thread |
+| DTC Thursday pulse | `30 13 * * 4` | `--mode pulse --json` |
+| DTC month-end recap | `0 14 1 * *` | Exports the pacing sheet to `.xlsx` via the Google Drive connector, regenerates a targets file from it into the session's scratch space, then runs `--mode recap --targets <that file> --json`. The export is what makes the reconciliation possible: the checked-in config was refreshed at the *start* of the closed month, before any of its actuals existed. |
+| DTC pacing targets refresh | `30 14 1 * *` | Same export, then `refresh_pacing_targets.py --check`; when the new month's tab has landed it commits the regenerated JSON on a branch and opens a PR. If the tab is not there yet (the team adds it late some months) it re-arms itself daily until it is. |
+
+The refresh Routine is the only writer of `config/dtc_pacing_targets.json`
+between months. It and the recap are the two Routines with a second credential
+(Google Drive); the server itself still holds nothing but the read-only
+BigQuery account, and `--targets` only ever points the brief at a file.
+
+Not yet in the brief: subscriber health (active subscribers, churn, skip rate).
+`fct_subscriptions` is not a registered logical table, so those figures still
+come from the team's own pulls; see the follow-ups.
 
 ### Admin
 
@@ -530,7 +594,10 @@ Three tiers, and the split is deliberate:
   answer is known. `tests/test_tools_dtc.py` holds the DTC and ads tools'
   numbers the same way, over fixtures projected under the Phase 1 registry
   bodies' column names; `tests/test_pacing.py` does the same for the pacing
-  tool and pins the checked-in targets file's integrity in the hermetic tier. A few drift guards also run here, comparing the projection
+  tool and pins the checked-in targets file's integrity in the hermetic tier;
+  `tests/test_dtc_brief.py` runs all three brief modes end to end through
+  `gather()` over the same fixture rows, and pins the brief's interpretation
+  layer (windows, Watch flags, the settled-sheet rule) hermetically. A few drift guards also run here, comparing the projection
   parsed out of each registry body against the schema BigQuery itself reports.
 * **Tier 3 — `-m bq_live`, real data.** Deliberately small: the full
   `bpd_health_check` runner against production, the registry/roles checks
@@ -665,3 +732,12 @@ The questions themselves are usable today as a manual exercise of the tools.
    are retired.
 7. **`.env.example` still contains committed Kiteworks credentials.** Rotating
    them was explicitly deferred; the file carries a TODO where they were.
+8. **Subscriber health is not in the DTC brief.** The ecomm team's own update
+   carries active subscribers, churn and skip rate; `fct_subscriptions` is not
+   a registered logical table, so the brief cannot. Registering it (with the
+   usual role, contract and drift-guard entries) is the prerequisite.
+9. **Demand definitions differ at the edges.** The warehouse's demand (order
+   subtotal + shipping on paid core-D2C orders) reconciles to the sheet's
+   `Actual DMD` within ~1% on most days but diverges by 5–40% on a few (Aug 10
+   2026: sheet $6.1K vs warehouse $9.7K). The recap reports the gap; deciding
+   which side is right is a conversation with the team, not a code change.

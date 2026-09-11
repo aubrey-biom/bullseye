@@ -113,6 +113,20 @@ class MonthTargets:
                     seen = True
         return total if seen else None
 
+    def series_mean(
+        self, name: str, start: date | None = None, end: date | None = None
+    ) -> float | None:
+        """Mean of one daily target series over the window (the sheet's rate targets —
+        NC RoAS, BRoAS — are constants repeated per day). None when absent."""
+        vals = [
+            v
+            for d, t in self.days.items()
+            if (start is None or d >= start) and (end is None or d <= end)
+            for v in [t.get(name)]
+            if v is not None
+        ]
+        return sum(vals) / len(vals) if vals else None
+
     def month_total(self, name: str) -> float | None:
         """The sheet's stated Total for a paced field, else the sum of its days."""
         stated = self.totals.get(name)

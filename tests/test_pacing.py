@@ -551,12 +551,16 @@ SPEND = [
 
 
 def _targets(days: int = 31) -> pt.PacingTargets:
-    """Aug 2026: forecast demand 10/day, spend 20/day, 1 new customer/day. Sheet actual demand for Aug 1 = 50."""
+    """Aug 2026: forecast demand 10/day, spend 20/day, 1 new customer/day, NC demand 8/day,
+    NC RoAS 0.4 and BRoAS 3.0 (rate targets, constant per day). Sheet actual demand for Aug 1 = 50."""
     d = {
         f"2026-08-{i:02d}": {
             "forecast_demand": 10.0,
             "forecast_spend": 20.0,
             "forecast_new_customers": 1.0,
+            "forecast_nc_demand": 8.0,
+            "forecast_nc_roas": 0.4,
+            "forecast_broas": 3.0,
             "sheet_actual_demand": 50.0 if i == 1 else None,
         }
         for i in range(1, days + 1)
@@ -615,8 +619,19 @@ async def test_pacing_month_to_date_against_targets(
     assert mtd["mer"] == pytest.approx(0.5)
     assert mtd["cac"] == pytest.approx(75.0)
     assert mtd["platform_roas"] == pytest.approx(400.0 / 150.0)
+    # Both MTD orders are the customers' first paid core-D2C orders -> all demand is NC demand.
+    assert mtd["nc_orders"] == 2
+    assert mtd["nc_demand"] == pytest.approx(75.0)
+    assert mtd["nc_roas"] == pytest.approx(0.5)  # nc_demand / spend
+    assert mtd["nc_aov"] == pytest.approx(37.5)
 
     assert s["forecast_mtd"]["demand"] == pytest.approx(50.0)
+    assert s["forecast_mtd"]["nc_demand"] == pytest.approx(40.0)
+    assert s["forecast_mtd"]["nc_roas"] == pytest.approx(0.4)  # mean of a constant series
+    assert s["forecast_mtd"]["broas"] == pytest.approx(3.0)
+    assert s["variance_vs_forecast_mtd"]["nc_demand_pct"] == pytest.approx(87.5)
+    assert s["variance_vs_forecast_mtd"]["nc_roas_pct"] == pytest.approx(25.0)
+    assert s["month_forecast"]["nc_demand"] == pytest.approx(248.0)
     assert s["forecast_mtd"]["spend"] == pytest.approx(100.0)
     assert s["forecast_mtd"]["new_customers"] == pytest.approx(5.0)
     assert s["forecast_mtd"]["cac"] == pytest.approx(20.0)
@@ -641,6 +656,10 @@ async def test_pacing_month_to_date_against_targets(
     assert s["last_year_mtd"]["demand"] == pytest.approx(22.0)
     assert s["last_year_mtd"]["spend"] == pytest.approx(10.0)
     assert s["last_year_mtd"]["new_customers"] == 1
+    assert s["last_year_mtd"]["nc_demand"] == pytest.approx(22.0)
+    assert s["last_year_mtd"]["nc_demand_change_pct"] == pytest.approx(
+        (75.0 - 22.0) / 22.0 * 100, abs=0.01
+    )
     assert s["last_year_mtd"]["demand_change_pct"] == pytest.approx(
         (75.0 - 22.0) / 22.0 * 100, abs=0.01
     )
@@ -653,6 +672,7 @@ async def test_pacing_month_to_date_against_targets(
     assert (d1["dow"], d1["demand"], d1["orders"], d1["forecast_demand"]) == ("Sat", 45.0, 1, 10.0)
     assert d1["act_vs_fcst_pct"] == pytest.approx(350.0)
     assert (str(d1["ly_day"]), d1["ly_demand"]) == ("2025-08-02", 22.0)
+    assert (d1["nc_orders"], d1["nc_demand"]) == (1, 45.0)
     assert d1["act_vs_ly_pct"] == pytest.approx((45.0 - 22.0) / 22.0 * 100, abs=0.01)
     assert d1["sheet_actual_demand"] == 50.0
     assert d1["sheet_vs_warehouse_pct"] == pytest.approx((50.0 - 45.0) / 45.0 * 100, abs=0.01)
