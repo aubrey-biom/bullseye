@@ -29,14 +29,15 @@ inside each tool.
 
 from __future__ import annotations
 
-import asyncio
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date as _date
-from typing import Literal
+from typing import Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
 # Imported from `.bq` rather than `.warehouse`: `bq` is where the BigQuery data
 # layer actually lives, and `warehouse` is only a compatibility re-export kept
@@ -50,6 +51,7 @@ from .schemas import (
     BigQueryStatusInput,
     DataFreshnessInput,
     DescribeSchemaInput,
+    DtcPacingInput,
     DtcSalesSummaryInput,
     ExportQueryToCsvInput,
     ForecastVsActualInput,
@@ -171,7 +173,7 @@ async def build_context(settings: Settings | None = None) -> AppContext:
 
 
 @asynccontextmanager
-async def lifespan(_server: FastMCP):
+async def lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:
     ctx = await build_context()
     try:
         yield ctx
@@ -182,7 +184,7 @@ async def lifespan(_server: FastMCP):
 mcp: FastMCP = FastMCP("bpd_mcp", lifespan=lifespan)
 
 
-def _ctx(c: Context) -> AppContext:
+def _ctx(c: Context[Any, Any, Any]) -> AppContext:
     return c.request_context.lifespan_context  # type: ignore[no-any-return]
 
 
@@ -199,15 +201,15 @@ def _ctx(c: Context) -> AppContext:
         "weeks / ETAs reach), the number of source files the upstream pipeline "
         "has landed, and when it last landed one."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_list_datasets(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     response_format: ResponseFormat = "markdown",
 ) -> ToolResponse:
     app = _ctx(ctx)
@@ -233,15 +235,15 @@ async def bpd_list_datasets(
         "validator (multi-statement and DDL/DML tokens rejected). Every query is "
         "dry-run first for cost, and the result is wrapped in LIMIT."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_run_sql(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     sql: str,
     limit: int = 200,
     response_format: ResponseFormat = "markdown",
@@ -262,15 +264,15 @@ async def bpd_run_sql(
         "cost gate as bpd_run_sql. Returns the absolute path so the user can "
         "open the file in Finder."
     ),
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
 )
 async def bpd_export_query_to_csv(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     sql: str,
     filename: str,
     include_header: bool = True,
@@ -301,15 +303,15 @@ async def bpd_export_query_to_csv(
         "table behind it, and any latest-state reduction applied. Also exposed as "
         "the MCP resource `bpd://schema`."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_describe_schema(
-    ctx: Context, response_format: ResponseFormat = "markdown"
+    ctx: Context[Any, Any, Any], response_format: ResponseFormat = "markdown"
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await query_tools.describe_schema(
@@ -324,15 +326,15 @@ async def bpd_describe_schema(
         "location filters. Returns total units (and dollars when the schema has a "
         "dollar column)."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_sales_summary(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     grain: Literal["day", "week", "month"] = "week",
     start_date: _date | None = None,
     end_date: _date | None = None,
@@ -357,15 +359,15 @@ async def bpd_get_sales_summary(
 @mcp.tool(
     name="bpd_get_top_skus",
     description="Top N SKUs by units or dollars over a date range, ordered descending.",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_top_skus(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     by: Literal["units", "dollars"] = "units",
     start_date: _date | None = None,
     end_date: _date | None = None,
@@ -391,15 +393,15 @@ async def bpd_get_top_skus(
         "Latest known inventory per TCIN × location at or before a date. Defaults to "
         "today. Uses inventory_daily if available, else inventory_weekly."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_inventory_snapshot(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     as_of: _date | None = None,
     tcin: int | None = None,
     location_id: int | None = None,
@@ -427,15 +429,15 @@ async def bpd_get_inventory_snapshot(
         "Joins weekly sales and latest inventory to compute weeks-of-supply and "
         "sell-through rate per TCIN × location."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_sell_through(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     start_date: _date | None = None,
     end_date: _date | None = None,
     tcin: int | None = None,
@@ -472,15 +474,15 @@ async def bpd_get_sell_through(
         "`as_of_date` filters by PO creation date (not time travel). "
         "Returns po_count, open_units, line_count per TCIN; derivation in `extra`."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_open_orders(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     as_of_date: _date | None = None,
     location_filter: list[int] | None = None,
     tcin_filter: list[int] | None = None,
@@ -509,15 +511,15 @@ async def bpd_get_open_orders(
         "`extra`. When the two plans diverge, prefer po_plan_daily for the near "
         "horizon (fresher snapshot); use po_plan_biweekly only beyond its reach."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_upcoming_pos(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     weeks_forward: int = 8,
     tcin_filter: list[int] | None = None,
     response_format: ResponseFormat = "markdown",
@@ -545,15 +547,15 @@ async def bpd_get_upcoming_pos(
         "latest_available (default) or pre_week forecast snapshots; extra.forecast_drops "
         "classifies each snapshot as weekly_retrospective vs forward_horizon."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_forecast_vs_actual(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     weeks_back: int = 12,
     tcin_filter: list[int] | None = None,
     location_filter: list[int] | None = None,
@@ -600,15 +602,15 @@ async def bpd_get_forecast_vs_actual(
         "(Central); periods touching today or clipped by the window are flagged "
         "partial_period."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_dtc_sales_summary(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     grain: Literal["day", "week", "month"] = "week",
     start_date: _date | None = None,
     end_date: _date | None = None,
@@ -646,15 +648,15 @@ async def bpd_get_dtc_sales_summary(
         "by_campaign=true returns the top_n campaigns by window spend with names "
         "and status from ads_campaigns. Platforms restate recent days."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_ads_performance(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     grain: Literal["day", "week", "month"] = "week",
     start_date: _date | None = None,
     end_date: _date | None = None,
@@ -689,15 +691,15 @@ async def bpd_get_ads_performance(
         "channels had spend in each period (Meta history starts 2025-07-02; "
         "earlier periods are google_only by construction)."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_get_marketing_efficiency(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     grain: Literal["day", "week", "month"] = "week",
     start_date: _date | None = None,
     end_date: _date | None = None,
@@ -710,6 +712,46 @@ async def bpd_get_marketing_efficiency(
             grain=grain,
             start_date=start_date,
             end_date=end_date,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_get_dtc_pacing",
+    description=(
+        "Month-to-date pacing of core-D2C demand (Shopify total less tax over paid "
+        "orders — the ecomm team's 'Actual DMD'), ad spend and new customers against "
+        "the ecomm team's daily forecast from their pacing sheet "
+        "(config/dtc_pacing_targets.json), with run-rate projection, to-go and "
+        "required daily average, and period-over-period comparisons: the same "
+        "number of days immediately before the month, the same days last month, "
+        "and the weekday-aligned span last year. Returns a summary, Monday-anchored "
+        "weekly rows and (by default) day-by-day rows. Paces through the last "
+        "complete day. If the month's targets are not loaded the actuals and "
+        "comparisons still return, with extra.targets saying how to refresh."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def bpd_get_dtc_pacing(
+    ctx: Context[Any, Any, Any],
+    as_of: _date | None = None,
+    month: str | None = None,
+    include_daily: bool = True,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await dtc_tools.get_dtc_pacing(
+        app.warehouse,
+        DtcPacingInput(
+            as_of=as_of,
+            month=month,
+            include_daily=include_daily,
             response_format=response_format,
         ),
     )
@@ -728,15 +770,15 @@ async def bpd_get_marketing_efficiency(
         "which datasets are reachable, and the fact that the credential has NO write "
         "capability. Replaces the old bpd_auth_status."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
 )
 async def bpd_bigquery_status(
-    ctx: Context, response_format: ResponseFormat = "markdown"
+    ctx: Context[Any, Any, Any], response_format: ResponseFormat = "markdown"
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await admin_tools.bigquery_status(
@@ -754,15 +796,15 @@ async def bpd_bigquery_status(
         "that a recent download means a FILE arrived, not that rows are queryable — "
         "the per-dataset max_date is the authority on that."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def bpd_data_freshness(
-    ctx: Context, response_format: ResponseFormat = "markdown"
+    ctx: Context[Any, Any, Any], response_format: ResponseFormat = "markdown"
 ) -> ToolResponse:
     app = _ctx(ctx)
     return await admin_tools.data_freshness(
@@ -783,15 +825,15 @@ async def bpd_data_freshness(
         "BigQuery call; `execute=true` makes the tool smoke test really run its "
         "queries (billing bytes) instead of only dry-running them."
     ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
 )
 async def bpd_health_check(
-    ctx: Context,
+    ctx: Context[Any, Any, Any],
     skip_network: bool = False,
     execute: bool = False,
     response_format: ResponseFormat = "markdown",
@@ -839,4 +881,4 @@ def run() -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    asyncio.run(run())
+    run()

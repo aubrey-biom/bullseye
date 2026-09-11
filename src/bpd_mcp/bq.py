@@ -866,9 +866,13 @@ def is_product_line_expr(title_col: str = "product_title", sku_col: str = "sku")
 _register(
     LogicalTable(
         name="dtc_order_lines",
-        # Line grain. `order_total` is the ORDER-level total repeated on every
-        # line (Rule 2) — it is here for `is_paid_order` and must never be
-        # SUMmed; `gross_line` / `net_line` are the SUM-safe money columns.
+        # Line grain. `order_total`, `order_subtotal`, `order_shipping`,
+        # `order_tax` and `order_discounts` are ORDER-level values repeated on
+        # every line (Rule 2): reduce to one row per order_id (ANY_VALUE) before
+        # summing them, never SUM them at line grain. `order_total` drives
+        # `is_paid_order`; `order_subtotal + order_shipping` is the ecomm team's
+        # "Demand" (Shopify total less tax — see tools/dtc.py get_dtc_pacing).
+        # `gross_line` / `net_line` are the SUM-safe line-grain money columns.
         # `is_current` only, no `is_deleted` filter: that is the basis the
         # locked revenue anchors were computed on.
         sql=f"""
@@ -877,6 +881,10 @@ SELECT DATE(order_created_datetime_ct) AS order_date_ct, order_created_at_utc,
        {channel_bucket_case("order_source")} AS channel_bucket,
        purchase_type, financial_status, fulfillment_status,
        CAST(current_total_price AS FLOAT64) AS order_total,
+       CAST(current_subtotal_price AS FLOAT64) AS order_subtotal,
+       CAST(total_shipping AS FLOAT64) AS order_shipping,
+       CAST(total_tax AS FLOAT64) AS order_tax,
+       CAST(current_total_discounts AS FLOAT64) AS order_discounts,
        COALESCE(current_total_price, 0) > {DTC_PAID_ORDER_MIN_TOTAL} AS is_paid_order,
        {is_product_line_expr("product_title", "sku")} AS is_product_line,
        product_id, variant_id, sku, current_sku, product_title, variant_title,
@@ -901,6 +909,8 @@ WHERE is_current
             "quantity",
             "gross_line",
             "net_line",
+            "order_subtotal",
+            "order_shipping",
         ),
     )
 )

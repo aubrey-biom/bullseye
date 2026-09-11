@@ -46,17 +46,21 @@ with those definitions, not a tidy-up.
 src/bpd_mcp/              the MCP server
   bq.py                   BigQuery data layer: logical-table registry + CTE injection
   column_roles.py         role -> column candidates; DATASET_KINDS / FEED_KINDS
-  tools/query.py          Target analytics tools; tools/dtc.py: DTC + paid-media analytics;
-                          tools/admin.py: catalog, freshness, health
+  tools/query.py          Target analytics tools; tools/dtc.py: DTC + paid-media analytics
+                          and pacing; tools/admin.py: catalog, freshness, health
+  pacing_targets.py       reader for config/dtc_pacing_targets.json (the ecomm team's targets)
   server.py               FastMCP entry point and tool roster
 scripts/
   pos_brief.py            scheduled Target POS brief (weekly + Thursday pulse) -> Slack text
   setup_reporting.sh      builds the venv the brief needs on a fresh container
   validate_kmg.py         KMG POS-report tie-out: the migration's acceptance gate
   bq_query.py             read-only ad-hoc query runner through the server's data layer
+  refresh_pacing_targets.py  regenerates config/dtc_pacing_targets.json from an .xlsx
+                          export of the ecomm team's pacing sheet (monthly)
   phase0/*.sql            the DTC/ads verification queries (annotated with results)
   verify_install.sh       hermetic install check
 config/pspw_goals.json    KMG-published $PSPW goals and POG door counts (not in BigQuery)
+config/dtc_pacing_targets.json  the ecomm team's daily DTC forecasts by month (not in BigQuery)
 skills/biom-canvas-sql/   vendored copy of the warehouse SQL skill: rules, schema map,
                           validated queries. Kept in sync with the claude.ai skill.
 tests/                    three tiers (hermetic / fixture-on-BigQuery / live); see "Tests"
@@ -260,7 +264,7 @@ the top of `src/bpd_mcp/bq.py`.
 
 ## Tool reference
 
-17 tools, all prefixed `bpd_`. Every tool accepts `response_format` of
+18 tools, all prefixed `bpd_`. Every tool accepts `response_format` of
 `markdown` (default) or `json`.
 
 ### Catalog & query
@@ -315,6 +319,34 @@ definitions, stated in each response's `extra.definitions`:
 | `bpd_get_dtc_sales_summary`     | Shopify DTC by `day`/`week`/`month` × bucket (default `core_d2c`): paid orders, customers, new customers, product units, gross and net line sales, AOV, and `admin_net_revenue` with its allocated refunds. Unpaid orders and their list value are reported beside the paid figures. `by_purchase_type` splits One Time / Subscription (new customers are then NULL rather than repeated). |
 | `bpd_get_ads_performance`       | Spend, impressions, clicks, platform conversions and value by period × channel with CTR/CPC/CPM/CPA/platform ROAS, plus each period's delivery integrity: delivered, confirmed-zero, undiagnosed-gap and unclassified days, summarised as `delivery_flag`. `by_campaign` returns the top-N campaigns by window spend with names and status from `ads_campaigns`. |
 | `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — MER on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
+| `bpd_get_dtc_pacing`            | Month-to-date pacing through the last complete day. **Demand** is the ecomm sheet's definition — order-level subtotal + shipping (Shopify total less tax) over paid core-D2C orders, one row per order — plus spend and new customers, each against the team's daily **forecast** from `config/dtc_pacing_targets.json`: MTD variance, month forecast, to-go, required daily average, run-rate projection. Period over period: the same number of days immediately before the month, the same days last month, and the weekday-aligned (364-day) span last year. Monday-anchored weekly rows and daily rows; `sheet_vs_warehouse_pct` shows the reconciliation to the sheet's own actuals where the config carries them. Targets missing → actuals still return, `extra.targets` says how to refresh. |
+
+#### Pacing targets: the ecomm team's sheet as config
+
+The DTC ecomm team paces against a Google Sheet ("2026 Daily Pacing &
+Performance D2C | Biom"), one tab per month, one row per day, with a daily
+**Forecast** (demand), **Forecasted Spend** and **Forecasted NCs** set when the
+tab is created, and a summary block (Total / To Date / To Go / Days Left).
+The server never reads the sheet: it holds one credential (the read-only
+BigQuery service account) and reads nothing but BigQuery. Instead the forecast
+series live in **`config/dtc_pacing_targets.json`**, regenerated from an
+`.xlsx` export of the sheet:
+
+```bash
+uv run python scripts/refresh_pacing_targets.py ~/Downloads/pacing.xlsx   # then commit the JSON
+uv run python scripts/refresh_pacing_targets.py pacing.xlsx --check       # exit 1 if a new tab landed
+```
+
+The script matches columns on header text (`bpd_mcp.pacing_targets.FIELD_MAP`),
+so a renamed column surfaces as a missing series rather than the wrong one;
+skips tabs that are not `<Month> <Year>` (the `April 2026 V2` revision, the
+source tabs); and records which export it read and when. Every pacing response
+carries that provenance in `extra.targets`, so a stale file is visible. The
+sheet's own **actuals** are kept only as `sheet_actual_*` for reconciliation —
+the warehouse is the source of every actual the tool reports. Reconciled for
+2026-09-01..09, the warehouse demand lands within 0–1.3% of the sheet's
+`Actual DMD` on seven of nine days and within 7% on the other two; spend agrees
+to ~0.2% and new customers to a few per day.
 
 ### Admin
 
@@ -497,7 +529,8 @@ Three tiers, and the split is deliberate:
   computed by the engine that will run it in production, over rows whose right
   answer is known. `tests/test_tools_dtc.py` holds the DTC and ads tools'
   numbers the same way, over fixtures projected under the Phase 1 registry
-  bodies' column names. A few drift guards also run here, comparing the projection
+  bodies' column names; `tests/test_pacing.py` does the same for the pacing
+  tool and pins the checked-in targets file's integrity in the hermetic tier. A few drift guards also run here, comparing the projection
   parsed out of each registry body against the schema BigQuery itself reports.
 * **Tier 3 — `-m bq_live`, real data.** Deliberately small: the full
   `bpd_health_check` runner against production, the registry/roles checks

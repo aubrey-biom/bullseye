@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import re
 import sys
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,7 @@ def _mask_token_value(value: str) -> str:
 
 
 def _redact_processor(
-    _logger: Any, _method: str, event_dict: dict[str, Any]
+    _logger: Any, _method: str, event_dict: MutableMapping[str, Any]
 ) -> dict[str, Any]:
     """Recursively redact any key matching the secret pattern."""
 
@@ -46,7 +47,8 @@ def _redact_processor(
             return [walk(x) for x in node]
         return node
 
-    return walk(event_dict)
+    redacted: dict[str, Any] = walk(event_dict)
+    return redacted
 
 
 _configured = False
@@ -106,7 +108,8 @@ def configure_logging(log_level: str, log_dir: Path) -> None:
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
-    return structlog.get_logger(name)
+    logger: structlog.stdlib.BoundLogger = structlog.get_logger(name)
+    return logger
 
 
 def mask_token(value: str | None) -> str:

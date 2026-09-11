@@ -272,8 +272,11 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         # fulfillment) — distinct from the sales/inventory `location_id`. Per
         # Patch #6.2.2, real Target orders files ship this column.
         "location": [
-            "receiving_location_id", "location_id", "location_number",
-            "store_id", "store_nbr",
+            "receiving_location_id",
+            "location_id",
+            "location_number",
+            "store_id",
+            "store_nbr",
         ],
     },
     "po_plan_daily": {
@@ -385,6 +388,10 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "gross": ["gross_line"],
         "net": ["net_line"],
         "order_total": ["order_total"],
+        "order_subtotal": ["order_subtotal"],
+        "order_shipping": ["order_shipping"],
+        "order_tax": ["order_tax"],
+        "order_discounts": ["order_discounts"],
         "variant": ["variant_id"],
     },
     "dtc_refunds": {
@@ -537,18 +544,42 @@ REQUIRED_ROLES: dict[str, tuple[str, ...]] = {
     "inventory_weekly": ("date", "on_hand", "tcin", "location"),
     "gross_margin": ("date", "tcin"),
     "orders_daily": (
-        "ordered", "received", "cancel_remaining", "po_id", "tcin", "location",
+        "ordered",
+        "received",
+        "cancel_remaining",
+        "po_id",
+        "tcin",
+        "location",
     ),
     "po_plan_daily": ("date", "order_date", "units", "tcin"),
     "po_plan_biweekly": ("date", "order_date", "units", "tcin"),
     "forecast_weekly": ("date", "units", "tcin"),
     # DTC + ads: what the Phase 2 analytics tools (dtc_*/ads_*) will hard-depend on.
-    "dtc_order_lines": ("date", "order_id", "customer_id", "bucket", "paid", "gross", "net", "units"),
+    "dtc_order_lines": (
+        "date",
+        "order_id",
+        "customer_id",
+        "bucket",
+        "paid",
+        "gross",
+        "net",
+        "units",
+        "order_subtotal",
+        "order_shipping",
+    ),
     "dtc_revenue_lines": ("date", "order_id", "bucket", "gross", "net"),
     "dtc_customer_first_order": ("date", "customer_id"),
     "ads_meta_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
     "ads_google_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
-    "ads_spend_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
+    "ads_spend_daily": (
+        "date",
+        "channel",
+        "campaign",
+        "spend",
+        "impressions",
+        "clicks",
+        "conversion_value",
+    ),
     "media_delivery_status": ("date", "channel", "status"),
 }
 
@@ -632,7 +663,7 @@ FEED_KINDS: dict[str, str] = {
 }
 
 
-def validate_roles(warehouse) -> list[dict[str, Any]]:
+def validate_roles(warehouse: Any) -> list[dict[str, Any]]:
     """Check every REQUIRED_ROLES entry against the live schema.
 
     Only POPULATED tables are validated: tables are created lazily by sync, so
@@ -723,7 +754,7 @@ class ColumnNotFound(LookupError):
 
 
 def resolve_column(
-    warehouse,  # avoid circular import on Warehouse type
+    warehouse: Any,  # avoid circular import on Warehouse type
     dataset: str,
     role: str,
     *,
@@ -765,7 +796,7 @@ def resolve_column(
     )
 
 
-def _columns_of(warehouse, table: str) -> list[tuple[str, str]]:
+def _columns_of(warehouse: Any, table: str) -> list[tuple[str, str]]:
     """`[(column_name, BIGQUERY_TYPE)]` in projection order for a logical table.
 
     Delegates to `BigQueryWarehouse.logical_schema`, which is cached and costs
@@ -784,7 +815,7 @@ def _columns_of(warehouse, table: str) -> list[tuple[str, str]]:
         return []
 
 
-def _dataset_has_rows(warehouse, dataset: str) -> bool:
+def _dataset_has_rows(warehouse: Any, dataset: str) -> bool:
     """Is the logical table's primary base table non-empty? 0 bytes, cached.
 
     IndexError is caught alongside KeyError/TypeError because
@@ -813,10 +844,10 @@ def _dataset_has_rows(warehouse, dataset: str) -> bool:
     except (KeyError, TypeError, IndexError):
         return False
     counts = warehouse.base_row_counts()
-    return counts.get(primary, 0) > 0
+    return bool(counts.get(primary, 0) > 0)
 
 
-def table_exists(warehouse, table: str) -> bool:
+def table_exists(warehouse: Any, table: str) -> bool:
     """Is `table` a known logical table? A registry membership test, 0 bytes.
 
     The registry IS the catalogue now — every logical table is defined there and

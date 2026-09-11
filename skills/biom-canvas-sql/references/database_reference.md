@@ -342,7 +342,7 @@ Present as `fct_orders` lines but not sellable products (≈$0 or trivial gross)
 
 ## 10. Complete Structural Map
 
-For the full column-level inventory of all 36 `biom_canvas` objects (every table, column, type, partition/cluster key, and view SELECT logic), see the companion **`schema_map.md`**. That file is regenerable structure; this file is curated judgment. Tables flagged 🆕 in `schema_map.md` (ad/Meta/keyword/shopping performance, `dim_date`, `dim_channel`, `dim_subscription_plan`, `fct_inventory`, `fct_subscription_events`, `fct_target_gross_margin`, and views `vw_shopify_sku_order_financial_detail`, `vw_variant_sku_journey`, `vw_shopify_category_geo_detail`, `vw_target_week_store`, `vw_target_week_tcin`) exist in the warehouse but are **not yet annotated with grain/quirks here** — verify their behavior with a live query before relying on them, then capture what you learn back into this file.
+For the full column-level inventory of all 41 `biom_canvas` objects (every table, column, type, partition/cluster key, and view SELECT logic), see the companion **`schema_map.md`**. That file is regenerable structure; this file is curated judgment. Tables flagged 🆕 in `schema_map.md` (ad/Meta/keyword/shopping performance, `dim_date`, `dim_channel`, `dim_subscription_plan`, `fct_inventory`, `fct_subscription_events`, `fct_target_gross_margin`, and views `vw_shopify_sku_order_financial_detail`, `vw_variant_sku_journey`, `vw_shopify_category_geo_detail`, `vw_target_week_store`, `vw_target_week_tcin`) exist in the warehouse but are **not yet annotated with grain/quirks here** — verify their behavior with a live query before relying on them, then capture what you learn back into this file.
 
 ---
 
