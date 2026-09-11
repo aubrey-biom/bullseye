@@ -28,6 +28,16 @@ dependencies = [
 #   pandas        - only the permissive parse fallback (parsers.py attempt 3).
 
 [project.optional-dependencies]
+# scripts/pos_brief.py (the scheduled Target POS brief) shares no code with the
+# MCP server and used to need this extra because the server ran on DuckDB. Since
+# the BigQuery migration the client is a runtime dependency above, so the extra
+# is now redundant — it is KEPT because scripts/setup_reporting.sh and the
+# Routine definitions at claude.ai/code/routines install `.[reporting]` by name,
+# and removing it would fail the scheduled brief on its next firing.
+reporting = [
+    "google-cloud-bigquery>=3.20",
+]
+
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",

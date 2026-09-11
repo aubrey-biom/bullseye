@@ -319,7 +319,7 @@ def test_feed_kinds_and_date_range_roles_complete_and_consistent() -> None:
     assert set(FEED_KINDS) == set(LOGICAL_TABLES)
     allowed = {
         "delta_latest_state", "accumulating_snapshots", "period_replace",
-        "append_daily", "keyed_overwrite_mixed", "dimensional",
+        "append_daily", "keyed_overwrite_mixed", "dimensional", "append_restated",
     }
     assert set(FEED_KINDS.values()) <= allowed
     for ds, roles_map in DATE_RANGE_ROLES.items():

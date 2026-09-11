@@ -652,13 +652,38 @@ def test_registry_entry_is_well_formed(name):
     assert t.base_tables, "base_tables drives __TABLES__ row counts and cost attribution"
     assert t.primary_base_table == t.base_tables[0]
 
+    # Where a base table may legitimately be referenced. Three shapes:
+    #   leaf      — backtick-quoted in this body (the BPD case);
+    #   composed  — this body reads other logical tables by bare name
+    #               (`depends_on`), so the physical refs live in THEIR bodies;
+    #   via view  — this body reads a `vw_*` object; base_tables then lists the
+    #               view's physical row sources (a view has no `__TABLES__`
+    #               row count) and `latest_state_note` must name the view so a
+    #               reader of describe() is told where the rows really come from.
+    reachable_sql = t.sql
+    for dep in resolve_references(f"SELECT 1 FROM {name}", LOGICAL_TABLES) - {name}:
+        reachable_sql += "\n" + LOGICAL_TABLES[dep].sql
+    views_read = sorted(set(re.findall(r"`[\w.-]+\.(vw_\w+)`", t.sql)))
+    if views_read:
+        assert t.latest_state_note, f"{name} reads {views_read} but its latest_state_note is empty"
+        for view in views_read:
+            assert view in t.latest_state_note, (
+                f"{name} reads view {view} but latest_state_note does not name it"
+            )
+
     for fq in t.base_tables:
         parts = fq.split(".")
         assert len(parts) == 3, f"{fq!r} is not project.dataset.table"
         assert all(parts), f"{fq!r} has an empty component"
-        assert f"`{fq}`" in t.sql, (
-            f"{fq!r} is declared in base_tables but not referenced backtick-quoted in the body; "
-            "an unquoted or missing reference means row counts describe the wrong table"
+        assert ".vw_" not in fq, (
+            f"{fq!r} is a view: __TABLES__ reports 0 rows for it, so list its row sources instead"
+        )
+        if views_read:
+            continue  # row sources of a view are not referenced in the body by design
+        assert f"`{fq}`" in reachable_sql, (
+            f"{fq!r} is declared in base_tables but not referenced backtick-quoted in the body "
+            "(or in the bodies it depends on); an unquoted or missing reference means row counts "
+            "describe the wrong table"
         )
 
     for dep in t.depends_on:
@@ -668,11 +693,24 @@ def test_registry_entry_is_well_formed(name):
 
 
 @pytest.mark.parametrize("name", sorted(LOGICAL_TABLES))
-def test_registry_body_is_self_contained(name):
-    """No BPD body references another logical table today, so every single-table
-    query must inject exactly ONE CTE. A body that quietly grew a bare-name
-    reference would multiply the bytes scanned by every tool that touches it."""
-    assert _injected(f"SELECT * FROM {name}", LOGICAL_TABLES) == [name]
+def test_registry_body_injects_exactly_its_declared_dependencies(name):
+    """A single-table query injects the table plus its DECLARED dependencies and
+    nothing else. A body that quietly grew an undeclared bare-name reference would
+    multiply the bytes scanned by every tool that touches it, so the declared
+    edge set is the whole edge set. No BPD body depends on anything; the DTC/ads
+    composed tables (dtc_customer_first_order, ads_spend_daily) depend on the
+    tables they say they do."""
+    t = LOGICAL_TABLES[name]
+    expected = {name}
+    work = list(t.depends_on)
+    while work:
+        dep = work.pop()
+        if dep not in expected:
+            expected.add(dep)
+            work.extend(LOGICAL_TABLES[dep].depends_on)
+    assert set(_injected(f"SELECT * FROM {name}", LOGICAL_TABLES)) == expected
+    if not t.depends_on:
+        assert _injected(f"SELECT * FROM {name}", LOGICAL_TABLES) == [name]
 
 
 def test_registry_uses_the_column_roles_spelling():
@@ -715,9 +753,14 @@ def test_latest_state_note_is_present_exactly_where_a_dedup_is():
     caller comparing against raw row counts. The two entries carrying a QUALIFY
     are the two that must have it."""
     with_qualify = {n for n, t in LOGICAL_TABLES.items() if "QUALIFY" in t.sql.upper()}
+    # The note has a second legitimate use: a body that reads a `vw_*` object
+    # names the view, because base_tables lists the view's row sources instead
+    # (see test_registry_entry_is_well_formed).
+    with_view = {n for n, t in LOGICAL_TABLES.items() if re.search(r"\.vw_\w+`", t.sql)}
     with_note = {n for n, t in LOGICAL_TABLES.items() if t.latest_state_note}
-    assert with_qualify == with_note
+    assert with_note == with_qualify | with_view
     assert with_qualify == {"orders_daily", "forecast_weekly"}
+    assert with_view == {"dtc_revenue_lines", "media_delivery_status"}
 
 
 def test_po_plan_tables_carry_no_registry_level_dedup():

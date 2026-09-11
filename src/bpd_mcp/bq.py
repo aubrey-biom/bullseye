@@ -190,7 +190,9 @@ class LogicalTable:
 #
 # Composing across sources: put the other logical name in `depends_on` and
 # reference it by bare name inside `sql`. CTE injection resolves transitively
-# and emits in topological order. No BPD table uses this today.
+# and emits in topological order. `dtc_customer_first_order` and
+# `ads_spend_daily` below are built this way; `logical_schema()` injects too,
+# so a composed body's schema probe resolves.
 #
 # Cost: an unpartitioned source scans in full on every reference. The three
 # biom_canvas facts are partitioned on their date column and clustered on
@@ -757,6 +759,417 @@ FROM `{_P}.bpd_raw.wkly_loc_attr_v0_0`
         date_column="last_remodel_date",
         patterns=("WKLY_LOC_ATTR_V0_0",),
         column_contract=("location_number", "last_remodel_date"),
+    )
+)
+
+
+# ======================================================================================
+# DTC (Shopify) + paid media (Meta / Google Ads) — the first non-BPD sources.
+# ======================================================================================
+#
+# Everything below reads `biom_canvas` only, so `base_datasets()` is unchanged.
+# The rules these bodies encode come from the warehouse reference and were
+# re-verified live on 2026-09-10 (see README "DTC & ads data model"):
+#
+#   * `is_current` on every SCD2 base table; the revenue VIEW filters it itself.
+#   * Shopify money is NUMERIC. Every money column is CAST to FLOAT64 here so
+#     the tools' ratio math promotes the way it does for Target (FLOAT64), and
+#     so a fixture can pin one type per column name across the registry.
+#   * Order dates are Central Time (`order_created_datetime_ct`), the basis of
+#     the locked revenue anchors.
+#   * `admin_net_revenue` exists ONLY in `vw_revenue_subscriptions` (Rule 9).
+#   * Google total spend comes from the CAMPAIGN fact only. The shopping and
+#     keyword facts are sub-grains of it (together ~40% of campaign spend on
+#     2026-09-10) and would double count if unioned in.
+#   * Meta and Google `campaign_id` are STRING and INT64 respectively; every
+#     ads_* table projects STRING so the two channels join and union cleanly.
+#   * Google's `customer_id` is the ADS ACCOUNT id, not a Shopify customer. It is
+#     projected as `ads_account_id` so no role can ever confuse the two.
+
+# `order_source` -> reporting bucket. ONE place, rendered into every DTC body
+# that classifies a line, so the two can never disagree. Values verified in
+# Shopify admin on 2026-09-10 (app names in parentheses):
+#   core_d2c  web (Online Store), Loop renewals, and 3890849 (Shopify's Shop
+#             app — real paid orders for the same storefront, NOT "app-sourced
+#             gifting" as the warehouse reference has it).
+#   gifting   242196283393 (ShopMy Integration). 100%-discounted influencer
+#             seeding: `gross_using_line_price` values the free product at LIST
+#             PRICE (~$213K in the 90 days to 2026-09-10) while every order
+#             totals $0. Excluded from D2C sales; reported as its own line.
+#   manual    shopify_draft_order (Draft Orders: comps, replacements,
+#             wholesale keyed by hand) and `Direct` (Matrixify bulk imports,
+#             e.g. "BabyCenter Reward Claim", $0).
+#   wholesale marketplace / B2B storefronts per the reference §9.4.
+# Anything else, including NULL (a 2026-06-18..29 load gap), is `unknown` and
+# is SURFACED by the tools, never silently dropped or silently counted.
+DTC_SOURCE_BUCKETS: dict[str, tuple[str, ...]] = {
+    "core_d2c": (
+        "web",
+        "subscription_contract",
+        "subscription_contract_checkout_one",
+        "3890849",
+    ),
+    "gifting": ("242196283393",),
+    "manual": ("shopify_draft_order", "Direct"),
+    "wholesale": (
+        "faire",
+        "Faire",
+        "Design Milk Shop",
+        "pos",
+        "BetterWorld",
+        "Flora",
+        "Sustai Market",
+        "Canal",
+        "Choose",
+        "shopify-collective-automatic-payments",
+    ),
+}
+
+# Order lines that are not sellable product (reference §9.3 plus the two
+# non-product SKU classes dim_product excludes). `is_product_line` is FALSE for
+# these so revenue-mix work can drop them without re-deriving the list.
+DTC_NON_PRODUCT_TITLES: tuple[str, ...] = ("Carbon Neutral Offset", "Checkout+")
+DTC_NON_PRODUCT_TITLE_PATTERNS: tuple[str, ...] = ("%CashBack%", "%GWP%")
+DTC_NON_PRODUCT_SKUS: tuple[str, ...] = ("x-redo", "1111", "2222")
+
+# `current_total_price > 1.00` strips $0 gifting and $1 PR samples (§9.4).
+DTC_PAID_ORDER_MIN_TOTAL = 1.00
+
+
+def _sql_str_list(values: tuple[str, ...]) -> str:
+    return ", ".join("'" + v.replace("'", "\\'") + "'" for v in values)
+
+
+def channel_bucket_case(source_col: str = "order_source") -> str:
+    """The `channel_bucket` CASE expression, rendered from DTC_SOURCE_BUCKETS."""
+    whens = "\n".join(
+        f"  WHEN {source_col} IN ({_sql_str_list(sources)}) THEN '{bucket}'"
+        for bucket, sources in DTC_SOURCE_BUCKETS.items()
+    )
+    return f"CASE\n{whens}\n  ELSE 'unknown'\nEND"
+
+
+def is_product_line_expr(title_col: str = "product_title", sku_col: str = "sku") -> str:
+    """The `is_product_line` BOOL expression (TRUE = a real product line)."""
+    likes = " OR ".join(
+        f"COALESCE({title_col}, '') LIKE '{p}'" for p in DTC_NON_PRODUCT_TITLE_PATTERNS
+    )
+    return (
+        f"NOT (COALESCE({title_col}, '') IN ({_sql_str_list(DTC_NON_PRODUCT_TITLES)}) "
+        f"OR {likes} "
+        f"OR COALESCE({sku_col}, '') IN ({_sql_str_list(DTC_NON_PRODUCT_SKUS)}))"
+    )
+
+
+# ---------- DTC: Shopify orders, refunds, certified revenue ----------
+
+_register(
+    LogicalTable(
+        name="dtc_order_lines",
+        # Line grain. `order_total` is the ORDER-level total repeated on every
+        # line (Rule 2) — it is here for `is_paid_order` and must never be
+        # SUMmed; `gross_line` / `net_line` are the SUM-safe money columns.
+        # `is_current` only, no `is_deleted` filter: that is the basis the
+        # locked revenue anchors were computed on.
+        sql=f"""
+SELECT DATE(order_created_datetime_ct) AS order_date_ct, order_created_at_utc,
+       order_id, line_item_id, order_name, customer_id, order_source,
+       {channel_bucket_case("order_source")} AS channel_bucket,
+       purchase_type, financial_status, fulfillment_status,
+       CAST(current_total_price AS FLOAT64) AS order_total,
+       COALESCE(current_total_price, 0) > {DTC_PAID_ORDER_MIN_TOTAL} AS is_paid_order,
+       {is_product_line_expr("product_title", "sku")} AS is_product_line,
+       product_id, variant_id, sku, current_sku, product_title, variant_title,
+       quantity, CAST(unit_price AS FLOAT64) AS unit_price,
+       CAST(total_discount AS FLOAT64) AS line_discount,
+       CAST(gross_using_line_price AS FLOAT64) AS gross_line,
+       CAST(net_line_sales AS FLOAT64) AS net_line,
+       landing_site, referring_site
+FROM `{_P}.biom_canvas.fct_orders`
+WHERE is_current
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_orders",),
+        date_column="order_date_ct",
+        column_contract=(
+            "order_date_ct",
+            "order_id",
+            "customer_id",
+            "order_source",
+            "channel_bucket",
+            "is_paid_order",
+            "is_product_line",
+            "quantity",
+            "gross_line",
+            "net_line",
+        ),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="dtc_refunds",
+        # Refund HEADER grain. `order_id` is INT64 at source and STRING on
+        # fct_orders (Rule 7); cast here so the join needs no cast at the call site.
+        sql=f"""
+SELECT DATE(refund_created_at_utc, 'America/Chicago') AS refund_date, refund_created_at_utc,
+       refund_id, CAST(order_id AS STRING) AS order_id,
+       CAST(total_refunded AS FLOAT64) AS refund_amount, note
+FROM `{_P}.biom_canvas.fct_refunds`
+WHERE is_current
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_refunds",),
+        date_column="refund_date",
+        column_contract=("refund_date", "order_id", "refund_amount"),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="dtc_revenue_lines",
+        # Read THROUGH the certified view, not around it: `admin_net_revenue`
+        # (gross minus allocated discount minus allocated refund) exists nowhere
+        # else, and re-deriving it here would drift from the number leadership
+        # reconciles to. The view already filters is_current (Rule 1 exception).
+        # Gifting nets to ~0 here (100% allocated discount) while `gross_revenue`
+        # still carries list value — `channel_bucket` is what tells them apart.
+        sql=f"""
+SELECT revenue_date, revenue_key, order_id, line_item_id, order_source,
+       {channel_bucket_case("order_source")} AS channel_bucket,
+       purchase_type, financial_status, customer_id, has_loop,
+       product_category, product_sub_category, sku, product_title, quantity, units_sold,
+       CAST(revenue_amount AS FLOAT64) AS gross_revenue,
+       CAST(allocated_discount AS FLOAT64) AS allocated_discount,
+       CAST(allocated_refund AS FLOAT64) AS allocated_refund,
+       CAST(admin_net_revenue AS FLOAT64) AS admin_net_revenue,
+       is_loop_subscription_certified, order_created_datetime_ct
+FROM `{_P}.biom_canvas.vw_revenue_subscriptions`
+WHERE record_type = 'revenue' AND channel_key = 'shopify'
+""",
+        # The physical tables the view joins. The view itself is not listed:
+        # `__TABLES__` reports 0 rows for a view, which would read as "empty".
+        base_tables=(
+            f"{_P}.biom_canvas.fct_revenue",
+            f"{_P}.biom_canvas.fct_orders",
+            f"{_P}.biom_canvas.fct_refunds",
+        ),
+        date_column="revenue_date",
+        latest_state_note=(
+            "Read through biom_canvas.vw_revenue_subscriptions (record_type='revenue', "
+            "channel_key='shopify'), the only place admin_net_revenue is defined. row_count "
+            "is fct_revenue's and includes Target rows."
+        ),
+        column_contract=(
+            "revenue_date",
+            "order_id",
+            "customer_id",
+            "channel_bucket",
+            "gross_revenue",
+            "admin_net_revenue",
+        ),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="dtc_customer_first_order",
+        # Derived from dtc_order_lines so "first order" uses the SAME channel
+        # bucket and paid-order rule as every other DTC number: a customer's
+        # first PAID core-D2C order. Gifting recipients and draft orders never
+        # create a "new customer" here. This is the first registry entry to use
+        # `depends_on`; CTE injection orders it after its dependency.
+        sql="""
+SELECT MIN(order_date_ct) AS first_order_date, customer_id,
+       COUNT(DISTINCT order_id) AS lifetime_orders,
+       SUM(gross_line) AS lifetime_gross
+FROM dtc_order_lines
+WHERE customer_id IS NOT NULL AND channel_bucket = 'core_d2c' AND is_paid_order
+GROUP BY customer_id
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_orders",),
+        date_column="first_order_date",
+        depends_on=("dtc_order_lines",),
+        column_contract=("first_order_date", "customer_id", "lifetime_orders"),
+    )
+)
+
+
+# ---------- Ads: Meta and Google daily performance ----------
+#
+# None of the ad facts is SCD2 (no is_current); each row is keyed by row_id and
+# carries `loaded_at`. Platforms RESTATE recent days (Meta's attribution window
+# is up to 28 days), so a day's spend can change after it first lands — see
+# FEED_KINDS 'append_restated'. Per-row ratio columns (ctr, cpc, cpm, cpp) are
+# deliberately NOT projected: a ratio must be recomputed from summed
+# numerators and denominators, never averaged.
+
+_register(
+    LogicalTable(
+        name="ads_meta_daily",
+        sql=f"""
+SELECT date_start AS date, ad_id, adset_id, campaign_id, 'meta' AS channel,
+       device_platform, publisher_platform,
+       spend, impressions, clicks, reach,
+       CAST(purchases AS FLOAT64) AS conversions, purchase_value AS conversion_value,
+       add_to_cart, view_content, frequency, loaded_at
+FROM `{_P}.biom_canvas.fct_meta_performance`
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_meta_performance",),
+        date_column="date",
+        column_contract=(
+            "date", "channel", "campaign_id", "spend", "impressions", "clicks",
+            "conversions", "conversion_value",
+        ),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="ads_google_daily",
+        # Campaign x day x device x network. THE source for Google total spend.
+        sql=f"""
+SELECT date, CAST(campaign_id AS STRING) AS campaign_id, 'google' AS channel,
+       device, network_type, customer_id AS ads_account_id,
+       spend_usd AS spend, impressions, clicks, conversions,
+       conversions_value AS conversion_value, loaded_at
+FROM `{_P}.biom_canvas.fct_ad_performance`
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_ad_performance",),
+        date_column="date",
+        column_contract=(
+            "date", "channel", "campaign_id", "spend", "impressions", "clicks",
+            "conversions", "conversion_value",
+        ),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="ads_google_shopping_daily",
+        # Product-level sub-grain of ads_google_daily (Shopping campaigns only).
+        # Drill-down, NOT a spend source: summing this with ads_google_daily
+        # double counts. `variant_id` is the Shopify variant behind the item.
+        sql=f"""
+SELECT date, CAST(campaign_id AS STRING) AS campaign_id, CAST(ad_group_id AS STRING) AS ad_group_id,
+       'google' AS channel, item_id, variant_id, device, product_channel,
+       customer_id AS ads_account_id,
+       spend_usd AS spend, impressions, clicks, conversions,
+       conversions_value AS conversion_value, all_conversions, all_conversions_value,
+       search_impression_share, search_click_share, loaded_at
+FROM `{_P}.biom_canvas.fct_shopping_performance`
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_shopping_performance",),
+        date_column="date",
+        column_contract=("date", "channel", "campaign_id", "spend", "impressions", "clicks"),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="ads_google_keyword_daily",
+        # Keyword-level sub-grain of ads_google_daily (Search campaigns only).
+        # Drill-down, NOT a spend source — same double-count warning as shopping.
+        sql=f"""
+SELECT date, CAST(campaign_id AS STRING) AS campaign_id, CAST(ad_group_id AS STRING) AS ad_group_id,
+       criterion_id, 'google' AS channel, device, customer_id AS ads_account_id,
+       spend_usd AS spend, impressions, clicks, conversions,
+       conversions_value AS conversion_value, loaded_at
+FROM `{_P}.biom_canvas.fct_keyword_performance`
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_keyword_performance",),
+        date_column="date",
+        column_contract=("date", "channel", "campaign_id", "spend", "impressions", "clicks"),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="ads_campaigns",
+        # Both channels' campaign dimensions in one shape. Google budgets are in
+        # micros and are converted; Meta's `daily_budget` is projected as
+        # stored — whether the pipeline already converted it from minor units
+        # is UNVERIFIED, so do not compare the two channels' budgets until it is.
+        sql=f"""
+SELECT campaign_start_date, CAST(campaign_id AS STRING) AS campaign_id, 'google' AS channel,
+       campaign_name, campaign_status AS status,
+       campaign_advertising_channel_type AS campaign_type,
+       campaign_bidding_strategy_type AS bidding_strategy,
+       SAFE_DIVIDE(campaign_budget_amount_micros, 1000000) AS daily_budget,
+       campaign_end_date, CAST(NULL AS STRING) AS objective
+FROM `{_P}.biom_canvas.dim_campaign`
+WHERE is_current
+UNION ALL
+SELECT DATE(start_time), campaign_id, 'meta', name, status, buying_type, CAST(NULL AS STRING),
+       daily_budget, DATE(stop_time), objective
+FROM `{_P}.biom_canvas.dim_campaign_meta`
+WHERE is_current
+""",
+        base_tables=(
+            f"{_P}.biom_canvas.dim_campaign",
+            f"{_P}.biom_canvas.dim_campaign_meta",
+        ),
+        date_column="campaign_start_date",
+        column_contract=("campaign_start_date", "campaign_id", "channel", "campaign_name", "status"),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="ads_spend_daily",
+        # The cross-channel spend spine: (date, channel, campaign_id). Composed
+        # from the two channel facts by bare name, so it can never disagree
+        # with them. Google side is the CAMPAIGN fact only (see the module note).
+        sql="""
+SELECT date, channel, campaign_id,
+       SUM(spend) AS spend, SUM(impressions) AS impressions, SUM(clicks) AS clicks,
+       SUM(conversions) AS conversions, SUM(conversion_value) AS conversion_value
+FROM ads_meta_daily
+GROUP BY date, channel, campaign_id
+UNION ALL
+SELECT date, channel, campaign_id,
+       SUM(spend), SUM(impressions), SUM(clicks), SUM(conversions), SUM(conversion_value)
+FROM ads_google_daily
+GROUP BY date, channel, campaign_id
+""",
+        base_tables=(
+            f"{_P}.biom_canvas.fct_meta_performance",
+            f"{_P}.biom_canvas.fct_ad_performance",
+        ),
+        date_column="date",
+        depends_on=("ads_meta_daily", "ads_google_daily"),
+        column_contract=(
+            "date", "channel", "campaign_id", "spend", "impressions", "clicks",
+            "conversions", "conversion_value",
+        ),
+    )
+)
+
+_register(
+    LogicalTable(
+        name="media_delivery_status",
+        # One row per channel x calendar day from each channel's first day:
+        # DELIVERED / OBSERVED_ZERO / CONFIRMED_NO_DELIVERY / ABSENT_UNDIAGNOSED.
+        # A zero-spend day is only a real zero if it is CONFIRMED_NO_DELIVERY or
+        # OBSERVED_ZERO; ABSENT_UNDIAGNOSED is a pipeline gap and must be flagged,
+        # never zero-filled. (On 2026-09-10 there were no undiagnosed days.)
+        # `channel` is lower-cased to match the ads_* tables.
+        sql=f"""
+SELECT event_date, LOWER(channel) AS channel, canvas_table, delivery_status,
+       spend_modelled, impressions_modelled, evidence_method, evidence_note, confidence
+FROM `{_P}.biom_canvas.vw_media_delivery_status`
+""",
+        # The view also reads biom_admin.seed_media_delivery_status (the
+        # evidence seed); it is not listed because base_tables is pinned to
+        # {biom_canvas, bpd_raw} and the seed is not a row source.
+        base_tables=(
+            f"{_P}.biom_canvas.fct_meta_performance",
+            f"{_P}.biom_canvas.fct_ad_performance",
+        ),
+        date_column="event_date",
+        latest_state_note=(
+            "Read through biom_canvas.vw_media_delivery_status; row_count is "
+            "fct_meta_performance's, not the view's day count."
+        ),
+        column_contract=("event_date", "channel", "delivery_status", "spend_modelled"),
     )
 )
 
@@ -1587,7 +2000,14 @@ class BigQueryWarehouse:
                 f"unknown logical table {table!r}; known: {sorted(self._registry)}"
             )
         body = self._registry[table].sql
-        job, _ = self._run(f"SELECT * FROM (\n{body.strip()}\n) LIMIT 0", dry_run=True)
+        # Injected like any other statement: a body that composes another
+        # logical table by bare name (`depends_on`, e.g. dtc_customer_first_order
+        # reading dtc_order_lines) would otherwise fail its own schema probe with
+        # `Unrecognized name`. For a leaf body this is a no-op.
+        probe, injected = build_with_report(
+            f"SELECT * FROM (\n{body.strip()}\n) LIMIT 0", self._registry
+        )
+        job, _ = self._run(probe, dry_run=True, injected=injected)
         cols = [(f.name, str(f.field_type).upper()) for f in (job.schema or [])]
         with self._lock:
             self._schema_cache[table] = cols
