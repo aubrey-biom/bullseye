@@ -250,7 +250,7 @@ async def data_freshness(
 # clear_cache = 14. Kept in lockstep with server.py by `_mcp_self_check` and by
 # a drift guard in the test suite — bump it in the SAME commit as any tool
 # addition or removal, or every user's health check hard-fails.
-EXPECTED_TOOL_COUNT = 14
+EXPECTED_TOOL_COUNT = 17
 
 
 def _timed(fn):
@@ -785,7 +785,7 @@ class _DryRunWarehouse:
 
     Used by the tool smoke test. It proves the SQL each tool composes actually
     compiles against BigQuery — including every dialect translation and every
-    resolved column name — at 0 bytes billed, where really invoking 11 tools
+    resolved column name — at 0 bytes billed, where really invoking 14 tools
     scans real data on every health check.
 
     Returns the dry run's own schema with ZERO rows, so tools take their
@@ -829,9 +829,12 @@ async def _tools_smoke_test(
                      a raised exception -> FAIL (the SQL did not compile)
     """
     from ..schemas import (
+        AdsPerformanceInput,
         DescribeSchemaInput,
+        DtcSalesSummaryInput,
         ForecastVsActualInput,
         InventorySnapshotInput,
+        MarketingEfficiencyInput,
         OpenOrdersInput,
         RunSqlInput,
         SalesSummaryInput,
@@ -839,6 +842,7 @@ async def _tools_smoke_test(
         TopSkusInput,
         UpcomingPosInput,
     )
+    from . import dtc as dtc_tools
     from . import query as query_tools
 
     wh: Any = warehouse if execute else _DryRunWarehouse(warehouse)
@@ -852,6 +856,9 @@ async def _tools_smoke_test(
         ("bpd_get_open_orders", lambda: query_tools.get_open_orders(wh, OpenOrdersInput())),
         ("bpd_get_upcoming_pos", lambda: query_tools.get_upcoming_pos(wh, UpcomingPosInput())),
         ("bpd_get_forecast_vs_actual", lambda: query_tools.get_forecast_vs_actual(wh, ForecastVsActualInput())),
+        ("bpd_get_dtc_sales_summary", lambda: dtc_tools.get_dtc_sales_summary(wh, DtcSalesSummaryInput())),
+        ("bpd_get_ads_performance", lambda: dtc_tools.get_ads_performance(wh, AdsPerformanceInput())),
+        ("bpd_get_marketing_efficiency", lambda: dtc_tools.get_marketing_efficiency(wh, MarketingEfficiencyInput())),
         ("bpd_list_datasets", lambda: list_datasets(warehouse, ListDatasetsInput())),
         ("bpd_data_freshness", lambda: data_freshness(warehouse, settings, DataFreshnessInput())),
     ]
