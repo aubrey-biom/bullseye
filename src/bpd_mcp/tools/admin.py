@@ -19,7 +19,7 @@ COST DISCIPLINE. Health checks run often and BigQuery bills by byte scanned, so
 every check here is either free or bounded, and each one says which:
   * `__TABLES__` row counts and dry-run schemas cost 0 bytes.
   * `bpd_meta.ingestion_state` is 834 rows.
-  * The date-range sweep is one combined job (~527 MB), TTL-cached in the
+  * The date-range sweep is one combined job (~690 MB), TTL-cached in the
     warehouse for 900 s and shared with `bpd_list_datasets`.
   * The tool smoke test DRY-RUNS by default (0 bytes); `execute=true` opts into
     a real run.

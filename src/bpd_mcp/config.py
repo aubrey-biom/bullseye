@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     bpd_bq_warn_bytes: int = Field(default=1 * 1024 * 1024 * 1024)  # 1 GiB
 
     # TTLs for the two metadata caches that are not free. The date-range sweep
-    # is one combined UNION ALL job over every logical table (~527 MB); at 900 s
+    # is one combined UNION ALL job over every logical table (~690 MB); at 900 s
     # a heavy interactive session refreshes it about four times an hour. Row
     # counts come from `__TABLES__` and cost nothing, so their TTL only exists
     # to keep the numbers moving.

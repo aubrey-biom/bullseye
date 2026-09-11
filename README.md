@@ -134,7 +134,7 @@ root. See `.env.example`.
 | `BPD_BQ_LOCATION`           | `us-central1`        | **Required.** An empty location makes `INFORMATION_SCHEMA` silently return zero rows instead of erroring. Validated non-empty. |
 | `BPD_BQ_MAX_BYTES_BILLED`   | 20 GiB               | Hard `maximum_bytes_billed` on every job.                                                 |
 | `BPD_BQ_WARN_BYTES`         | 1 GiB                | The pre-flight dry-run gate logs a warning above this.                                    |
-| `BPD_BQ_DATERANGE_TTL_S`    | `900`                | TTL for the combined date-range sweep (~527 MB per refresh — the one metadata query that costs money). |
+| `BPD_BQ_DATERANGE_TTL_S`    | `900`                | TTL for the combined date-range sweep (~690 MB per refresh over 26 tables — the one metadata query that costs money). |
 | `BPD_BQ_ROWCOUNT_TTL_S`     | `300`                | TTL for `__TABLES__` row counts (0 bytes).                                                |
 | `BPD_EXPORT_MAX_ROWS`       | `200000`             | Cap for `bpd_export_query_to_csv`. Lowered from 1,000,000: on per-byte billing an unguarded export is a money question, not a disk question. |
 | `BPD_VENDOR_ID`             | `139440`             | Biom's BPID. Identity only.                                                               |
@@ -357,7 +357,7 @@ concern:
   avoidable scan per call.
 * **Metadata is free or cached.** Schemas come from cached dry runs (0 bytes);
   row counts from `__TABLES__` (0 bytes, 300 s TTL); the date-range sweep is one
-  combined `UNION ALL` job (~527 MB, 900 s TTL). `INFORMATION_SCHEMA` bills a
+  combined `UNION ALL` job (~690 MB over 26 tables, 900 s TTL; ~527 MB before the DTC/ads tables, of which the view-backed `dtc_revenue_lines` is ~73 MB). `INFORMATION_SCHEMA` bills a
   10 MB minimum per query and is avoided.
 * **Date predicates matter.** Partition pruning survives CTE injection
   (`sales_daily` 13.3 MB → 3.5 MB with a `WHERE`), so never drop a date filter
@@ -468,6 +468,11 @@ Three tiers, and the split is deliberate:
   `bpd_health_check` runner against production, the registry/roles checks
   against live schemas, and the KMG tie-out below driven end to end as a
   subprocess.
+
+Both live tiers were run against the 26-table registry (the DTC and ads
+entries included) on **2026-09-11**: tier 2 **82 passed**, tier 3 **4 passed**,
+and `bpd_health_check` reported 11 pass / 1 warn, the warn being the upstream
+feed-freshness condition on two retired Target patterns, not a registry fault.
 
 Both BigQuery tiers **skip themselves** when neither `GCP_SA_KEY_B64` nor
 `GOOGLE_APPLICATION_CREDENTIALS` is set, so a contributor without warehouse
