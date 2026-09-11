@@ -143,6 +143,7 @@ def test_dataset_and_feed_kind_values_stay_in_their_documented_vocabularies() ->
         "append_daily",
         "keyed_overwrite_mixed",
         "dimensional",
+        "append_restated",
     }
 
 

@@ -366,6 +366,126 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "tcin": ["tcin", "item_id"],
         "location": ["location_id", "location_number", "store_id", "store_nbr"],
     },
+    # ---------- DTC (Shopify) ----------
+    #
+    # These bodies are OURS (bq.py projects and aliases every column), so the
+    # candidate lists are short and exact: there is no upstream naming drift to
+    # absorb the way there is for Target's feeds. A second candidate appears
+    # only where the same role has two legitimate spellings across DTC tables.
+    "dtc_order_lines": {
+        "date": ["order_date_ct"],
+        "order_id": ["order_id"],
+        "customer_id": ["customer_id"],
+        "source": ["order_source"],
+        "bucket": ["channel_bucket"],
+        "paid": ["is_paid_order"],
+        "product_line": ["is_product_line"],
+        "purchase_type": ["purchase_type"],
+        "units": ["quantity"],
+        "gross": ["gross_line"],
+        "net": ["net_line"],
+        "order_total": ["order_total"],
+        "variant": ["variant_id"],
+    },
+    "dtc_refunds": {
+        "date": ["refund_date"],
+        "order_id": ["order_id"],
+        "amount": ["refund_amount"],
+    },
+    "dtc_revenue_lines": {
+        "date": ["revenue_date"],
+        "order_id": ["order_id"],
+        "customer_id": ["customer_id"],
+        "source": ["order_source"],
+        "bucket": ["channel_bucket"],
+        "purchase_type": ["purchase_type"],
+        "category": ["product_category"],
+        "sub_category": ["product_sub_category"],
+        "units": ["units_sold", "quantity"],
+        "gross": ["gross_revenue"],
+        "net": ["admin_net_revenue"],
+        "discount": ["allocated_discount"],
+        "refund": ["allocated_refund"],
+    },
+    "dtc_customer_first_order": {
+        "date": ["first_order_date"],
+        "customer_id": ["customer_id"],
+        "orders": ["lifetime_orders"],
+    },
+    # ---------- Ads (Meta + Google) ----------
+    #
+    # One measure vocabulary across every ads_* table: `spend`, `impressions`,
+    # `clicks`, `conversions`, `conversion_value`. CPC / CTR / ROAS are NOT roles
+    # on purpose — they are ratios and must be recomputed from these sums.
+    "ads_meta_daily": {
+        "date": ["date"],
+        "channel": ["channel"],
+        "campaign": ["campaign_id"],
+        "spend": ["spend"],
+        "impressions": ["impressions"],
+        "clicks": ["clicks"],
+        "conversions": ["conversions"],
+        "conversion_value": ["conversion_value"],
+        "loaded_at": ["loaded_at"],
+    },
+    "ads_google_daily": {
+        "date": ["date"],
+        "channel": ["channel"],
+        "campaign": ["campaign_id"],
+        "spend": ["spend"],
+        "impressions": ["impressions"],
+        "clicks": ["clicks"],
+        "conversions": ["conversions"],
+        "conversion_value": ["conversion_value"],
+        "loaded_at": ["loaded_at"],
+    },
+    "ads_google_shopping_daily": {
+        "date": ["date"],
+        "channel": ["channel"],
+        "campaign": ["campaign_id"],
+        "variant": ["variant_id"],
+        "spend": ["spend"],
+        "impressions": ["impressions"],
+        "clicks": ["clicks"],
+        "conversions": ["conversions"],
+        "conversion_value": ["conversion_value"],
+        "loaded_at": ["loaded_at"],
+    },
+    "ads_google_keyword_daily": {
+        "date": ["date"],
+        "channel": ["channel"],
+        "campaign": ["campaign_id"],
+        "spend": ["spend"],
+        "impressions": ["impressions"],
+        "clicks": ["clicks"],
+        "conversions": ["conversions"],
+        "conversion_value": ["conversion_value"],
+        "loaded_at": ["loaded_at"],
+    },
+    "ads_campaigns": {
+        "date": ["campaign_start_date"],
+        "channel": ["channel"],
+        "campaign": ["campaign_id"],
+        "name": ["campaign_name"],
+        "status": ["status"],
+        "budget": ["daily_budget"],
+    },
+    "ads_spend_daily": {
+        "date": ["date"],
+        "channel": ["channel"],
+        "campaign": ["campaign_id"],
+        "spend": ["spend"],
+        "impressions": ["impressions"],
+        "clicks": ["clicks"],
+        "conversions": ["conversions"],
+        "conversion_value": ["conversion_value"],
+    },
+    "media_delivery_status": {
+        "date": ["event_date"],
+        "channel": ["channel"],
+        "status": ["delivery_status"],
+        "spend": ["spend_modelled"],
+    },
 }
 
 
@@ -389,6 +509,18 @@ DATASET_KINDS: dict[str, str] = {
     "item_attr": "dimensional",
     "item_attr_extended": "dimensional",
     "location_attr": "dimensional",
+    # DTC + ads
+    "dtc_order_lines": "transactional",
+    "dtc_refunds": "transactional",
+    "dtc_revenue_lines": "transactional",
+    "dtc_customer_first_order": "transactional",
+    "ads_meta_daily": "transactional",
+    "ads_google_daily": "transactional",
+    "ads_google_shopping_daily": "transactional",
+    "ads_google_keyword_daily": "transactional",
+    "ads_campaigns": "dimensional",
+    "ads_spend_daily": "transactional",
+    "media_delivery_status": "transactional",
 }
 
 
@@ -410,6 +542,14 @@ REQUIRED_ROLES: dict[str, tuple[str, ...]] = {
     "po_plan_daily": ("date", "order_date", "units", "tcin"),
     "po_plan_biweekly": ("date", "order_date", "units", "tcin"),
     "forecast_weekly": ("date", "units", "tcin"),
+    # DTC + ads: what the Phase 2 analytics tools (dtc_*/ads_*) will hard-depend on.
+    "dtc_order_lines": ("date", "order_id", "customer_id", "bucket", "paid", "gross", "net", "units"),
+    "dtc_revenue_lines": ("date", "order_id", "bucket", "gross", "net"),
+    "dtc_customer_first_order": ("date", "customer_id"),
+    "ads_meta_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
+    "ads_google_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
+    "ads_spend_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
+    "media_delivery_status": ("date", "channel", "status"),
 }
 
 
@@ -453,6 +593,14 @@ DATE_RANGE_ROLES: dict[str, dict[str, str]] = {
 #                             (forecast_weekly: neither snapshots nor clean
 #                             latest-state; see forecast_drops)
 #   dimensional             — full-universe last-write-wins snapshot
+#   append_restated         — one row per (key, day) appended daily, but the
+#                             platform RESTATES recent days (Meta attributes
+#                             purchases for up to 28 days after the click), so
+#                             the last few weeks can change after they land.
+#                             Freshness is the table's own MAX(date)/loaded_at,
+#                             not the Kiteworks ledger.
+# The DTC tables read SCD2 sources through `is_current` (or a view that does),
+# so like orders_daily they ARE the latest state: delta_latest_state.
 FEED_KINDS: dict[str, str] = {
     "sales_daily": "append_daily",
     "sales_weekly": "period_replace",
@@ -469,6 +617,18 @@ FEED_KINDS: dict[str, str] = {
     "item_attr": "dimensional",
     "item_attr_extended": "dimensional",
     "location_attr": "dimensional",
+    # DTC + ads
+    "dtc_order_lines": "delta_latest_state",
+    "dtc_refunds": "delta_latest_state",
+    "dtc_revenue_lines": "delta_latest_state",
+    "dtc_customer_first_order": "delta_latest_state",
+    "ads_meta_daily": "append_restated",
+    "ads_google_daily": "append_restated",
+    "ads_google_shopping_daily": "append_restated",
+    "ads_google_keyword_daily": "append_restated",
+    "ads_campaigns": "dimensional",
+    "ads_spend_daily": "append_restated",
+    "media_delivery_status": "append_restated",
 }
 
 

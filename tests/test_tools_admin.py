@@ -707,4 +707,4 @@ async def test_bigquery_status_identifies_the_real_service_account(bq_client) ->
     assert who.endswith("@biom-reporting-s26.iam.gserviceaccount.com"), who
     assert "bpd_raw" in resp.data["datasets_reachable"]
     assert "biom_canvas" in resp.data["datasets_reachable"]
-    assert resp.data["logical_tables"] == 15
+    assert resp.data["logical_tables"] == len(LOGICAL_TABLES)

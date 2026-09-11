@@ -121,11 +121,12 @@ once every old server process has exited.
 
 ## Data model: logical tables
 
-The analytics tools reference **15 logical tables** by bare name. They are not
-BigQuery views — the service account cannot create views — so the server
-injects each referenced one as a CTE immediately before the query runs. From a
-caller's point of view (including `bpd_run_sql`) they behave exactly like
-tables:
+The analytics tools reference **26 logical tables** by bare name: 15 Target
+BPD tables, 4 DTC (Shopify) tables and 7 paid-media (Meta / Google Ads)
+tables. They are not BigQuery views — the service account cannot create views
+— so the server injects each referenced one as a CTE immediately before the
+query runs. From a caller's point of view (including `bpd_run_sql`) they
+behave exactly like tables:
 
 ```sql
 SELECT tcin, SUM(sale_quantity) AS units
@@ -151,6 +152,47 @@ GROUP BY tcin ORDER BY units DESC
 | `item_attr`             | `bpd_raw.weekly_item_mta`                                    | EAV form |
 | `item_attr_extended`    | `bpd_raw.wkly_tcin_item`                                     | |
 | `location_attr`         | `bpd_raw.wkly_loc_attr_v0_0`                                 | |
+
+### DTC & ads data model
+
+Added for the DTC performance / pacing work. All read `biom_canvas` only, all
+project lower-case names, and every Shopify money column is **CAST to FLOAT64**
+(the sources are NUMERIC, which does not promote in ratio math).
+
+| Logical table               | BigQuery source                                             | Note |
+| --------------------------- | ----------------------------------------------------------- | ---- |
+| `dtc_order_lines`           | `biom_canvas.fct_orders` (`is_current`)                      | line grain; `order_date_ct` is Central Time; adds `channel_bucket`, `is_paid_order`, `is_product_line`; `order_total` repeats per line — never SUM it |
+| `dtc_refunds`               | `biom_canvas.fct_refunds` (`is_current`)                     | refund-header grain; `order_id` cast to STRING |
+| `dtc_revenue_lines`         | `biom_canvas.vw_revenue_subscriptions` (`record_type='revenue'`, `channel_key='shopify'`) | the only source of `admin_net_revenue`; the view filters `is_current` itself |
+| `dtc_customer_first_order`  | derived from `dtc_order_lines` (`depends_on`)                | first **paid core-D2C** order per customer; gifting never mints a new customer |
+| `ads_meta_daily`            | `biom_canvas.fct_meta_performance`                           | ad × day × device × publisher; `purchases`/`purchase_value` → `conversions`/`conversion_value` |
+| `ads_google_daily`          | `biom_canvas.fct_ad_performance`                             | campaign × day × device × network; **the** source for Google total spend |
+| `ads_google_shopping_daily` | `biom_canvas.fct_shopping_performance`                       | product sub-grain; drill-down only — summing it with the campaign fact double counts |
+| `ads_google_keyword_daily`  | `biom_canvas.fct_keyword_performance`                        | keyword sub-grain; same warning |
+| `ads_campaigns`             | `dim_campaign` ∪ `dim_campaign_meta` (`is_current`)          | Google budget converted from micros; Meta budget units unverified |
+| `ads_spend_daily`           | derived from `ads_meta_daily` ∪ `ads_google_daily`           | the cross-channel (date, channel, campaign_id) spend spine |
+| `media_delivery_status`     | `biom_canvas.vw_media_delivery_status`                       | per channel × day: DELIVERED / OBSERVED_ZERO / CONFIRMED_NO_DELIVERY / ABSENT_UNDIAGNOSED — never zero-fill an undiagnosed day |
+
+**`channel_bucket`** is the locked reporting scope for every DTC number, rendered
+from one constant (`bq.DTC_SOURCE_BUCKETS`) into every body that classifies a
+line. Verified against Shopify admin on 2026-09-10:
+
+| bucket      | `order_source` values | why |
+| ----------- | --------------------- | --- |
+| `core_d2c`  | `web`, `subscription_contract_checkout_one`, `subscription_contract`, `3890849` | Online Store, Loop renewals, and Shopify's **Shop** app (real paid orders — the warehouse reference mis-files it as "app-sourced") |
+| `gifting`   | `242196283393` | **ShopMy Integration.** 100%-discounted influencer seeding. `gross_using_line_price` values the free product at *list price* (~$213K in the 90 days to 2026-09-10) while every order totals $0. Excluded from D2C sales; report it as its own line |
+| `manual`    | `shopify_draft_order`, `Direct` | Draft Orders (comps, replacements) and Matrixify bulk imports ("BabyCenter Reward Claim", $0) |
+| `wholesale` | `faire`, `Design Milk Shop`, `pos`, … | marketplace / B2B per the reference §9.4 |
+| `unknown`   | anything else, incl. `NULL` | surfaced, never dropped. `NULL` is a 2026-06-18..29 load gap — raise upstream |
+
+Ad-data facts established live on 2026-09-10 and relied on by the design: both
+channels land yesterday's data before 13:00 UTC (one-day lag, daily); every
+calendar day in both channels is classified by `media_delivery_status` (no
+undiagnosed gaps); Meta history starts **2025-07-02**, so any blended
+spend/ROAS/CAC series before that is Google-only; Google keyword + shopping
+spend is ~40% of campaign spend and must never be added to it; platform
+conversion value is populated on both channels, so platform-attributed ROAS is
+computable per channel alongside blended ROAS from warehouse revenue.
 
 Two of these carry a **latest-state reduction** that is the difference between
 right and catastrophically wrong: `orders_daily` unreduced reports 14.2 M open

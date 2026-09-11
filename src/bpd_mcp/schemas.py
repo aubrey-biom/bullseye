@@ -46,11 +46,12 @@ class ToolResponse(_BaseModel):
 # Catalog
 # --------------------------------------------------------------------------------------
 
-# The 15 logical tables the server exposes. This list MUST equal
-# `bq.KNOWN_DATASET_NAMES` (i.e. the keys of `bq.LOGICAL_TABLES`), which is in
-# turn pinned to `column_roles.COLUMN_ROLES` / `DATASET_KINDS` / `FEED_KINDS` by
-# a drift guard. It is spelled out literally rather than generated so MCP
-# clients get a real enum in the published tool schema.
+# The 26 logical tables the server exposes (15 Target BPD, 4 DTC, 7 ads). This
+# list MUST equal `bq.KNOWN_DATASET_NAMES` (i.e. the keys of
+# `bq.LOGICAL_TABLES`), which is in turn pinned to `column_roles.COLUMN_ROLES`
+# / `DATASET_KINDS` / `FEED_KINDS` by a drift guard. It is spelled out literally
+# rather than generated so MCP clients get a real enum in the published tool
+# schema.
 KnownDataset = Literal[
     "sales_daily",
     "sales_weekly",
@@ -67,6 +68,17 @@ KnownDataset = Literal[
     "po_plan_daily",
     "po_plan_biweekly",
     "forecast_weekly",
+    "dtc_order_lines",
+    "dtc_refunds",
+    "dtc_revenue_lines",
+    "dtc_customer_first_order",
+    "ads_meta_daily",
+    "ads_google_daily",
+    "ads_google_shopping_daily",
+    "ads_google_keyword_daily",
+    "ads_campaigns",
+    "ads_spend_daily",
+    "media_delivery_status",
 ]
 
 
