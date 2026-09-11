@@ -77,6 +77,8 @@ ORDER_LINES = [
         "purchase_type": "One Time",
         "is_paid_order": True,
         "is_product_line": True,
+        "order_subtotal": 36.0,
+        "order_shipping": 4.0,
         "quantity": 2,
         "gross_line": 40.0,
         "net_line": 36.0,
@@ -90,6 +92,8 @@ ORDER_LINES = [
         "purchase_type": "One Time",
         "is_paid_order": True,
         "is_product_line": False,
+        "order_subtotal": 36.0,
+        "order_shipping": 4.0,
         "quantity": 1,
         "gross_line": 0.0,
         "net_line": 0.0,
@@ -103,6 +107,8 @@ ORDER_LINES = [
         "purchase_type": "Subscription",
         "is_paid_order": True,
         "is_product_line": True,
+        "order_subtotal": 25.0,
+        "order_shipping": 0.0,
         "quantity": 1,
         "gross_line": 25.0,
         "net_line": 25.0,
@@ -116,6 +122,8 @@ ORDER_LINES = [
         "purchase_type": "One Time",
         "is_paid_order": False,
         "is_product_line": True,
+        "order_subtotal": 0.0,
+        "order_shipping": 0.0,
         "quantity": 3,
         "gross_line": 90.0,
         "net_line": 0.0,
@@ -129,6 +137,8 @@ ORDER_LINES = [
         "purchase_type": "One Time",
         "is_paid_order": True,
         "is_product_line": True,
+        "order_subtotal": 18.0,
+        "order_shipping": 2.0,
         "quantity": 1,
         "gross_line": 20.0,
         "net_line": 18.0,
@@ -142,14 +152,16 @@ ORDER_LINES = [
         "purchase_type": "One Time",
         "is_paid_order": True,
         "is_product_line": True,
+        "order_subtotal": 10.0,
+        "order_shipping": 0.0,
         "quantity": 1,
         "gross_line": 10.0,
         "net_line": 10.0,
     },
 ]
 # core_d2c wk 08-03: orders 2 (o1, o2), customers 2, units 3 (Checkout+ excluded),
-#                    gross 65, net_line 61, aov 32.5
-# core_d2c wk 08-10: orders 1 (o4), customers 1, units 1, gross 20, net 18, aov 20
+#                    gross 65, net_line 61, aov 32.5, demand 65 (o1 36+4 once, o2 25)
+# core_d2c wk 08-10: orders 1 (o4), customers 1, units 1, gross 20, net 18, aov 20, demand 20
 # gifting  wk 08-03: orders 0, unpaid_orders 1, unpaid_list_value 90
 # unknown  wk 08-10: orders 1, gross 10
 
@@ -775,8 +787,10 @@ async def test_marketing_efficiency_by_week(fixture_warehouse: Any) -> None:
     assert w1["customers"] == 2
     assert w1["new_customers"] == 2
     assert w1["gross_sales"] == pytest.approx(65.0)  # gifting's 90 is NOT here
+    assert w1["demand"] == pytest.approx(65.0)  # o1's order-level 36+4 counted ONCE over 2 lines
     assert w1["net_line_sales"] == pytest.approx(61.0)
     assert w1["admin_net_revenue"] == pytest.approx(59.0)
+    assert w1["mer_demand"] == pytest.approx(65.0 / 250.0)
     assert w1["mer_gross"] == pytest.approx(65.0 / 250.0)
     assert w1["mer_net"] == pytest.approx(59.0 / 250.0)
     assert w1["blended_cac"] == pytest.approx(125.0)
@@ -793,6 +807,8 @@ async def test_marketing_efficiency_by_week(fixture_warehouse: Any) -> None:
     assert w2["orders"] == 1
     assert w2["new_customers"] == 0
     assert w2["blended_cac"] is None  # no new customers: NULL, never inf or a crash
+    assert w2["demand"] == pytest.approx(20.0)  # o4: 18 + 2 shipping
+    assert w2["mer_demand"] == pytest.approx(0.4)
     assert w2["mer_gross"] == pytest.approx(0.4)
     assert w2["cost_per_order"] == pytest.approx(50.0)
     assert w2["platform_roas"] == pytest.approx(0.0)
@@ -820,7 +836,9 @@ async def test_marketing_efficiency_spend_without_sales_is_a_row_with_zeros(
     assert w2["spend"] == pytest.approx(50.0)
     assert w2["orders"] == 0
     assert w2["gross_sales"] == pytest.approx(0.0)
+    assert w2["demand"] == pytest.approx(0.0)
     assert w2["mer_gross"] == pytest.approx(0.0)
+    assert w2["mer_demand"] == pytest.approx(0.0)
     assert w2["blended_cac"] is None
     assert w2["cost_per_order"] is None
 

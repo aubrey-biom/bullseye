@@ -5,10 +5,10 @@ for in #ecommerce (weekly, not daily), in the shape of the MTD updates Corinne
 already posts there (Revenue & Efficiency / Acquisition / month pacing / takeaways):
 
   weekly (Mondays)   the Mon–Sun week that just closed: demand, spend, MER, new
-                     customers, CAC, NC demand and NC ROAS vs the prior week and
-                     the trailing 4-week average; then the month's pacing against
-                     the ecomm team's forecast. One threaded reply: the 8-week
-                     table.
+                     customers and CAC vs the prior week (demand also vs the
+                     trailing 4-week average); then the month's pacing — demand,
+                     spend, NCs, NC demand and NC ROAS — against the ecomm team's
+                     forecast. One threaded reply: the 8-week table.
   pulse  (Thursdays) week so far (Mon–Wed) vs the same days last week, plus the
                      month pacing — the mid-week check on whether the plan needs
                      a spend or promo decision before the week closes.
@@ -19,7 +19,10 @@ already posts there (Revenue & Efficiency / Acquisition / month pacing / takeawa
 
 Every number comes from the server's own tools (tools/dtc.py) through its
 read-only BigQuery data layer, so the brief can never disagree with what someone
-gets from the MCP by hand. Targets come from config/dtc_pacing_targets.json (the
+gets from the MCP by hand. "Demand" is one definition everywhere in a message —
+the sheet's Actual DMD (order subtotal + shipping on paid core-D2C orders), as
+`demand` from the efficiency tool for the week figures and from the pacing tool
+for the month — and MER is demand / spend on both. Targets come from config/dtc_pacing_targets.json (the
 sheet as config — see bpd_mcp/pacing_targets.py); the brief prints the tab and
 refresh date it used, and says plainly when the month has no targets loaded.
 
@@ -32,6 +35,7 @@ Usage:
     uv run python scripts/dtc_brief.py --mode pulse
     uv run python scripts/dtc_brief.py --mode recap
     uv run python scripts/dtc_brief.py --mode weekly --as-of 2026-09-07 --json
+    uv run python scripts/dtc_brief.py --mode recap --targets /tmp/pacing_targets.json
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from bpd_mcp.pacing_targets import load_targets
 from bpd_mcp.schemas import (
     DtcPacingInput,
     MarketingEfficiencyInput,
@@ -75,12 +80,11 @@ def _k(v: Any) -> str:
     return f"${v / 1000:,.1f}K" if abs(v) >= 10_000 else f"${v:,.0f}"
 
 
-def _money(v: Any) -> str:
-    return "n/a" if v is None else f"${v:,.0f}"
-
-
-def _pct(v: Any) -> str:
-    return "n/a" if v is None else f"{v:+.1f}%"
+# $ and % render exactly as the tools' own markdown does (n/a for None), so a
+# figure in the brief and the same figure from the MCP read identically.
+_money = dtc._money
+_pct = dtc._pct
+_pct_change = dtc._pct_change
 
 
 def _x(v: Any) -> str:
@@ -89,12 +93,6 @@ def _x(v: Any) -> str:
 
 def _n(v: Any) -> str:
     return "n/a" if v is None else f"{v:,.0f}"
-
-
-def _pct_change(a: float | None, b: float | None) -> float | None:
-    if a is None or b is None or b == 0:
-        return None
-    return (a - b) / b * 100.0
 
 
 def _light(variance_pct: float | None, *, good_when_high: bool = True) -> str:
@@ -110,6 +108,7 @@ def _light(variance_pct: float | None, *, good_when_high: bool = True) -> str:
 
 
 def _table(rows: list[list[str]], aligns: str) -> str:
+    """Fixed-width text table for a Slack code block (same shape as pos_brief's)."""
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     out = []
     for r in rows:
@@ -153,9 +152,11 @@ async def gather(
 ) -> dict[str, Any]:
     """Run the tool calls one brief needs and return their JSON payloads, untouched.
 
-    `warehouse` / `targets` are injection points for the tests (a fixture warehouse
-    of literal rows, a synthetic targets file); the CLI leaves both None and the
-    server's own context is built and closed here.
+    `warehouse` is an injection point for the tests (a fixture warehouse of literal
+    rows); the CLI leaves it None and the server's own context is built and closed
+    here. `targets` is a parsed PacingTargets, or None for the checked-in file —
+    the month-end recap Routine passes a fresh export (see `--targets`) so the
+    closed month's sheet actuals are there to reconcile against.
     """
     app = None
     if warehouse is None:
@@ -178,20 +179,7 @@ async def gather(
                 ),
                 "pacing",
             )
-            m_start, m_end = dtc.month_bounds(ym)
-            weeks = _ok(
-                await dtc.get_marketing_efficiency(
-                    wh,
-                    MarketingEfficiencyInput(
-                        grain="week",
-                        start_date=m_start - timedelta(days=m_start.weekday()),
-                        end_date=m_end,
-                        response_format="json",
-                    ),
-                ),
-                "efficiency",
-            )
-            return {"mode": mode, "today": today, "pacing": pacing, "weeks": weeks}
+            return {"mode": mode, "today": today, "pacing": pacing}
 
         pacing = _ok(
             await dtc.get_dtc_pacing(
@@ -266,14 +254,14 @@ async def gather(
 def _sum_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Roll efficiency rows (any grain) into one window with recomputed ratios."""
     tot: dict[str, Any] = dict.fromkeys(
-        ("spend", "orders", "new_customers", "gross_sales", "admin_net_revenue"), 0.0
+        ("spend", "orders", "new_customers", "demand", "gross_sales", "admin_net_revenue"), 0.0
     )
     for r in rows:
         for k in tot:
             tot[k] += float(r.get(k) or 0)
-    tot["mer"] = tot["gross_sales"] / tot["spend"] if tot["spend"] else None
+    tot["mer"] = tot["demand"] / tot["spend"] if tot["spend"] else None
     tot["cac"] = tot["spend"] / tot["new_customers"] if tot["new_customers"] else None
-    tot["aov"] = tot["gross_sales"] / tot["orders"] if tot["orders"] else None
+    tot["aov"] = tot["demand"] / tot["orders"] if tot["orders"] else None
     return tot
 
 
@@ -448,17 +436,17 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     prev = by.get(str(wk_start - timedelta(days=7)))
     trailing = [by[k] for k in sorted(by) if k < str(wk_start)][-4:]
     avg4 = _sum_rows(trailing) if trailing else None
-    avg4_demand = (avg4["gross_sales"] / len(trailing)) if avg4 else None
+    avg4_demand = (avg4["demand"] / len(trailing)) if avg4 else None
 
-    def _vs(key: str, cur_v: Any, good_when_high: bool = True) -> str:
+    def _vs(key: str, cur_v: Any) -> str:
         prev_v = prev.get(key) if prev else None
         return f"{_pct(_pct_change(cur_v, prev_v))} WoW"
 
     head = f"🛒 **DTC — week of {_span(wk_start, wk_end)}**"
     lead = (
-        f"Demand {_k(cur['gross_sales'])}, {_vs('gross_sales', cur['gross_sales'])}"
+        f"Demand {_k(cur['demand'])}, {_vs('demand', cur['demand'])}"
         + (
-            f", {_pct(_pct_change(cur['gross_sales'], avg4_demand))} vs the trailing {len(trailing)}-wk avg"
+            f", {_pct(_pct_change(cur['demand'], avg4_demand))} vs the trailing {len(trailing)}-wk avg"
             if avg4_demand
             else ""
         )
@@ -466,9 +454,9 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     )
     lines = [head, lead, "", "**Revenue & Efficiency**"]
     lines.append(
-        f"Spend {_k(cur['spend'])} ({_vs('spend', cur['spend'])}) · MER {_x(cur['mer_gross'])}"
-        + (f" (prior week {_x(prev['mer_gross'])})" if prev else "")
-        + f" · platform ROAS {_x(cur['platform_roas'])} · AOV {_money(cur['gross_sales'] / cur['orders'] if cur['orders'] else None)}"
+        f"Spend {_k(cur['spend'])} ({_vs('spend', cur['spend'])}) · MER {_x(cur['mer_demand'])}"
+        + (f" (prior week {_x(prev['mer_demand'])})" if prev else "")
+        + f" · platform ROAS {_x(cur['platform_roas'])} · AOV {_money(cur['demand'] / cur['orders'] if cur['orders'] else None)}"
     )
     lines += ["", "**Acquisition**"]
     lines.append(
@@ -491,10 +479,10 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         tbl.append(
             [
                 f"{p_start:%b %-d}",
-                _money(r["gross_sales"]),
-                _pct(_pct_change(r["gross_sales"], prev_row["gross_sales"])) if prev_row else "",
+                _money(r["demand"]),
+                _pct(_pct_change(r["demand"], prev_row["demand"])) if prev_row else "",
                 _money(r["spend"]),
-                _x(r["mer_gross"]),
+                _x(r["mer_demand"]),
                 _n(r["new_customers"]),
                 _money(r["blended_cac"]),
                 f"{r['new_customer_share'] * 100:.0f}%"
@@ -517,8 +505,8 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
     head = f"🛒 **DTC — week so far** ({_span(wk_start, through)})"
     lines = [
         head,
-        f"**{days} day{'' if days == 1 else 's'} in:** demand {_k(cur['gross_sales'])} "
-        f"({_pct(_pct_change(cur['gross_sales'], prev['gross_sales']))} vs the same days last week) · "
+        f"**{days} day{'' if days == 1 else 's'} in:** demand {_k(cur['demand'])} "
+        f"({_pct(_pct_change(cur['demand'], prev['demand']))} vs the same days last week) · "
         f"spend {_k(cur['spend'])} ({_pct(_pct_change(cur['spend'], prev['spend']))}) · MER {_x(cur['mer'])}"
         + (f" (last week {_x(prev['mer'])})" if prev["mer"] else ""),
         f"New customers {_n(cur['new_customers'])} ({_pct(_pct_change(cur['new_customers'], prev['new_customers']))}) · "
@@ -557,10 +545,12 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
         )
     lines = [head, lead, "", "**Revenue & Efficiency**"]
     fc = s.get("forecast_mtd") or {}
-    var = s.get("variance_vs_forecast_mtd") or {}
+    # Every "vs forecast" below is against the sheet's stated month Total (`fm`),
+    # the same base the demand lead uses — not the MTD variance, whose base is the
+    # summed daily series and can differ from the Total row by a few percent.
     sp = f"Spend {_k(mtd['spend'])}"
     if fm.get("spend") is not None:
-        sp += f" vs {_k(fm['spend'])} forecast ({_pct(var.get('spend_pct'))})"
+        sp += f" vs {_k(fm['spend'])} forecast ({_pct(_pct_change(mtd['spend'], fm['spend']))})"
     sp += f" · MER {_x(mtd['mer'])}" + (
         f" (plan {_x(fc.get('mer'))})" if fc.get("mer") is not None else ""
     )
@@ -569,14 +559,16 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
     lines += ["", "**Acquisition**"]
     nc = f"New customers {_n(mtd['new_customers'])}"
     if fm.get("new_customers") is not None:
-        nc += f" vs {_n(fm['new_customers'])} goal ({_pct(var.get('new_customers_pct'))}){_light(var.get('new_customers_pct'))}"
+        nc_var = _pct_change(mtd["new_customers"], fm["new_customers"])
+        nc += f" vs {_n(fm['new_customers'])} goal ({_pct(nc_var)}){_light(nc_var)}"
     nc += f" · CAC {_money(mtd['cac'])}" + (
         f" (plan {_money(fc.get('cac'))})" if fc.get("cac") is not None else ""
     )
     lines.append(nc)
     ncd = f"NC demand {_k(mtd['nc_demand'])}"
     if fm.get("nc_demand") is not None:
-        ncd += f" vs {_k(fm['nc_demand'])} goal ({_pct(var.get('nc_demand_pct'))}){_light(var.get('nc_demand_pct'))}"
+        ncd_var = _pct_change(mtd["nc_demand"], fm["nc_demand"])
+        ncd += f" vs {_k(fm['nc_demand'])} goal ({_pct(ncd_var)}){_light(ncd_var)}"
     ncd += f" · NC ROAS {_x(mtd['nc_roas'])}" + (
         f" (target {_x(fc.get('nc_roas'))})" if fc.get("nc_roas") is not None else ""
     )
@@ -643,8 +635,9 @@ def render(d: dict[str, Any]) -> dict[str, Any]:
     return {"weekly": render_weekly, "pulse": render_pulse, "recap": render_recap}[d["mode"]](d)
 
 
-def build(mode: str, as_of: date | None = None) -> dict[str, Any]:
-    return render(asyncio.run(gather(mode, as_of)))
+def build(mode: str, as_of: date | None = None, targets_path: str | None = None) -> dict[str, Any]:
+    targets = load_targets(targets_path) if targets_path else None
+    return render(asyncio.run(gather(mode, as_of, targets=targets)))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -656,10 +649,19 @@ def main(argv: list[str] | None = None) -> int:
         "--as-of",
         help="YYYY-MM-DD: run as if today were this date (Central), to backtest a past Monday/Thursday/1st",
     )
+    ap.add_argument(
+        "--targets",
+        metavar="PATH",
+        help=(
+            "pacing targets JSON to use instead of config/dtc_pacing_targets.json — the "
+            "month-end recap passes one regenerated from a same-morning sheet export so the "
+            "closed month's sheet actuals are present to reconcile against"
+        ),
+    )
     ap.add_argument("--json", action="store_true", help="emit {main, replies} as JSON")
     args = ap.parse_args(argv)
 
-    out = build(args.mode, date.fromisoformat(args.as_of) if args.as_of else None)
+    out = build(args.mode, date.fromisoformat(args.as_of) if args.as_of else None, args.targets)
     if args.json:
         print(json.dumps(out, indent=2))
     else:

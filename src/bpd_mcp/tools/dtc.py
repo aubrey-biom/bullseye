@@ -797,8 +797,13 @@ _EFFICIENCY_DEFINITIONS = {
     "orders / customers / gross_sales / net_line_sales": (
         "core_d2c PAID orders only (channel_bucket = 'core_d2c' AND is_paid_order)"
     ),
+    "demand": (
+        "order-level order_subtotal + order_shipping (Shopify total less tax; the ecomm pacing "
+        "sheet's 'Actual DMD') over the same paid core_d2c orders, one row per order"
+    ),
     "admin_net_revenue": "core_d2c rows of dtc_revenue_lines (certified view), order-date basis",
     "new_customers": "rows of dtc_customer_first_order in the period (first PAID core-D2C order)",
+    "mer_demand": "SAFE_DIVIDE(demand, spend) — the sheet's blended ROAS (BRoAS) basis",
     "mer_gross": "SAFE_DIVIDE(gross_sales, spend) — marketing efficiency ratio on gross",
     "mer_net": "SAFE_DIVIDE(admin_net_revenue, spend)",
     "blended_cac": "SAFE_DIVIDE(spend, new_customers) — all spend over new customers",
@@ -819,8 +824,10 @@ _EFFICIENCY_MARKDOWN_COLUMNS = [
     "spend",
     "orders",
     "new_customers",
+    "demand",
     "gross_sales",
     "admin_net_revenue",
+    "mer_demand",
     "mer_gross",
     "blended_cac",
     "platform_roas",
@@ -857,7 +864,17 @@ async def get_marketing_efficiency(
         o = _cols(
             warehouse,
             "dtc_order_lines",
-            ("date", "order_id", "customer_id", "bucket", "paid", "gross", "net"),
+            (
+                "date",
+                "order_id",
+                "customer_id",
+                "bucket",
+                "paid",
+                "gross",
+                "net",
+                "order_subtotal",
+                "order_shipping",
+            ),
         )
         r = _cols(warehouse, "dtc_revenue_lines", ("date", "bucket", "net"))
         n = _cols(warehouse, "dtc_customer_first_order", ("date", "customer_id"))
@@ -883,6 +900,25 @@ WITH sales AS (
     FROM dtc_order_lines
     WHERE {_date_pred(o_date, start, end)}
       AND {_q(o["bucket"])} = '{CORE_BUCKET}' AND {_q(o["paid"])}
+    GROUP BY period
+),
+-- Demand is an ORDER-level figure (subtotal after discounts + shipping, i.e.
+-- Shopify's total less tax — the ecomm pacing sheet's "Actual DMD"), repeated
+-- on every line of the order, so it is reduced to one row per order first.
+orders AS (
+    SELECT {_q(o["order_id"])} AS order_id,
+           ANY_VALUE({o_date}) AS d,
+           ANY_VALUE({_q(o["order_subtotal"])}) AS order_subtotal,
+           ANY_VALUE({_q(o["order_shipping"])}) AS order_shipping
+    FROM dtc_order_lines
+    WHERE {_date_pred(o_date, start, end)}
+      AND {_q(o["bucket"])} = '{CORE_BUCKET}' AND {_q(o["paid"])}
+    GROUP BY order_id
+),
+demand AS (
+    SELECT {period_expr(g, "d")} AS period,
+           SUM(COALESCE(order_subtotal, 0.0) + COALESCE(order_shipping, 0.0)) AS demand
+    FROM orders
     GROUP BY period
 ),
 rev AS (
@@ -927,9 +963,11 @@ SELECT k.period,
        COALESCE(sales.orders, 0) AS orders,
        COALESCE(sales.customers, 0) AS customers,
        COALESCE(newc.new_customers, 0) AS new_customers,
+       COALESCE(demand.demand, 0.0) AS demand,
        COALESCE(sales.gross_sales, 0.0) AS gross_sales,
        COALESCE(sales.net_line_sales, 0.0) AS net_line_sales,
        COALESCE(rev.admin_net_revenue, 0.0) AS admin_net_revenue,
+       SAFE_DIVIDE(COALESCE(demand.demand, 0.0), spend.spend) AS mer_demand,
        SAFE_DIVIDE(COALESCE(sales.gross_sales, 0.0), spend.spend) AS mer_gross,
        SAFE_DIVIDE(COALESCE(rev.admin_net_revenue, 0.0), spend.spend) AS mer_net,
        SAFE_DIVIDE(spend.spend, newc.new_customers) AS blended_cac,
@@ -940,6 +978,7 @@ SELECT k.period,
        SAFE_DIVIDE(COALESCE(spend.platform_conversion_value, 0.0), spend.spend) AS platform_roas
 FROM spine k
 LEFT JOIN sales USING (period)
+LEFT JOIN demand USING (period)
 LEFT JOIN rev USING (period)
 LEFT JOIN newc USING (period)
 LEFT JOIN spend USING (period)
@@ -1378,7 +1417,13 @@ LIMIT 5000
         fc_mtd["nc_demand"] = month_targets.series_sum(
             "forecast_nc_demand", w.month_start, w.mtd_end
         )
-        fc_mtd["nc_roas"] = month_targets.series_mean("forecast_nc_roas", w.month_start, w.mtd_end)
+        # Like fc mer/cac, a ratio of the summed series — the sheet's own daily NC
+        # RoAS column is the fallback when either sum is absent.
+        fc_mtd["nc_roas"] = _ratio(fc_mtd["nc_demand"], fc_mtd["spend"])
+        if fc_mtd["nc_roas"] is None:
+            fc_mtd["nc_roas"] = month_targets.series_mean(
+                "forecast_nc_roas", w.month_start, w.mtd_end
+            )
         fc_mtd["broas"] = month_targets.series_mean("forecast_broas", w.month_start, w.mtd_end)
         fc_month = {
             "demand": month_targets.month_total("forecast_demand"),

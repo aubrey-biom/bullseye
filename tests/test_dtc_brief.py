@@ -196,11 +196,12 @@ def test_footer_shows_both_dates_when_pacing_runs_past_the_window() -> None:
 
 def test_sum_rows_recomputes_ratios_from_sums() -> None:
     rows = [
-        {"spend": 100.0, "orders": 4, "new_customers": 2, "gross_sales": 300.0},
-        {"spend": 50.0, "orders": 1, "new_customers": 0, "gross_sales": 0.0},
+        {"spend": 100.0, "orders": 4, "new_customers": 2, "demand": 300.0, "gross_sales": 320.0},
+        {"spend": 50.0, "orders": 1, "new_customers": 0, "demand": 0.0, "gross_sales": 0.0},
     ]
     t = brief._sum_rows(rows)
-    assert (t["spend"], t["orders"], t["gross_sales"]) == (150.0, 5.0, 300.0)
+    assert (t["spend"], t["orders"], t["demand"]) == (150.0, 5.0, 300.0)
+    # MER and AOV are on demand (the sheet's definition), never on list-price gross.
     assert t["mer"] == pytest.approx(2.0) and t["cac"] == pytest.approx(75.0)
     assert brief._sum_rows([])["mer"] is None  # no spend: no ratio, never a zero
 
@@ -212,7 +213,7 @@ def test_pulse_with_one_closed_day_says_so() -> None:
         "wtd": (date(2026, 9, 7), date(2026, 9, 7)),
         "pacing": _pacing(),
         "cur": {
-            "rows": [{"spend": 3_000.0, "orders": 150, "new_customers": 60, "gross_sales": 8_000.0}]
+            "rows": [{"spend": 3_000.0, "orders": 150, "new_customers": 60, "demand": 8_000.0}]
         },
         "prev": {"rows": []},
     }
@@ -231,7 +232,7 @@ def test_weekly_refuses_to_render_without_its_week() -> None:
         "today": date(2026, 9, 7),
         "week": (date(2026, 8, 31), date(2026, 9, 6)),
         "pacing": _pacing(),
-        "weeks": {"rows": [{"period": "2026-08-24", "gross_sales": 1.0}]},
+        "weeks": {"rows": [{"period": "2026-08-24", "demand": 1.0}]},
     }
     with pytest.raises(RuntimeError, match="no efficiency row for the week of 2026-08-31"):
         brief.render_weekly(d)
@@ -241,14 +242,15 @@ def test_cli_emits_main_and_replies_as_json(monkeypatch: Any, capsys: Any) -> No
     canned = {"main": "hello", "replies": ["thread"]}
     seen: dict[str, Any] = {}
 
-    def fake_build(mode: str, as_of: date | None) -> dict[str, Any]:
-        seen.update(mode=mode, as_of=as_of)
+    def fake_build(mode: str, as_of: date | None, targets_path: str | None) -> dict[str, Any]:
+        seen.update(mode=mode, as_of=as_of, targets_path=targets_path)
         return canned
 
     monkeypatch.setattr(brief, "build", fake_build)
-    assert brief.main(["--mode", "recap", "--as-of", "2026-09-01", "--json"]) == 0
+    argv = ["--mode", "recap", "--as-of", "2026-09-01", "--targets", "/x/t.json", "--json"]
+    assert brief.main(argv) == 0
     assert json.loads(capsys.readouterr().out) == canned
-    assert seen == {"mode": "recap", "as_of": date(2026, 9, 1)}
+    assert seen == {"mode": "recap", "as_of": date(2026, 9, 1), "targets_path": "/x/t.json"}
     assert brief.main(["--mode", "pulse"]) == 0
     out = capsys.readouterr().out
     assert (
@@ -284,8 +286,10 @@ async def test_weekly_brief_end_to_end(fixture_warehouse: Any, monkeypatch: Any)
     assert d["week"] == (date(2026, 7, 27), date(2026, 8, 2))
     out = brief.render(d)
     main = out["main"]
-    # Week of Jul 27: p1 (30) on Jul 30 + o1 (45 demand; gross 40) on Aug 1 -> gross_sales 70.
-    assert main.startswith("🛒 **DTC — week of Mon Jul 27–Sun Aug 2**\nDemand $70, ")
+    # Week of Jul 27: p1 (30) on Jul 30 + o1 (40 + 5 shipping, counted once) on Aug 1 -> 75,
+    # the same order-level demand the pacing block reports for o1 (45), not its gross (40).
+    assert main.startswith("🛒 **DTC — week of Mon Jul 27–Sun Aug 2**\nDemand $75, ")
+    assert "MER 0.75x" in main  # 75 demand / 100 spend (Aug 1)
     assert "**August pacing** (through Wed Aug 5, 5 of 31 days)" in main
     assert "Demand $75 vs plan $50 (+50.0%) :large_green_circle:" in main
     assert "NC demand $75 vs $40 plan (+87.5%)" in main
@@ -303,7 +307,7 @@ async def test_pulse_brief_end_to_end(fixture_warehouse: Any, monkeypatch: Any) 
     main = brief.render(d)["main"]
     # Mon Aug 3..Wed Aug 5: o2 only (gross 25, spend 50 on Aug 3); Jul 27..29 had nothing.
     assert main.startswith(
-        "🛒 **DTC — week so far** (Mon Aug 3–Wed Aug 5)\n**3 days in:** demand $25 "
+        "🛒 **DTC — week so far** (Mon Aug 3–Wed Aug 5)\n**3 days in:** demand $30 "
     )
     assert "(n/a vs the same days last week)" in main
     assert "spend $50 (n/a)" in main
@@ -315,6 +319,7 @@ async def test_recap_brief_end_to_end(fixture_warehouse: Any, monkeypatch: Any) 
     monkeypatch.setattr(dtc, "today_reporting", lambda: date(2026, 9, 1))
     wh = fixture_warehouse(**_tables())
     d = await brief.gather("recap", warehouse=wh, targets=pacing_fx._targets())
+    assert set(d) == {"mode", "today", "pacing"}  # one tool call; the week table is pacing's
     out = brief.render(d)
     main = out["main"]
     # August closed at demand 75 against the sheet's 310 total: a miss, no "Beat." lead.
@@ -322,6 +327,9 @@ async def test_recap_brief_end_to_end(fixture_warehouse: Any, monkeypatch: Any) 
         "🛒 **DTC — August 2026 recap**\nDemand $75 vs the $310 forecast (-75.8%) :red_circle:"
     )
     assert "**Beat.**" not in main
+    # Spend and NCs are judged against the sheet's month Total, the same base as demand.
+    assert "Spend $150 vs $620 forecast (-75.8%)" in main
+    assert "New customers 2 vs 31 goal (-93.5%) :red_circle:" in main
     assert "Best day Sat Aug 1 at $45; softest" in main
     assert "data through Mon Aug 31" in main and "(pacing through" not in main
     assert "**August 2026 by week**" in out["replies"][0]
