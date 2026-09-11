@@ -46,14 +46,17 @@ from .bq import BigQueryWarehouse
 from .config import Settings, get_settings
 from .logging_setup import configure_logging, get_logger
 from .schemas import (
+    AdsPerformanceInput,
     BigQueryStatusInput,
     DataFreshnessInput,
     DescribeSchemaInput,
+    DtcSalesSummaryInput,
     ExportQueryToCsvInput,
     ForecastVsActualInput,
     HealthCheckInput,
     InventorySnapshotInput,
     ListDatasetsInput,
+    MarketingEfficiencyInput,
     OpenOrdersInput,
     ResponseFormat,
     RunSqlInput,
@@ -64,6 +67,7 @@ from .schemas import (
     UpcomingPosInput,
 )
 from .tools import admin as admin_tools
+from .tools import dtc as dtc_tools
 from .tools import query as query_tools
 
 logger = get_logger("bpd_mcp.server")
@@ -222,7 +226,7 @@ async def bpd_list_datasets(
     description=(
         "Execute arbitrary BigQuery Standard SQL against the BPD logical tables "
         "(sales_daily, sales_weekly, inventory_daily, orders_daily, "
-        "forecast_weekly, ... — see bpd_describe_schema). Reference them by bare "
+        "forecast_weekly, dtc_order_lines, ads_spend_daily, ... — see bpd_describe_schema). Reference them by bare "
         "name; the server injects each referenced table as a CTE. Read-only is "
         "enforced at the credential layer (the service account holds dataViewer "
         "+ jobUser and cannot create or write anything) AND at the input "
@@ -572,6 +576,140 @@ async def bpd_get_forecast_vs_actual(
             include_unmatched=include_unmatched,
             pre_week_min_lead_days=pre_week_min_lead_days,
             as_of_date=as_of_date,
+            response_format=response_format,
+        ),
+    )
+
+
+# --------------------------------------------------------------------------------------
+# DTC + paid-media analytics (Phase 2 of the DTC performance / pacing work)
+# --------------------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="bpd_get_dtc_sales_summary",
+    description=(
+        "Shopify DTC sales by day/week/month and channel_bucket: paid orders, "
+        "customers, new customers (first PAID core-D2C order), product units, "
+        "gross and net line sales, AOV, and the certified admin_net_revenue with "
+        "its allocated refunds. Default scope is core_d2c only; every bucket not "
+        "selected is totalled in extra.other_buckets, never dropped — that is "
+        "where $0 gifting orders valued at list price show up. Unknown "
+        "order_source values are counted and called out. Weeks are Monday-"
+        "anchored (not Target's fiscal week). Default window: 90 days to today "
+        "(Central); periods touching today or clipped by the window are flagged "
+        "partial_period."
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bpd_get_dtc_sales_summary(
+    ctx: Context,
+    grain: Literal["day", "week", "month"] = "week",
+    start_date: _date | None = None,
+    end_date: _date | None = None,
+    buckets: list[Literal["core_d2c", "gifting", "manual", "wholesale", "unknown"]] | None = None,
+    by_purchase_type: bool = False,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    kwargs: dict[str, object] = {}
+    if buckets is not None:
+        kwargs["buckets"] = buckets
+    return await dtc_tools.get_dtc_sales_summary(
+        app.warehouse,
+        DtcSalesSummaryInput(
+            grain=grain,
+            start_date=start_date,
+            end_date=end_date,
+            by_purchase_type=by_purchase_type,
+            response_format=response_format,
+            **kwargs,  # type: ignore[arg-type]
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_get_ads_performance",
+    description=(
+        "Paid-media performance by day/week/month and channel (meta, google), "
+        "from the cross-channel spend spine (Google = campaign fact only, no "
+        "sub-grain double count): spend, impressions, clicks, platform "
+        "conversions and conversion value, with CTR/CPC/CPM/CPA/platform ROAS "
+        "recomputed from sums. Each period carries its delivery integrity from "
+        "media_delivery_status — delivered days, confirmed-zero days, undiagnosed "
+        "gap days (flagged, never zero-filled) and unclassified days. "
+        "by_campaign=true returns the top_n campaigns by window spend with names "
+        "and status from ads_campaigns. Platforms restate recent days."
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bpd_get_ads_performance(
+    ctx: Context,
+    grain: Literal["day", "week", "month"] = "week",
+    start_date: _date | None = None,
+    end_date: _date | None = None,
+    channel: Literal["all", "meta", "google"] = "all",
+    by_campaign: bool = False,
+    top_n: int = 25,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await dtc_tools.get_ads_performance(
+        app.warehouse,
+        AdsPerformanceInput(
+            grain=grain,
+            start_date=start_date,
+            end_date=end_date,
+            channel=channel,
+            by_campaign=by_campaign,
+            top_n=top_n,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_get_marketing_efficiency",
+    description=(
+        "Blended marketing efficiency per day/week/month: all-channel ad spend "
+        "against core-D2C PAID sales — MER on gross and on admin_net_revenue, "
+        "blended CAC (spend / new customers), cost per order, new-customer "
+        "share — beside the platforms' own attributed ROAS so the attribution "
+        "gap is visible rather than implied. channels_reporting says which "
+        "channels had spend in each period (Meta history starts 2025-07-02; "
+        "earlier periods are google_only by construction)."
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bpd_get_marketing_efficiency(
+    ctx: Context,
+    grain: Literal["day", "week", "month"] = "week",
+    start_date: _date | None = None,
+    end_date: _date | None = None,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await dtc_tools.get_marketing_efficiency(
+        app.warehouse,
+        MarketingEfficiencyInput(
+            grain=grain,
+            start_date=start_date,
+            end_date=end_date,
             response_format=response_format,
         ),
     )

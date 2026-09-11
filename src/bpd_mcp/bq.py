@@ -1743,7 +1743,7 @@ class BigQueryWarehouse:
       | schema       | dry-run per logical table               | 0 bytes   | process lifetime |
       | row counts   | one `__TABLES__` query per base dataset | 0 bytes   | 300 s            |
       | ingest state | `bpd_meta.ingestion_state` rollup       | ~10 MB    | 300 s            |
-      | date ranges  | ONE combined UNION ALL over all tables  | ~527 MB   | 900 s            |
+      | date ranges  | ONE combined UNION ALL over all tables  | ~690 MB   | 900 s            |
 
     Only the last costs real money; 900 s bounds a heavy interactive session to
     roughly 4 refreshes an hour. `refresh_metadata()` clears all four.
@@ -2170,10 +2170,13 @@ GROUP BY pattern
     def _date_ranges(self) -> dict[str, dict[str, Any]]:
         """Snapshot + content date extents for every logical table, in ONE job.
 
-        This is the only metadata query that costs real money: ~527 MB for the
-        combined form, versus ~618 MB if issued as 15 separate jobs. Never issue
-        the per-table form. The 900 s TTL is worth far more than the 15% the
-        combining saves.
+        This is the only metadata query that costs real money: ~690 MB for the
+        combined form over the 26-table registry (measured 2026-09-11; ~527 MB
+        for the 15 BPD tables alone, versus ~618 MB as 15 separate jobs). The
+        view-backed `dtc_revenue_lines` is ~73 MB of the increase and the
+        composed `dtc_customer_first_order` ~17 MB; every ads_* table is under
+        2 MB. Never issue the per-table form. The 900 s TTL is worth far more
+        than the ~15% the combining saves.
 
         Every extent goes through `SAFE_CAST(col AS DATE)` because the extents
         are taken over STRING date columns too — `location_attr.last_remodel_date`

@@ -46,7 +46,8 @@ with those definitions, not a tidy-up.
 src/bpd_mcp/              the MCP server
   bq.py                   BigQuery data layer: logical-table registry + CTE injection
   column_roles.py         role -> column candidates; DATASET_KINDS / FEED_KINDS
-  tools/query.py          analytics tools; tools/admin.py: catalog, freshness, health
+  tools/query.py          Target analytics tools; tools/dtc.py: DTC + paid-media analytics;
+                          tools/admin.py: catalog, freshness, health
   server.py               FastMCP entry point and tool roster
 scripts/
   pos_brief.py            scheduled Target POS brief (weekly + Thursday pulse) -> Slack text
@@ -134,7 +135,7 @@ root. See `.env.example`.
 | `BPD_BQ_LOCATION`           | `us-central1`        | **Required.** An empty location makes `INFORMATION_SCHEMA` silently return zero rows instead of erroring. Validated non-empty. |
 | `BPD_BQ_MAX_BYTES_BILLED`   | 20 GiB               | Hard `maximum_bytes_billed` on every job.                                                 |
 | `BPD_BQ_WARN_BYTES`         | 1 GiB                | The pre-flight dry-run gate logs a warning above this.                                    |
-| `BPD_BQ_DATERANGE_TTL_S`    | `900`                | TTL for the combined date-range sweep (~527 MB per refresh — the one metadata query that costs money). |
+| `BPD_BQ_DATERANGE_TTL_S`    | `900`                | TTL for the combined date-range sweep (~690 MB per refresh over 26 tables — the one metadata query that costs money). |
 | `BPD_BQ_ROWCOUNT_TTL_S`     | `300`                | TTL for `__TABLES__` row counts (0 bytes).                                                |
 | `BPD_EXPORT_MAX_ROWS`       | `200000`             | Cap for `bpd_export_query_to_csv`. Lowered from 1,000,000: on per-byte billing an unguarded export is a money question, not a disk question. |
 | `BPD_VENDOR_ID`             | `139440`             | Biom's BPID. Identity only.                                                               |
@@ -259,7 +260,7 @@ the top of `src/bpd_mcp/bq.py`.
 
 ## Tool reference
 
-14 tools, all prefixed `bpd_`. Every tool accepts `response_format` of
+17 tools, all prefixed `bpd_`. Every tool accepts `response_format` of
 `markdown` (default) or `json`.
 
 ### Catalog & query
@@ -283,13 +284,45 @@ the top of `src/bpd_mcp/bq.py`.
 | `bpd_get_upcoming_pos`       | `po_plan_daily` + `po_plan_biweekly`, each filtered to its **latest `business_d` snapshot**. Windows on `order_d`, grouped by (tcin, week, **source**) so the two plans never blend. |
 | `bpd_get_forecast_vs_actual` | DFE `forecast_weekly` vs `sales_weekly` on a coverage-honest (tcin, location, week) spine — only **matched** cells produce variance; unmatched volume is counted in `extra.coverage`, never zero-filled. `variance_pct` is a true percent. `snapshot_policy`: `latest_available` (default) or `pre_week`. |
 
+### DTC & paid-media analytics
+
+Phase 2 of the DTC performance / pacing work (`src/bpd_mcp/tools/dtc.py`).
+All three compose the DTC and ads logical tables above and share one set of
+definitions, stated in each response's `extra.definitions`:
+
+* **Scope** is `channel_bucket`. Buckets not selected are totalled in
+  `extra.other_buckets`, never dropped — that is where the $0 ShopMy gifting
+  orders valued at list price show up. Orders from an unrecognised
+  `order_source` are counted in `extra.unknown_source_orders` and called out.
+* **Sales** are paid orders (`is_paid_order`); **units** count product lines
+  only; **net revenue** is `admin_net_revenue` from the certified view; a
+  **new customer** is a first paid core-D2C order (`dtc_customer_first_order`).
+* **Every ratio is computed from sums** with `SAFE_DIVIDE` (AOV, CTR, CPC, CPM,
+  CPA, ROAS, MER, CAC). Nothing averages a per-row ratio.
+* **Spend** is the cross-channel spine `ads_spend_daily` — Google from the
+  campaign fact only. A zero-spend day is only a real zero when
+  `media_delivery_status` says so; `ABSENT_UNDIAGNOSED` days are flagged, never
+  zero-filled, and days the view has not classified are counted.
+* **Periods** are Monday-anchored weeks (`DATE_TRUNC(x, WEEK(MONDAY))`) or
+  calendar months — deliberately *not* Target's Sunday–Saturday fiscal week, so
+  never join these rows to `sales_weekly` on `period`. The default window is
+  90 days ending today (Central). A period that includes today, or that the
+  window clips, is flagged `partial_period`; ads land yesterday's data before
+  13:00 UTC, so today's column is always short.
+
+| Tool                            | Purpose |
+| ------------------------------- | ------- |
+| `bpd_get_dtc_sales_summary`     | Shopify DTC by `day`/`week`/`month` × bucket (default `core_d2c`): paid orders, customers, new customers, product units, gross and net line sales, AOV, and `admin_net_revenue` with its allocated refunds. Unpaid orders and their list value are reported beside the paid figures. `by_purchase_type` splits One Time / Subscription (new customers are then NULL rather than repeated). |
+| `bpd_get_ads_performance`       | Spend, impressions, clicks, platform conversions and value by period × channel with CTR/CPC/CPM/CPA/platform ROAS, plus each period's delivery integrity: delivered, confirmed-zero, undiagnosed-gap and unclassified days, summarised as `delivery_flag`. `by_campaign` returns the top-N campaigns by window spend with names and status from `ads_campaigns`. |
+| `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — MER on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
+
 ### Admin
 
 | Tool                    | Purpose |
 | ----------------------- | ------- |
 | `bpd_bigquery_status`   | Which identity we query as (`SESSION_USER()`), where the credential came from (a path or env-var name — never key bytes), project, location, reachable datasets, and an explicit `write_capability: none`. **Replaces `bpd_auth_status`.** |
 | `bpd_data_freshness`    | Per-dataset snapshot and content date ranges, plus the upstream pipeline's own per-pattern ledger: file counts, newest file date, last download, lag in days. **Replaces `bpd_cache_status`.** |
-| `bpd_health_check`      | 12-check audit (see below). First call when diagnosing anything. |
+| `bpd_health_check`      | 12-check audit (see below). First call when diagnosing anything. Its tool smoke test covers all 14 warehouse-only tools, the three DTC/ads tools included. |
 
 **Removed in this version**, with no replacement: `bpd_list_top_folders`,
 `bpd_list_folder_contents`, `bpd_get_file_metadata`, `bpd_search_files`,
@@ -357,7 +390,7 @@ concern:
   avoidable scan per call.
 * **Metadata is free or cached.** Schemas come from cached dry runs (0 bytes);
   row counts from `__TABLES__` (0 bytes, 300 s TTL); the date-range sweep is one
-  combined `UNION ALL` job (~527 MB, 900 s TTL). `INFORMATION_SCHEMA` bills a
+  combined `UNION ALL` job (~690 MB over 26 tables, 900 s TTL; ~527 MB before the DTC/ads tables, of which the view-backed `dtc_revenue_lines` is ~73 MB). `INFORMATION_SCHEMA` bills a
   10 MB minimum per query and is avoided.
 * **Date predicates matter.** Partition pruning survives CTE injection
   (`sales_daily` 13.3 MB → 3.5 MB with a `WHERE`), so never drop a date filter
@@ -462,12 +495,19 @@ Three tiers, and the split is deliberate:
   real BigQuery**, which bills 0 bytes and runs in about 0.7 s per query. This
   is where the bulk of the analytics coverage lives — the SQL is compiled and
   computed by the engine that will run it in production, over rows whose right
-  answer is known. A few drift guards also run here, comparing the projection
+  answer is known. `tests/test_tools_dtc.py` holds the DTC and ads tools'
+  numbers the same way, over fixtures projected under the Phase 1 registry
+  bodies' column names. A few drift guards also run here, comparing the projection
   parsed out of each registry body against the schema BigQuery itself reports.
 * **Tier 3 — `-m bq_live`, real data.** Deliberately small: the full
   `bpd_health_check` runner against production, the registry/roles checks
   against live schemas, and the KMG tie-out below driven end to end as a
   subprocess.
+
+Both live tiers were run against the 26-table registry (the DTC and ads
+entries included) on **2026-09-11**: tier 2 **82 passed**, tier 3 **4 passed**,
+and `bpd_health_check` reported 11 pass / 1 warn, the warn being the upstream
+feed-freshness condition on two retired Target patterns, not a registry fault.
 
 Both BigQuery tiers **skip themselves** when neither `GCP_SA_KEY_B64` nor
 `GOOGLE_APPLICATION_CREDENTIALS` is set, so a contributor without warehouse

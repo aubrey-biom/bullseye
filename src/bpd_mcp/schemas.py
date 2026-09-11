@@ -306,6 +306,82 @@ class ForecastVsActualInput(_BaseModel):
 
 
 # --------------------------------------------------------------------------------------
+# DTC + paid-media analytics (Phase 2 of the DTC performance / pacing work)
+# --------------------------------------------------------------------------------------
+
+# The reporting buckets `channel_bucket` can take: the keys of
+# bq.DTC_SOURCE_BUCKETS plus the catch-all. Spelled out so MCP clients get a
+# real enum; a hermetic test pins it to the constant.
+DtcChannelBucket = Literal["core_d2c", "gifting", "manual", "wholesale", "unknown"]
+
+# Monday-anchored weeks and calendar months. NOT Target's Sunday-Saturday
+# fiscal week — DTC and ads have no fiscal calendar to honour.
+ReportGrain = Literal["day", "week", "month"]
+
+_WINDOW_START_DOC = (
+    "First day (inclusive). Default: 90 days ending at end_date. Shopify dates "
+    "are Central Time; ad dates are the platforms' account-local day."
+)
+_WINDOW_END_DOC = (
+    "Last day (inclusive). Default: today (Central). A period that includes "
+    "today, or that the window clips, is flagged partial_period."
+)
+
+
+def _default_buckets() -> list[DtcChannelBucket]:
+    return ["core_d2c"]
+
+
+class DtcSalesSummaryInput(_BaseModel):
+    grain: ReportGrain = "week"
+    start_date: _date | None = Field(default=None, description=_WINDOW_START_DOC)
+    end_date: _date | None = Field(default=None, description=_WINDOW_END_DOC)
+    buckets: list[DtcChannelBucket] = Field(
+        default_factory=_default_buckets,
+        min_length=1,
+        description=(
+            "channel_bucket values to return as rows. Default core_d2c only. "
+            "Buckets NOT selected are never dropped silently: their window "
+            "totals come back in extra.other_buckets (this is where $0 gifting "
+            "orders valued at list price show up)."
+        ),
+    )
+    by_purchase_type: bool = Field(
+        default=False,
+        description=(
+            "Split each bucket by purchase_type (One Time / Subscription). "
+            "new_customers is not split (a first order has no purchase-type "
+            "split in dtc_customer_first_order) and comes back NULL in this mode."
+        ),
+    )
+    response_format: ResponseFormat = "markdown"
+
+
+class AdsPerformanceInput(_BaseModel):
+    grain: ReportGrain = "week"
+    start_date: _date | None = Field(default=None, description=_WINDOW_START_DOC)
+    end_date: _date | None = Field(default=None, description=_WINDOW_END_DOC)
+    channel: Literal["all", "meta", "google"] = "all"
+    by_campaign: bool = Field(
+        default=False,
+        description=(
+            "Rows per (period, channel, campaign) for the top_n campaigns by "
+            "window spend, with campaign_name / campaign_status from "
+            "ads_campaigns. Delivery integrity then moves to extra.delivery."
+        ),
+    )
+    top_n: int = Field(default=25, ge=1, le=200, description="Only with by_campaign.")
+    response_format: ResponseFormat = "markdown"
+
+
+class MarketingEfficiencyInput(_BaseModel):
+    grain: ReportGrain = "week"
+    start_date: _date | None = Field(default=None, description=_WINDOW_START_DOC)
+    end_date: _date | None = Field(default=None, description=_WINDOW_END_DOC)
+    response_format: ResponseFormat = "markdown"
+
+
+# --------------------------------------------------------------------------------------
 # Admin tools
 # --------------------------------------------------------------------------------------
 

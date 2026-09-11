@@ -689,7 +689,7 @@ async def test_full_health_check_against_production(tmp_path: Path) -> None:
     """The whole runner over real production data — the only test that answers
     "is the deployed server healthy right now?".
 
-    BILLS BYTES: the date-range sweep (~527 MB, shared with bpd_list_datasets)
+    BILLS BYTES: the date-range sweep (~690 MB, shared with bpd_list_datasets)
     plus one COUNTIF pass for the known-unpopulated guard. The tool smoke test
     stays in dry-run mode (0 bytes), which is what it is for.
     """

@@ -9,7 +9,7 @@ replacement infers it from how stale the newest file feeding the table is.
 
 Everything here is pure python and free. `list_datasets()` reads exactly three
 things — `_base_row_counts()` (0 bytes), `_ingest_rollup()` (~10 MB) and
-`_date_ranges()` (~527 MB) — each behind a `_TTLCache`. Seeding those three
+`_date_ranges()` (~690 MB) — each behind a `_TTLCache`. Seeding those three
 caches exercises the real method bodies and the real derivation while the client
 is never touched: the warehouses below are built with `client=_NoClient()`,
 which raises on any attribute access, so a query would be an error rather than a
