@@ -324,10 +324,19 @@ An analysis keyed **only** on the `dim_product` join silently drops all of these
 Present as `fct_orders` lines but not sellable products (≈$0 or trivial gross): titles `Carbon Neutral Offset`, `Checkout+`, `20% CashBack` (and any `%CashBack%`), and gift-with-purchase `%GWP%` (e.g. `Hydrangea Dispenser GWP`). Filter these out of product/revenue-mix work.
 
 ### 9.4 — `order_source` taxonomy (D2C vs wholesale/marketplace)
-- **Core D2C:** `web`, `subscription_contract`, `subscription_contract_checkout_one`
-- **App-sourced, incl. ShopMy gifting:** numeric app-IDs (`242196283393`, `2329312`, `3890849`, `1424624`, …)
-- **Wholesale / marketplace / POS — exclude from D2C analyses:** `faire`/`Faire`, `Design Milk Shop`, `pos`, `BetterWorld`, `Flora`, `Sustai Market`, `Canal`, `Choose`, `shopify-collective-automatic-payments`, `shopify_draft_order`
-- Default a "D2C customer" definition to the three core-D2C sources unless the question says otherwise. (`current_total_price > 1.00` additionally strips $0 gifting / $1 PR samples but does not catch non-zero marketplace orders — combine with the source filter.)
+
+**Updated 2026-09-10** after resolving every numeric source against Shopify admin (`Order.app.name`). The bpd-mcp registry encodes this map once as `bq.DTC_SOURCE_BUCKETS` and projects it as `channel_bucket` on `dtc_order_lines` / `dtc_revenue_lines` — prefer that column over re-deriving the CASE.
+
+| bucket | `order_source` | identity | treatment |
+|---|---|---|---|
+| **core D2C** | `web`, `subscription_contract_checkout_one`, `subscription_contract` (legacy, ~0 volume), **`3890849`** | Online Store, Loop Subscriptions, **Shopify's Shop app** | include. The Shop app is a sales channel for the same storefront with real paid orders (~239 orders / $13K per 90d) — it is NOT "app-sourced gifting" as earlier versions of this section implied |
+| **gifting** | **`242196283393`** | **ShopMy Integration** (influencer seeding) | exclude from D2C sales, report separately. Every order totals $0 (100% discount), yet `gross_using_line_price` values the free product at **list price** — ~$213K across ~4,764 orders in the 90 days to 2026-09-10. Any "gross" that does not exclude this bucket is inflated by roughly a fifth. `admin_net_revenue` self-corrects (allocated discount nets it to ~0); gross does not |
+| **manual** | `shopify_draft_order`, `Direct` | Draft Orders (comps, replacements, hand-keyed wholesale); Matrixify bulk imports tagged "BabyCenter Reward Claim" | exclude. Both sample at $0 totals with list-value gross |
+| **wholesale / marketplace / POS** | `faire`/`Faire`, `Design Milk Shop`, `pos`, `BetterWorld`, `Flora`, `Sustai Market`, `Canal`, `Choose`, `shopify-collective-automatic-payments` | | exclude from D2C analyses |
+| **unknown** | `NULL`, `341262598145`, `2329312`, `1424624`, anything new | `NULL` is a **load gap** (2026-06-18..29 only, ~318 orders) — raise upstream, do not classify | surface as its own row; never drop silently and never fold into D2C |
+
+- `current_total_price > 1.00` additionally strips $0 gifting / $1 PR samples but does not catch non-zero marketplace orders — combine with the source filter. On `dtc_order_lines` this is `is_paid_order`.
+- A "new customer" for CAC purposes is a customer's first **paid core-D2C** order (`dtc_customer_first_order`); a gifting recipient or a draft order never mints one.
 
 ---
 

@@ -8,6 +8,36 @@ Status legend:
 
 ---
 
+## ✅ Order sources, last 90 days — what is D2C and what only looks like it
+**Validated:** 2026-09-10 · **Answers:** "which `order_source` values carry real D2C revenue, and which inflate gross?" (§9.4)
+
+```sql
+SELECT order_source, COUNT(DISTINCT order_id) AS orders,
+       ROUND(SUM(gross_using_line_price), 2) AS list_value_gross,
+       ROUND(SUM(net_line_sales), 2) AS net_line,
+       COUNT(DISTINCT IF(current_total_price > 1, order_id, NULL)) AS paid_orders,
+       MIN(DATE(order_created_datetime_ct)) AS first_day,
+       MAX(DATE(order_created_datetime_ct)) AS last_day
+FROM `biom-reporting-s26.biom_canvas.fct_orders`
+WHERE is_current
+  AND DATE(order_created_datetime_ct) >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL 90 DAY)
+GROUP BY order_source ORDER BY orders DESC
+```
+
+**Result (2026-09-10):** `web` 7,728 orders / $534.6K · `subscription_contract_checkout_one` 6,483 / $174.8K · `242196283393` 4,764 / **$213.2K list value at $0 totals** · `shopify_draft_order` 783 / $25.8K · `NULL` 318 / $14.6K (2026-06-18..29 only) · `3890849` 239 / $13.1K · `Direct` 124 / $0.
+
+**Gotchas:**
+- The numeric sources were resolved in Shopify admin, not guessed: `242196283393` = ShopMy Integration (gifting), `3890849` = Shop app (real D2C), `Direct` = Matrixify imports. Section 9.4 now carries the full map; the bpd-mcp registry encodes it as `channel_bucket`.
+- `gross_using_line_price` is list value: it is only a sales figure on paid orders. Filter to `current_total_price > 1` (or `is_paid_order`) before calling a sum "gross sales".
+- The two-week `NULL` window is a pipeline gap, not a business event. It sits inside the 90-day window of any pacing report run before mid-September 2026.
+
+## ✅ Ad-fact coverage and freshness
+**Validated:** 2026-09-10 · **Answers:** "how far back does paid-media data go, how fresh is it, is conversion value populated?" · Query: `scripts/phase0/01_ad_facts_coverage.sql` in bpd-mcp.
+
+**Result:** Google campaign fact 2021-11-18 → yesterday, Meta 2025-07-02 → yesterday, both loaded before 13:00 UTC daily. Conversion value populated on both. Keyword + shopping spend ≈ 40% of campaign spend — **sub-grains, never add them to the campaign fact.** `vw_media_delivery_status` classified every calendar day on both channels; zero `ABSENT_UNDIAGNOSED`.
+
+---
+
 ## 🟡 Cross-sell across categories + dispenser-as-catalyst (VMG)
 
 **Question:** As Biom adds categories, are customers buying into more than one? And do customers who buy dispensers buy into more distinct categories (the "dispenser as cross-sell catalyst" thesis)?

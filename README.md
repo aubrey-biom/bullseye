@@ -31,6 +31,43 @@ enumerates each single-process assumption that was removed and why.
 
 ---
 
+## Repository map
+
+One repo, two deliverables that share a data source but no code: the **MCP
+server** (interactive analysis from Claude) and the **scheduled Target POS
+brief** (a script a Routine runs on a timer). Paths below are load-bearing —
+the Routine definitions at claude.ai/code/routines invoke `scripts/*.py` and
+`scripts/setup_reporting.sh` by name, so moving them is a coordinated change
+with those definitions, not a tidy-up.
+
+```
+.claude/settings.json     Claude Code project settings: lets cloud sessions use the
+                          read-only BigQuery credential (permissions + auto-mode note)
+src/bpd_mcp/              the MCP server
+  bq.py                   BigQuery data layer: logical-table registry + CTE injection
+  column_roles.py         role -> column candidates; DATASET_KINDS / FEED_KINDS
+  tools/query.py          analytics tools; tools/admin.py: catalog, freshness, health
+  server.py               FastMCP entry point and tool roster
+scripts/
+  pos_brief.py            scheduled Target POS brief (weekly + Thursday pulse) -> Slack text
+  setup_reporting.sh      builds the venv the brief needs on a fresh container
+  validate_kmg.py         KMG POS-report tie-out: the migration's acceptance gate
+  bq_query.py             read-only ad-hoc query runner through the server's data layer
+  phase0/*.sql            the DTC/ads verification queries (annotated with results)
+  verify_install.sh       hermetic install check
+config/pspw_goals.json    KMG-published $PSPW goals and POG door counts (not in BigQuery)
+skills/biom-canvas-sql/   vendored copy of the warehouse SQL skill: rules, schema map,
+                          validated queries. Kept in sync with the claude.ai skill.
+tests/                    three tiers (hermetic / fixture-on-BigQuery / live); see "Tests"
+evals/bpd_eval.xml        end-to-end MCP questions (answers not yet pinned)
+```
+
+`main` is the canonical branch. Everything above lives on it; the historical
+`claude/*` branches are merged patch series and are safe to delete once `main`
+is the GitHub default.
+
+---
+
 ## Quickstart
 
 ```bash
