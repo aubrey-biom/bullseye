@@ -1,7 +1,7 @@
 {
   "_comment": "KMG-published reference data that is NOT derivable from BigQuery: $PSPW goals, POG-authorized door counts, and the short display names used in leadership reporting. BigQuery's item_description is unusable for reporting (three different dispensers all read 'Biom Refillable Plant-Based Wi...'), and inventory-derived door counts overstate POG authorization (1,726 vs KMG's 1,598), which understates $PSPW. Update all three whenever KMG republishes; the brief prints `as_of` so readers know the vintage.",
-  "source": "KMG JulW4'26 POS report",
-  "as_of": "2026-08-03",
+  "source": "KMG SepW2'26 POS report",
+  "as_of": "2026-09-14",
 
   "assortment": {
     "003-02-5627": { "name": "Disinf Refill 180ct Var",   "goal_pspw": 51.96, "pog_doors": 1598 },
@@ -23,10 +23,14 @@
     "007-07-3543": { "name": "Baby Refill 60ct",          "goal_pspw": 15.96, "pog_doors": 1493 },
     "253-04-0088": { "name": "HS Wipes 40ct Santal",      "goal_pspw": 11.97, "pog_doors": 833  },
     "003-02-6532": { "name": "AP Refill 60ct Neroli",     "goal_pspw": 7.49,  "pog_doors": 1599 },
-    "253-04-0086": { "name": "Body Go-Pack XL 30ct",      "goal_pspw": 11.96, "pog_doors": 367  }
+    "253-04-0086": { "name": "Body Go-Pack XL 30ct",      "goal_pspw": 11.96, "pog_doors": 367  },
+    "007-08-5892": { "name": "Mini Disp w/LM 40ct Peri",  "goal_pspw": 7.91  },
+    "007-08-0321": { "name": "LM Refill 40ct Frag Free",  "goal_pspw": 5.96  }
   },
-  "_assortment_note": "These 20 DPCIs ARE the goaled assortment (18 with a published goal + the two Baby Kits KMG lists without one). $PSPW/UPSPW totals sum across these only.",
+  "_assortment_note": "These 22 DPCIs ARE the goaled assortment (20 with a published goal + the two Baby Kits KMG lists without one). $PSPW/UPSPW totals sum across these only.",
   "_limited_time_note": "`limited_time: true` marks a limited-time item that is MEANT to sell out — the HS 20ct go-pack and the two LGR+PUR baby kits (Seafoam Grn, Lilac). Going out of stock is the plan for these, not a miss, so the brief reports their sell-through instead of raising an in-stock breach. It does not change $PSPW/goal math. Note KMG already publishes no $PSPW goal for either baby kit, which is the same fact seen from the goals side.",
+  "_pog_doors_note": "Three states, and the brief reads all three differently. A NUMBER is KMG's POG-authorized door count. An explicit `null` means KMG authorizes no planogram doors (online-only or de-listed), so per-door velocity is undefined and renders as '—'. A MISSING `pog_doors` key means KMG has published a $PSPW goal but not yet a door count — a newly-listed item still ramping into doors — and the brief falls back to that week's inventory-derived door count, which is all there is for a new item. Do not write `null` for a new item: that would silently suppress its $PSPW instead of estimating it. Replace the fallback with KMG's number as soon as the POS file carries one; inventory doors run ~5% high (1,045 vs the 989 SepW2'26 implies for 007-08-0321), so the estimate understates $PSPW slightly.",
+  "_new_in_sepw2_note": "007-08-5892 (Mini Dispenser w/Little Mess Wipes 40ct - Periwinkle) and 007-08-0321 (Mini Little Mess Wipes Refill 40ct - Fragrance Free) first carry $PSPW goals in the SepW2'26 file; 'LM' in their display names is Little Mess. Both sold from w/e 2026-08-22 and were the unrecognised DPCIs the SepW2 brief flagged. Two cautions carried from that file. (1) KMG prints two different goals for 007-08-5892 — $7.19 on the OOS table and $7.91 on the WIP table, a transposition on one of them. The higher figure is pinned here so attainment is not overstated to leadership; confirm with KMG (Bets Hansen) and correct if $7.19 is the real goal. (2) KMG's Sales$ for 007-08-0321 reads $3,117/898u for w/e 2026-09-12 against $5,859/1,691u in both `biom_canvas.fct_target_sales` and `bpd_raw.weekly_sales_tcin_loc`, at the same ~$3.47/unit — KMG is short roughly half the units on that row. Every other DPCI in the file ties to BigQuery within restatement noise, so this is a report-side gap on a brand-new row, not a data gap.",
 
   "excluded": {
     "253-04-9259": { "name": "HS Go-Pack 20ct Santal", "pog_doors": 198, "limited_time": true, "reason": "KMG publishes no $PSPW goal for the 20ct travel go-pack" },
