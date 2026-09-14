@@ -323,7 +323,7 @@ definitions, stated in each response's `extra.definitions`:
 | `bpd_get_dtc_sales_summary`     | Shopify DTC by `day`/`week`/`month` × bucket (default `core_d2c`): paid orders, customers, new customers, product units, gross and net line sales, AOV, and `admin_net_revenue` with its allocated refunds. Unpaid orders and their list value are reported beside the paid figures. `by_purchase_type` splits One Time / Subscription (new customers are then NULL rather than repeated). |
 | `bpd_get_ads_performance`       | Spend, impressions, clicks, platform conversions and value by period × channel with CTR/CPC/CPM/CPA/platform ROAS, plus each period's delivery integrity: delivered, confirmed-zero, undiagnosed-gap and unclassified days, summarised as `delivery_flag`. `by_campaign` returns the top-N campaigns by window spend with names and status from `ads_campaigns`. |
 | `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — **demand** (order-level subtotal + shipping, the pacing sheet's definition) with MER on demand, on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
-| `bpd_get_dtc_pacing`            | Month-to-date pacing through the last complete day. **Demand** is the ecomm sheet's definition — order-level subtotal + shipping (Shopify total less tax) over paid core-D2C orders, one row per order — plus spend and new customers, each against the team's daily **forecast** from `config/dtc_pacing_targets.json`: MTD variance, month forecast, to-go, required daily average, run-rate projection. Period over period: the same number of days immediately before the month, the same days last month, and the weekday-aligned (364-day) span last year. Monday-anchored weekly rows and daily rows; `sheet_vs_warehouse_pct` shows the reconciliation to the sheet's own actuals where the config carries them. Targets missing → actuals still return, `extra.targets` says how to refresh. |
+| `bpd_get_dtc_pacing`            | Month-to-date pacing through the last complete day. **Demand** is the ecomm sheet's definition — order-level subtotal + shipping (Shopify total less tax) over paid core-D2C orders, one row per order — plus spend and new customers, each against the team's daily **forecast** from `config/dtc_pacing_targets.json`: MTD variance, month forecast, to-go, required daily average, run-rate projection. Period over period: the same number of days immediately before the month, the same days last month, and the weekday-aligned (364-day) span last year. Monday-anchored weekly rows and daily rows, each with its plan and weekday-aligned LY. Every actual is the warehouse's; the sheet contributes targets only. Targets missing → actuals still return, `extra.targets` says how to refresh. |
 
 #### Pacing targets: the ecomm team's sheet as config
 
@@ -345,41 +345,44 @@ The script matches columns on header text (`bpd_mcp.pacing_targets.FIELD_MAP`),
 so a renamed column surfaces as a missing series rather than the wrong one;
 skips tabs that are not `<Month> <Year>` (the `April 2026 V2` revision, the
 source tabs); and records which export it read and when. Every pacing response
-carries that provenance in `extra.targets`, so a stale file is visible. The
-sheet's own **actuals** are kept only as `sheet_actual_*` for reconciliation —
-the warehouse is the source of every actual the tool reports. Reconciled for
-2026-09-01..09, the warehouse demand lands within 0–1.3% of the sheet's
-`Actual DMD` on seven of nine days and within 7% on the other two; spend agrees
-to ~0.2% and new customers to a few per day.
+carries that provenance in `extra.targets`, so a stale file is visible.
+
+**Only the forecast columns are read.** The sheet also carries the team's own
+hand-pulled actuals (Actual DMD, Actual Spend, Total NCs, LY Total DMD); those
+are deliberately not in `FIELD_MAP`. Every actual the tools and briefs report
+is BigQuery's, and the sheet is the source of targets and nothing else. The
+definitions do line up: reconciled day by day for Aug 1–Sep 8 2026, the
+warehouse's demand (net sales + shipping on paid core-D2C orders) matched the
+sheet's `Actual DMD` to the dollar on several days and within 2% on half of
+them, with the sheet running ~1.7% high on average; Shopify "gross sales" (list
+price, no shipping) ran 7.6% low and net sales 13% low, so neither is what the
+team paces.
 
 #### The scheduled DTC brief
 
 `scripts/dtc_brief.py` turns the DTC tools into the ecomm team's Slack update.
 It runs no SQL of its own: every number is a `bpd_get_dtc_pacing` or
 `bpd_get_marketing_efficiency` payload, so the brief and an interactive
-question to the server can never disagree. Three modes, each a `main` message
-plus zero or more threaded `replies`:
+question to the server can never disagree. Every actual is BigQuery's; the
+pacing sheet supplies the plan and nothing else. Three modes, each a `main`
+message plus threaded `replies`:
 
 | Mode | When | What it says |
 | ---- | ---- | ------------ |
-| `weekly` | Monday morning ET | The Monday–Sunday week just closed: demand, spend, MER, new customers and CAC week-over-week, demand also against the trailing four-week average; then the month's pacing block; then a **Watch** list. Reply: the 8-week trend table. |
-| `pulse` | Thursday morning ET | The week so far (Monday through yesterday) against the same weekdays a week earlier, then the same pacing block and Watch list. Shorter, no reply. |
-| `recap` | The 1st of the month | The month that just closed: demand against the sheet's forecast and last year, spend, MER, acquisition against goal, best and softest day, and the reconciliation to the sheet's own actuals. Reply: the week-by-week build. |
+| `weekly` | Monday morning ET | The Monday–Sunday week just closed as a scorecard against the plan for those seven days (the daily forecasts summed), with WoW and the trailing four-week average; then the month to date, scored the same way. Replies: the week day by day; the 8-week trend. |
+| `pulse` | Thursday morning ET | The week so far (Monday through yesterday) against its plan and the same weekdays a week earlier, then the month to date. Reply: the days so far. |
+| `recap` | The 1st of the month | The month that just closed against the sheet's month Total, last month and last year, with the certified net revenue after refunds for the P&L tie-out, best and softest day. Replies: by week; by day. |
 
-"Demand" means one thing everywhere in a message: the sheet's Actual DMD
-(order subtotal + shipping on paid core-D2C orders), taken as `demand` from the
-efficiency tool for the week figures and from the pacing tool for the month,
-and MER is demand over spend on both. The **pacing block** reads the ecomm
-team's own sheet columns back to them —
-demand, spend, NCs and NC demand month-to-date against plan, run-rate against
-the month's forecast, to-go and the required daily average — with the
-`:large_green_circle:` / `:large_yellow_circle:` / `:red_circle:` idiom their
-updates already use (green at or above plan, yellow within 10%). **Watch**
-flags only what is material: a series ≥10% behind plan, spend ≥10% off plan
-either way, a sheet-vs-warehouse gap ≥5% on a settled day, a month with no
-targets loaded. "Settled" excludes the two days before the export was taken:
-the team keys the sheet's actuals by hand the next morning, so the export's
-last row is routinely partial, and comparing it produced a false flag every run.
+"Demand" means one thing everywhere in a message: the plan's basis, net sales
+after discounts plus shipping (Shopify total less tax) on paid core-D2C orders,
+taken as `demand` from the efficiency tool for weeks and days and from the
+pacing tool for the month; MER is demand over spend on both. Every line with a
+plan is a **scorecard line** — light first, then the stat: 🟢 at or above plan,
+🟡 within 10% below, 🔴 beyond; CAC reads the other way; spend is ⚪ because
+under-plan spend is a decision rather than a miss. Demand, MER, new customers,
+CAC and spend are scored for the week and again for the month, plus NC demand
+and NC ROAS for the month. **Notes** carry only what the lights cannot show: a
+month with no plan loaded, the Meta-history caveat on LY comparisons.
 
 ```bash
 uv run python scripts/dtc_brief.py --mode weekly            # prints main + [threaded reply]
@@ -387,9 +390,9 @@ uv run python scripts/dtc_brief.py --mode recap --json      # {"main": ..., "rep
 uv run python scripts/dtc_brief.py --mode pulse --as-of 2026-09-03   # backtest a past Thursday
 ```
 
-`--as-of` runs as if today were that date (Central); the pacing block still
-paces through the day before it. Off schedule, the footer shows both dates
-("data through Sun Sep 6 (pacing through Thu Sep 10)").
+`--as-of` runs as if today were that date (Central); the month block still
+runs through the day before it. Off schedule, the footer shows both dates
+("data through Sun Sep 6 (month through Thu Sep 10)").
 
 **Routines.** Four fresh-session Routines at claude.ai/code/routines, all with
 the Slack connector, all posting to **#ecommerce** after the ads data has
@@ -400,13 +403,12 @@ POST / IF-WRONG prompt pattern:
 | ------- | ---------- | ---- |
 | DTC weekly brief | `30 13 * * 1` | `dtc_brief.py --mode weekly --json`; posts `main`, then each reply in the thread |
 | DTC Thursday pulse | `30 13 * * 4` | `--mode pulse --json` |
-| DTC month-end recap | `0 14 1 * *` | Exports the pacing sheet to `.xlsx` via the Google Drive connector, regenerates a targets file from it into the session's scratch space, then runs `--mode recap --targets <that file> --json`. The export is what makes the reconciliation possible: the checked-in config was refreshed at the *start* of the closed month, before any of its actuals existed. |
-| DTC pacing targets refresh | `30 14 1 * *` | Same export, then `refresh_pacing_targets.py --check`; when the new month's tab has landed it commits the regenerated JSON on a branch and opens a PR. If the tab is not there yet (the team adds it late some months) it re-arms itself daily until it is. |
+| DTC month-end recap | `0 14 1 * *` | `--mode recap --json` for the month that just closed; the checked-in config already carries that month's forecast. |
+| DTC pacing targets refresh | `30 14 1 * *` | Exports the pacing sheet to `.xlsx` via the Google Drive connector and runs `refresh_pacing_targets.py --check`; when the new month's tab has landed it commits the regenerated JSON on a branch and opens a PR. If the tab is not there yet (the team adds it late some months) it re-arms itself daily until it is. |
 
 The refresh Routine is the only writer of `config/dtc_pacing_targets.json`
-between months. It and the recap are the two Routines with a second credential
-(Google Drive); the server itself still holds nothing but the read-only
-BigQuery account, and `--targets` only ever points the brief at a file.
+between months, and the only Routine with a second credential (Google Drive);
+the server itself still holds nothing but the read-only BigQuery account.
 
 Not yet in the brief: subscriber health (active subscribers, churn, skip rate).
 `fct_subscriptions` is not a registered logical table, so those figures still
@@ -597,7 +599,7 @@ Three tiers, and the split is deliberate:
   tool and pins the checked-in targets file's integrity in the hermetic tier;
   `tests/test_dtc_brief.py` runs all three brief modes end to end through
   `gather()` over the same fixture rows, and pins the brief's interpretation
-  layer (windows, Watch flags, the settled-sheet rule) hermetically. A few drift guards also run here, comparing the projection
+  layer (windows, the plan for a span, scorecard lights) hermetically. A few drift guards also run here, comparing the projection
   parsed out of each registry body against the schema BigQuery itself reports.
 * **Tier 3 — `-m bq_live`, real data.** Deliberately small: the full
   `bpd_health_check` runner against production, the registry/roles checks
@@ -736,8 +738,14 @@ The questions themselves are usable today as a manual exercise of the tools.
    carries active subscribers, churn and skip rate; `fct_subscriptions` is not
    a registered logical table, so the brief cannot. Registering it (with the
    usual role, contract and drift-guard entries) is the prerequisite.
-9. **Demand definitions differ at the edges.** The warehouse's demand (order
-   subtotal + shipping on paid core-D2C orders) reconciles to the sheet's
-   `Actual DMD` within ~1% on most days but diverges by 5–40% on a few (Aug 10
-   2026: sheet $6.1K vs warehouse $9.7K). The recap reports the gap; deciding
-   which side is right is a conversation with the team, not a code change.
+9. **The plan basis includes shipping.** The team's forecast (and so the
+   brief's "demand") is net sales + shipping; shipping is ~12% of it, so MER,
+   AOV and CAC-adjacent ratios all carry it. Most DTC finance teams pace on net
+   sales and treat shipping as cost recovery; the certified `admin_net_revenue`
+   the recap shows is effectively that, after refunds. Moving the plan to net
+   sales is the team's call when they build a month's tab, not a code change.
+10. **The sheet's hand-pulled actuals run ~1.7% above the warehouse**, and $1–2.5K
+   above on a handful of days (Aug 4, 7, 18, 26, Sep 2 2026) where the certified
+   revenue view shows the same excess over the order-line table. Cause not
+   pinned. Nothing reads those columns any more, so it is a curiosity, not a
+   discrepancy in anything reported.

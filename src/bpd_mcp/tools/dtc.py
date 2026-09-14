@@ -1034,11 +1034,11 @@ LIMIT {ROW_CAP}
 #
 # "Demand" here is deliberately the SHEET's definition, not gross_sales: the
 # order-level subtotal after discounts plus shipping, i.e. Shopify's total less
-# tax, over paid core-D2C orders reduced to one row per order. Reconciled
-# against the sheet's Actual DMD for 2026-09-01..09 it lands within 0-1.3% on
-# seven of nine days and within 7% on the other two (the sheet's pull runs on a
-# different clock). The remaining gap is reported per day as
-# `sheet_vs_warehouse_pct` wherever the config carries the sheet's own actual.
+# tax (net sales + shipping), over paid core-D2C orders reduced to one row per
+# order. Reconciled against the sheet's own Actual DMD for Aug 1..Sep 8 2026 it
+# matched to the dollar on several days and within 2% on half of them, with the
+# sheet running ~1.7% high on average; no other warehouse definition came close.
+# Every actual reported here is the warehouse's; the sheet contributes targets only.
 
 #: 52 weeks, so "last year" compares Tuesday with Tuesday, not the 1st with the 1st.
 LY_SHIFT_DAYS = 364
@@ -1243,7 +1243,6 @@ _PACING_DEFINITIONS = {
     "run_rate_projection": "MTD actual / elapsed days * days in month",
     "required_daily_average": "(month forecast - MTD actual) / days left",
     "weeks": "Monday-anchored, numbered within the month; the first and last are usually partial",
-    "sheet_actual_demand": "the sheet's own Actual DMD as of the config refresh — reconciliation only, never the source of a number here",
 }
 
 
@@ -1457,7 +1456,6 @@ LIMIT 5000
         ly_row = daily.get(d - timedelta(days=LY_SHIFT_DAYS), {})
         t = month_targets.days.get(d) if month_targets is not None else None
         fc_demand = t.get("forecast_demand") if t else None
-        sheet_actual = t.get("sheet_actual_demand") if t else None
         demand = round(_f(row.get("demand")), 2)
         ly_demand = round(_f(ly_row.get("demand")), 2)
         daily_rows.append(
@@ -1479,8 +1477,6 @@ LIMIT 5000
                 "ly_day": d - timedelta(days=LY_SHIFT_DAYS),
                 "ly_demand": ly_demand,
                 "act_vs_ly_pct": _pct_change(demand, ly_demand or None),
-                "sheet_actual_demand": sheet_actual,
-                "sheet_vs_warehouse_pct": _pct_change(sheet_actual, demand or None),
             }
         )
         d += timedelta(days=1)
