@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,16 +78,59 @@ def test_short_week_is_excluded_from_a_trailing_average() -> None:
 @pytest.mark.parametrize(
     ("week_end", "label"),
     [
-        (date(2026, 8, 1), "Jul W4 '26"),  # starts Sun Jul 26 — 4th Sunday of July
-        (date(2026, 8, 8), "Aug W1 '26"),  # starts Sun Aug 2 — 1st Sunday of August
-        (date(2026, 7, 4), "Jun W4 '26"),  # starts Sun Jun 28 — 4th Sunday of June
-        (date(2026, 1, 3), "Dec W4 '25"),  # start month carries the year across
+        # The four weeks of the SepW2'26 report's own summary table, each tied
+        # to its BigQuery dollar total — the pins that fix this convention.
+        (date(2026, 9, 12), "Sep W2 '26"),
+        (date(2026, 9, 5), "Sep W1 '26"),  # fiscal September opens Sun Aug 30
+        (date(2026, 8, 29), "Aug W4 '26"),
+        (date(2026, 8, 22), "Aug W3 '26"),
+        (date(2026, 8, 1), "Jul W4 '26"),  # the JulW4'26 report, same week
+        (date(2026, 8, 8), "Aug W1 '26"),
+        (date(2026, 7, 4), "Jun W5 '26"),  # fiscal June is a 5-week month
+        (date(2026, 10, 3), "Sep W5 '26"),  # so is fiscal September
+        (date(2026, 1, 3), "Dec W5 '25"),  # fiscal December runs into January
+        (date(2027, 1, 30), "Jan W4 '27"),  # last week of FY2026
+        (date(2029, 2, 3), "Jan W5 '29"),  # the 53rd week of FY2028
     ],
 )
-def test_fiscal_label_names_the_week_by_its_start(week_end: date, label: str) -> None:
-    """KMG labels a week by the month it STARTS in; labelling by week-end would
-    call w/e Aug 1 "Aug W1" and disagree with every published report."""
+def test_fiscal_label_follows_targets_454_calendar(week_end: date, label: str) -> None:
+    """KMG numbers weeks inside Target's 4-5-4 fiscal month.
+
+    Counting Sundays in the CALENDAR month agrees for most of the year and then
+    slips a week at every 5-week month: it called w/e Sep 5 2026 "Aug W5" and
+    every later September week one number low, so the Monday brief and the
+    report it is read beside disagreed on which week it was.
+    """
     assert pos_brief._fiscal_label(week_end) == label
+
+
+def test_fiscal_months_hold_the_454_week_counts() -> None:
+    """FY2026 must come out as 52 weeks split 4-5-4 per quarter — the shape the
+    SepW2'26 promo recap shows, with a Jun W5, a Sep W5 and a Dec W5 and every
+    other month stopping at W4."""
+    counts: Counter[str] = Counter()
+    week_end = pos_brief._fy_start(2026) + timedelta(days=6)
+    while week_end <= date(2027, 1, 30):
+        counts[pos_brief._fiscal_label(week_end).split()[0]] += 1
+        week_end += timedelta(days=7)
+    assert sum(counts.values()) == 52
+    assert [counts[m] for m in ("Feb", "Mar", "Apr")] == [4, 5, 4]
+    assert [counts[m] for m in ("May", "Jun", "Jul")] == [4, 5, 4]
+    assert [counts[m] for m in ("Aug", "Sep", "Oct")] == [4, 5, 4]
+    assert [counts[m] for m in ("Nov", "Dec", "Jan")] == [4, 5, 4]
+
+
+@pytest.mark.parametrize(
+    ("fy", "start"),
+    [
+        (2025, date(2025, 2, 2)),  # Feb 1 is a Saturday — the year starts after it
+        (2026, date(2026, 2, 1)),  # Feb 1 is itself the Sunday
+        (2027, date(2027, 1, 31)),  # nearest Sunday falls back into January
+        (2028, date(2028, 1, 30)),
+    ],
+)
+def test_fiscal_year_starts_on_the_sunday_nearest_feb_1(fy: int, start: date) -> None:
+    assert pos_brief._fy_start(fy) == start
 
 
 @pytest.mark.parametrize(
@@ -138,6 +182,8 @@ CFG = {
             "pog_doors": 1387,
             "limited_time": True,
         },
+        # Newly listed: KMG publishes the goal before the door count.
+        "007-08-5892": {"name": "Mini Disp w/LM 40ct Peri", "goal_pspw": 7.91},
     },
     "excluded": {
         "003-02-7872": {"name": "Dispenser - Black", "pog_doors": None, "reason": "online-only"},
@@ -186,6 +232,25 @@ def test_goaled_sku_without_a_published_goal_has_velocity_but_no_attainment() ->
     assert s.goal is None and s.pct_goal is None
 
 
+def test_new_item_with_a_goal_but_no_door_count_is_still_scored() -> None:
+    """KMG published $PSPW goals for the two Little Mess minis in SepW2'26
+    without door counts. A missing key is NOT a null: nulling it would leave a
+    goaled item with no $PSPW at all, so the inventory door count stands in and
+    is marked as an estimate."""
+    s = pos_brief._annotate([_sku("007-08-5892", amt=19_745.0, doors=1053)], CFG)[0]
+    assert s.doors_pog == 1053 and s.doors_estimated
+    assert s.pspw == pytest.approx(18.75, abs=0.01)
+    assert s.pct_goal == pytest.approx(237.0, abs=0.5)
+    assert s.in_assortment and s.known
+
+
+def test_a_kmg_door_count_is_never_marked_as_an_estimate() -> None:
+    s = pos_brief._annotate([_sku("003-02-5627", amt=43_550.0, doors=1726)], CFG)[0]
+    assert not s.doors_estimated
+    # Nor is a SKU KMG authorizes no doors for: there is no denominator to flag.
+    assert not pos_brief._annotate([_sku("003-02-7872", doors=29)], CFG)[0].doors_estimated
+
+
 # ---------- the shipped config ----------
 
 
@@ -195,10 +260,21 @@ def test_shipped_goals_file_is_well_formed() -> None:
     assert not set(cfg["assortment"]) & set(cfg["excluded"]), "a DPCI cannot be both"
     for dpci, meta in cfg["assortment"].items():
         assert meta["name"], dpci
-        assert isinstance(meta["pog_doors"], int) and meta["pog_doors"] > 0, dpci
         assert meta["goal_pspw"] is None or meta["goal_pspw"] > 0, dpci
+        if "pog_doors" in meta:
+            assert isinstance(meta["pog_doors"], int) and meta["pog_doors"] > 0, dpci
+        else:
+            # Omitting the key buys the inventory-door fallback, which only
+            # earns its keep for an item that has a goal to be scored against.
+            assert meta["goal_pspw"], f"{dpci}: no doors and no goal"
     for dpci, meta in cfg["excluded"].items():
         assert meta["name"] and meta["reason"], dpci
+        # An excluded entry must state its doors even when the answer is "none".
+        # Omitting the key buys the inventory fallback, which for an online-only
+        # or de-listed SKU invents a $PSPW out of the few doors holding stock —
+        # the exact thing excluding it was meant to prevent.
+        assert "pog_doors" in meta, f"{dpci}: pog_doors must be explicit, null included"
+        assert meta["pog_doors"] is None or meta["pog_doors"] > 0, dpci
 
 
 # ---------- end-to-end render ----------
@@ -369,6 +445,57 @@ def test_render_reports_the_short_week_it_dropped() -> None:
     assert "w/e 2026-05-09 (4/7 days)" in out["main"]
     assert "quantity-weighted" in out["main"]
     assert len(out["replies"]) == 2
+
+
+def _with_extra_sku(sku) -> dict:
+    d = _render_input(391_030.0, record_high=391_030.0)
+    d["skus"] = [*d["skus"], sku]
+    return d
+
+
+def test_an_unrecognised_dpci_gets_its_estimated_doors_explained_too() -> None:
+    """The "~" is a promise the footer explains it. A DPCI with no KMG entry at
+    all is on inventory doors for a different reason than a goaled item awaiting
+    a door count, and both reasons have to reach the reader."""
+    new = pos_brief._annotate([_sku("999-99-9999", amt=5_000.0, units=400.0, doors=50)], CFG)[0]
+    new.prev_amt, new.eoh_ow, new.wip, new.oos = 4_000.0, 900.0, 99.0, 1.0
+    new.prev_oos, new.prev_eoh_ow = 1.0, 950.0
+    out = pos_brief.render_weekly(_with_extra_sku(new))
+    assert "~50" in out["replies"][0]
+    assert "does not carry" in out["main"] and "(~50 doors)" in out["main"]
+
+
+def test_render_says_which_doors_are_estimated() -> None:
+    """A % to goal built on an inventory door count is not one KMG could
+    reproduce, and a newly-listed item is where a reader is least likely to
+    notice. The footer names it and the SKU table marks the denominator."""
+    new = pos_brief._annotate([_sku("007-08-5892", amt=19_745.0, units=1_345.0, doors=1053)], CFG)[
+        0
+    ]
+    new.prev_amt, new.eoh_ow, new.wip, new.oos = 18_754.0, 3_314.0, 86.5, 13.51
+    new.prev_oos, new.prev_eoh_ow = 9.0, 3_900.0
+    out = pos_brief.render_weekly(_with_extra_sku(new))
+    assert "publishes a $PSPW goal but not yet a door count" in out["main"]
+    assert "Mini Disp w/LM 40ct Peri (~1,053 doors)" in out["main"]
+    assert "~1,053" in out["replies"][0]
+    # The Top 5 is what most readers stop at, so the marker has to survive there.
+    top5 = out["main"].split("**Top 5 SKUs")[1]
+    assert "~237%" in top5
+
+
+def test_a_goaled_sku_with_no_doors_stays_out_of_the_goal_tables() -> None:
+    """A goal alone is not attainment. A newly-listed item can carry a goal and
+    still have no doors at all — no KMG count and no inventory row yet — and the
+    Top 5 table prints a $PSPW unconditionally, so it must not reach it."""
+    new = pos_brief._annotate([_sku("007-08-5892", amt=99_999.0, units=6_000.0, doors=None)], CFG)[
+        0
+    ]
+    new.prev_amt, new.eoh_ow, new.wip, new.oos = 80_000.0, None, None, None
+    out = pos_brief.render_weekly(_with_extra_sku(new))
+    assert new.pspw is None
+    top5 = out["main"].split("**Top 5 SKUs")[1]
+    assert "Mini Disp w/LM 40ct Peri" not in top5
+    assert "Mini Disp w/LM 40ct Peri" in out["replies"][0]  # still in the full detail
 
 
 # ---------- pulse mode ----------

@@ -624,6 +624,89 @@ would pass exactly when production is broken.
 
 ---
 
+## The scheduled Target POS brief
+
+`scripts/pos_brief.py` turns `biom_canvas` into the #target Slack post
+leadership reads beside KMG's own weekly POS report. Two modes — `weekly`
+(Monday, the week that just closed, plus two threaded SKU tables) and `pulse`
+(Thursday, the week so far). Every number is BigQuery's; KMG supplies the
+goals, the POG door counts and the short display names, and nothing else.
+
+```bash
+uv run python scripts/pos_brief.py --mode weekly                      # main + [threaded replies]
+uv run python scripts/pos_brief.py --mode weekly --week-ending 2026-09-12 --json
+uv run python scripts/pos_brief.py --mode pulse --through 2026-09-10  # backtest a past Thursday
+```
+
+### KMG reference data: `config/pspw_goals.json`
+
+$PSPW goals are not derivable from the warehouse, so the file is the only
+place they live, and the brief prints its `source`/`as_of` in the footer so a
+reader can see the vintage. **Refresh it whenever KMG republishes**: goals,
+door counts, the assortment membership, and the two note fields that explain
+anything unusual in that week's file.
+
+`pog_doors` has three states and the brief reads all three differently:
+
+| state | meaning | what the brief does |
+| ----- | ------- | ------------------- |
+| a number | KMG's POG-authorized door count | divides by it |
+| `null` | KMG authorizes no planogram doors (online-only, de-listed) | prints `—`; no $PSPW |
+| **key absent** | KMG has published a goal but not yet a door count | falls back to that week's inventory door count, marks it `~`, and names it in the footer |
+
+The third state was added for the SepW2'26 file, which publishes $PSPW goals
+for **007-08-5892** (Mini Dispenser w/Little Mess Wipes 40ct - Periwinkle,
+$7.91) and **007-08-0321** (Mini Little Mess Wipes Refill 40ct, $5.96) without
+door counts — the two DPCIs the brief had been flagging as unrecognised since
+they started selling in w/e 2026-08-22. Writing `null` for a new item would
+have suppressed its $PSPW entirely; the inventory count runs a few percent
+above POG authorization (1,045 against the 989 implied for 007-08-0321 by
+KMG's own Sales$ ÷ $PSPW — both figures theirs, so internally consistent
+whatever the Sales$ gap below), so the estimate reads $PSPW and % to goal
+slightly low, which is the honest direction to be wrong in. Replace it with
+KMG's number as soon as their file carries one.
+
+Two cautions from that file are recorded in the config next to the entries
+they concern: KMG prints **two different goals for 007-08-5892** ($7.19 on the
+OOS table, $7.91 on the WIP table — the higher is pinned so attainment is not
+overstated), and KMG's Sales$ for **007-08-0321** is short roughly half the
+units two Target feeds report for the same week at the same unit price.
+
+### Week labels follow Target's 4-5-4 calendar
+
+`_fiscal_label` names a week the way KMG and leadership do — "Sep W2 '26" —
+by its position inside Target's **4-5-4 fiscal month**, not inside the
+calendar month. The two agree for most of the year and slip apart at every
+5-week month: fiscal September 2026 opens on Sun Aug 30, so w/e Sep 5 is
+Sep W1 and w/e Sep 12 is Sep W2, while counting Sundays in the calendar month
+called them Aug W5 and Sep W1 and ran a week behind KMG for the rest of the
+month. The SepW2'26 report pins it from both directions: its four-week summary
+labels w/e 09-12 / 09-05 / 08-29 / 08-22 as Sep W2 / Sep W1 / Aug W4 / Aug W3,
+each tying to its BigQuery dollar total, and its promo recap carries a Jun W5,
+a Sep W5 and a Dec W5 with every other month stopping at W4.
+
+### Routines
+
+Two fresh-session Routines at claude.ai/code/routines, both with the Slack
+connector, both posting to **#target** (C05G713GRL5), both following the
+SETUP / VERIFY / POST / IF-WRONG prompt pattern the DTC Routines copied:
+
+| Routine | Cron (UTC) | Runs |
+| ------- | ---------- | ---- |
+| Target POS — weekly brief | `0 12 * * 1` | `pos_brief.py --mode weekly --json`; posts `main`, then each reply in the thread |
+| Target POS — Thursday pulse | `0 12 * * 4` | `--mode pulse --json`; no threaded replies |
+
+Both check out **`main`**. They used to check out
+`claude/build-mcp-kiteworks-N8Zgz`, which was merged into `main` long ago and
+then stopped moving: because the branch still exists the `git checkout ... ||
+git checkout main` fallback never fired, and the Monday brief silently ran 27
+commits behind — without the limited-time sell-through line or the
+implausible-OOS gate that `main` had carried for weeks. A Routine that pins a
+branch inherits that branch's bugs forever; pin `main` and let the PR gate do
+its job.
+
+---
+
 ## Source-of-truth tie-out (KMG POS report)
 
 `scripts/validate_kmg.py` validates the BigQuery data layer against the vendor's
@@ -749,3 +832,16 @@ The questions themselves are usable today as a manual exercise of the tools.
    revenue view shows the same excess over the order-line table. Cause not
    pinned. Nothing reads those columns any more, so it is a curiosity, not a
    discrepancy in anything reported.
+11. **The Baby POG door counts in `config/pspw_goals.json` do not reproduce
+   KMG's own $PSPW.** Divide each SepW2'26 Sales$ by its published $PSPW and
+   the implied denominator matches the checked-in door count for every
+   003-02 item and for both 253-04 minis (1,599 vs 1,598, 830 vs 833), but
+   not for the four 007-07 Baby items or the Body Go-Pack XL: 604 vs 1,469
+   (Baby Refill 720ct), 955 vs 1,493 (60ct), 1,031 vs 1,496 (240ct), 1,065 vs
+   1,499 (Welcome Kit), 227 vs 367 (Go-Pack XL). The dollars themselves tie —
+   the brief and the report agree on Sales$ for all five — so this is purely
+   the denominator, and it puts the brief's % to goal at roughly half KMG's on
+   Baby (720ct reads 22% here against 54.4% in the report). Ask KMG (Bets
+   Hansen) for the door column out of `Biom_Target POS <week>.xlsx` rather
+   than back-solving it from a $PSPW that may itself be wrong; whichever way
+   it lands, the two documents in front of leadership should not disagree.

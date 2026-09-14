@@ -157,21 +157,31 @@ def _annotate(skus: list[Any], cfg: dict[str, Any]) -> list[Any]:
 
     POG doors come from KMG when known: inventory-derived counts include stores
     holding stock without POG authorization, which inflates the denominator and
-    understates $PSPW (1,726 vs 1,598 on Disinf 180ct = $25.23 vs $27.32).
+    understates $PSPW (1,726 vs 1,598 on Disinf 180ct = $25.23 vs $27.32). When
+    KMG has published a goal but no door count yet, `doors_estimated` marks the
+    fallback so the brief can say which $PSPW figures rest on one.
     """
     ref = {**cfg["assortment"], **cfg["excluded"]}
     for s in skus:
         meta = ref.get(s.dpci, {})
         s.name = meta.get("name") or (s.descr or s.dpci or "—")[:30]
         s.goal = meta.get("goal_pspw")
-        # An explicit null pog_doors means KMG authorizes no planogram doors —
-        # online-only or de-listed. Per-door velocity is undefined there, so it
-        # renders as "—" rather than dividing by the handful of stores that
-        # happen to hold stock. Only DPCIs absent from the file fall back to the
-        # inventory door count, since that is all we have for a new item.
-        s.doors_pog = meta.get("pog_doors") if s.dpci in ref else getattr(s, "doors", None)
+        # Three door states, and the key's PRESENCE is what separates the last
+        # two. A number is KMG's POG count. An explicit null means KMG
+        # authorizes no planogram doors — online-only or de-listed — so per-door
+        # velocity is undefined and renders as "—" rather than dividing by the
+        # handful of stores that happen to hold stock. A MISSING key means KMG
+        # has published a goal but not yet a door count (a newly-listed item
+        # ramping into doors, as 007-08-5892 and 007-08-0321 are in SepW2'26),
+        # which falls back to the inventory door count exactly as a DPCI absent
+        # from the file does — that is all there is for a new item, and scoring
+        # it against its goal on an estimated denominator beats not scoring it.
+        s.doors_pog = meta["pog_doors"] if "pog_doors" in meta else getattr(s, "doors", None)
         s.in_assortment = s.dpci in cfg["assortment"]
         s.known = s.dpci in ref
+        # True while the denominator is the inventory fallback above, not a KMG
+        # number: those doors run a few percent high, so $PSPW reads low.
+        s.doors_estimated = bool(s.doors_pog) and "pog_doors" not in meta
         # Limited-time items are meant to sell out; see _lto_split.
         s.limited_time = bool(meta.get("limited_time"))
         s.pspw = (s.amt / s.doors_pog) if s.doors_pog else None
@@ -189,20 +199,60 @@ def _pct(now: float | None, before: float | None, digits: int = 1) -> str:
     return f"{pct:+.{digits}f}%"
 
 
+# Target's retail calendar is 4-5-4: fiscal February holds 4 weeks, March 5,
+# April 4, and so on around the year. A fiscal month therefore does NOT begin
+# on the 1st, and its week count is fixed by the pattern rather than by how many
+# Sundays the calendar month happens to contain.
+FISCAL_MONTH_WEEKS = (4, 5, 4, 4, 5, 4, 4, 5, 4, 4, 5, 4)  # Feb..Jan
+FISCAL_MONTH_NAMES = (
+    "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+    "Aug", "Sep", "Oct", "Nov", "Dec", "Jan",
+)  # fmt: skip
+
+
+def _fy_start(year: int) -> date:
+    """First day (a Sunday) of Target's fiscal year `year`.
+
+    The retail year ends on the Saturday nearest Jan 31, so it begins on the
+    Sunday nearest Feb 1: FY2026 = Sun Feb 1 2026 .. Sat Jan 30 2027, FY2025
+    = Sun Feb 2 2025. Years where the nearest Sunday falls back into January
+    (FY2027 starts Jan 31 2027) come out of the same rule, as does the 53-week
+    year that follows (FY2028 runs Jan 30 2028 .. Feb 3 2029).
+    """
+    feb1 = date(year, 2, 1)
+    back = (feb1.weekday() + 1) % 7  # days from the preceding Sunday
+    sunday = feb1 - timedelta(days=back)
+    return sunday if back <= 3 else sunday + timedelta(days=7)
+
+
 def _fiscal_label(week_end: date) -> str:
     """Week label matching KMG/leadership convention, e.g. "Jul W4 '26".
 
-    The week is named for the month it STARTS in (Sunday), numbered by that
-    Sunday's ordinal position among Sundays in that month. w/e Sat Aug 1 2026
-    starts Sun Jul 26 — the 4th Sunday of July — hence "Jul W4 '26", which is
-    how the published posts label it (labeling by week-END would say Aug W1).
+    KMG numbers weeks inside Target's 4-5-4 fiscal month, not inside the
+    calendar month. The two agree for most of the year and diverge at every
+    5-week month: w/e Sat Sep 5 2026 is the 1st week of fiscal September
+    (which opens Sun Aug 30), while counting Sundays in the calendar month
+    would call it Aug W5 — and then run a week behind KMG for the rest of
+    September. The SepW2'26 report pins this: its four-week summary labels
+    w/e 09-12 / 09-05 / 08-29 / 08-22 as Sep W2 / Sep W1 / Aug W4 / Aug W3,
+    each tied to its BigQuery dollar total, and its promo recap carries a
+    Jun W5, a Sep W5 and a Dec W5 with every other month stopping at W4 —
+    exactly the 4-5-4 shape.
     """
-    start = week_end - timedelta(days=6)
-    first = start.replace(day=1)
-    # Sunday index within the start month.
-    first_sunday = first + timedelta(days=(6 - first.weekday()) % 7)
-    week_no = (start - first_sunday).days // 7 + 1
-    return f"{start.strftime('%b')} W{week_no} '{start.strftime('%y')}"
+    fy = week_end.year if week_end >= _fy_start(week_end.year) else week_end.year - 1
+    start = _fy_start(fy)
+    week_no = (week_end - start).days // 7 + 1  # 1-based week of the fiscal year
+    weeks = list(FISCAL_MONTH_WEEKS)
+    if (_fy_start(fy + 1) - start).days // 7 == 53:
+        weeks[-1] += 1  # the 53rd week lands in fiscal January
+    for i, n in enumerate(weeks):
+        if week_no <= n:
+            # Fiscal Feb..Dec sit in the FY's own calendar year; fiscal January
+            # is the following one (fiscal Dec 2025 runs into Jan 3 2026).
+            yr = fy + 1 if i == 11 else fy
+            return f"{FISCAL_MONTH_NAMES[i]} W{week_no} '{yr % 100:02d}"
+        week_no -= n
+    raise ValueError(f"week ending {week_end} falls outside fiscal year {fy}")
 
 
 def _latest_week_end(sales_through: date) -> date:
@@ -525,7 +575,10 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     metric_table = "```\n" + _table(rows, "l" + "r" * len(recent)) + "\n```"
 
     # goal attainment (skus are pre-annotated with name/goal/pog doors/pspw)
-    goaled = [s for s in skus if s.in_assortment and s.goal]
+    # A goal is only half of goal attainment: a SKU KMG authorizes no doors for
+    # has no $PSPW to score, and it must not reach the Top 5 table, which prints
+    # one unconditionally.
+    goaled = [s for s in skus if s.in_assortment and s.goal and s.pspw]
     above = [s for s in goaled if s.pct_goal and s.pct_goal >= 100]
     below = sorted([s for s in goaled if s.pct_goal], key=lambda s: s.pct_goal)[:4]
 
@@ -579,7 +632,13 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         )
     if above:
         working.append(
-            "• Above $PSPW goal: " + ", ".join(f"{s.name} {s.pct_goal:.0f}%" for s in above) + "."
+            # "~" wherever the denominator is the inventory fallback rather than
+            # a KMG door count — the footer says which SKUs and why.
+            "• Above $PSPW goal: "
+            + ", ".join(
+                f"{s.name} {'~' if s.doors_estimated else ''}{s.pct_goal:.0f}%" for s in above
+            )
+            + "."
         )
     if gainers:
         working.append(
@@ -632,8 +691,8 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     for s in below:
         s_wos = s.eoh_ow / s.units if s.eoh_ow and s.units else None
         watch.append(
-            f"• **{s.name}** — {s.pct_goal:.0f}% to goal (${s.pspw:.2f} vs "
-            f"${s.goal:.2f})" + (f", {s_wos:.1f} wks supply." if s_wos else ".")
+            f"• **{s.name}** — {'~' if s.doors_estimated else ''}{s.pct_goal:.0f}% to goal "
+            f"(${s.pspw:.2f} vs ${s.goal:.2f})" + (f", {s_wos:.1f} wks supply." if s_wos else ".")
         )
     if decliners:
         watch.append(
@@ -666,7 +725,9 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
                 f"${s.amt:,.0f}",
                 f"${s.pspw:,.2f}",
                 f"${s.goal:,.2f}",
-                f"{s.pct_goal:.0f}%",
+                # The Top 5 is the table leadership actually reads, so it needs
+                # the estimated-doors marker as much as the detail reply does.
+                f"{'~' if s.doors_estimated else ''}{s.pct_goal:.0f}%",
                 _pct(s.amt, s.prev_amt),
             ]
         )
@@ -686,6 +747,26 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         f"inventory through {d['inv_through']}. Target restates recent weeks, so "
         f"figures can move.",
     ]
+
+    # Never let a per-door figure computed on an estimated denominator pass as
+    # one KMG could reproduce. Every "~" printed above has to be accounted for
+    # here, and a SKU earns one for either of two reasons.
+    def _names(skus: list[Any]) -> str:
+        return ", ".join(f"{s.name} (~{s.doors_pog:,} doors)" for s in skus)
+
+    pending = [s for s in listed if s.doors_estimated and s.known]
+    unnamed = [s for s in listed if s.doors_estimated and not s.known]
+    why = []
+    if pending:
+        why.append("KMG publishes a $PSPW goal but not yet a door count for " + _names(pending))
+    if unnamed:
+        why.append("KMG's file does not carry " + _names(unnamed) + " at all")
+    if why:
+        notes.append(
+            "; ".join(why) + ", so those doors are this week's inventory-derived count "
+            "(marked ~). Inventory doors run a few percent above POG authorization, "
+            "which reads $PSPW and % to goal slightly low."
+        )
     if d["dropped"]:
         notes.append(
             "Excluded from all averages as short weeks: "
@@ -720,7 +801,7 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             [
                 s.dpci or "—",
                 s.name,
-                f"{s.doors_pog:,}" if s.doors_pog else "—",
+                ("~" if s.doors_estimated else "") + f"{s.doors_pog:,}" if s.doors_pog else "—",
                 f"${s.amt:,.0f}",
                 f"${s.pspw:,.2f}" if s.pspw else "—",
                 f"${s.goal:,.2f}" if s.goal else "—",
