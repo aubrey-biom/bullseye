@@ -660,10 +660,11 @@ $7.91) and **007-08-0321** (Mini Little Mess Wipes Refill 40ct, $5.96) without
 door counts — the two DPCIs the brief had been flagging as unrecognised since
 they started selling in w/e 2026-08-22. Writing `null` for a new item would
 have suppressed its $PSPW entirely; the inventory count runs a few percent
-above POG authorization (1,045 against the 989 KMG's own $PSPW implies for
-007-08-0321), so the estimate reads $PSPW and % to goal slightly low, which is
-the honest direction to be wrong in. Replace it with KMG's number as soon as
-their file carries one.
+above POG authorization (1,045 against the 989 implied for 007-08-0321 by
+KMG's own Sales$ ÷ $PSPW — both figures theirs, so internally consistent
+whatever the Sales$ gap below), so the estimate reads $PSPW and % to goal
+slightly low, which is the honest direction to be wrong in. Replace it with
+KMG's number as soon as their file carries one.
 
 Two cautions from that file are recorded in the config next to the entries
 they concern: KMG prints **two different goals for 007-08-5892** ($7.19 on the
