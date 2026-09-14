@@ -803,7 +803,15 @@ _EFFICIENCY_DEFINITIONS = {
     ),
     "admin_net_revenue": "core_d2c rows of dtc_revenue_lines (certified view), order-date basis",
     "new_customers": "rows of dtc_customer_first_order in the period (first PAID core-D2C order)",
-    "mer_demand": "SAFE_DIVIDE(demand, spend) — the sheet's blended ROAS (BRoAS) basis",
+    "nc_orders / nc_demand": (
+        "orders placed on the customer's first_order_date (dtc_customer_first_order) and their "
+        "demand — what the spend actually bought"
+    ),
+    "mer_demand": "SAFE_DIVIDE(demand, spend) — blended MER, the sheet's BRoAS basis",
+    "nc_roas / nc_aov": (
+        "SAFE_DIVIDE(nc_demand, spend) — the sheet's 'NC RoAS', a.k.a. acquisition MER (aMER); "
+        "SAFE_DIVIDE(nc_demand, nc_orders)"
+    ),
     "mer_gross": "SAFE_DIVIDE(gross_sales, spend) — marketing efficiency ratio on gross",
     "mer_net": "SAFE_DIVIDE(admin_net_revenue, spend)",
     "blended_cac": "SAFE_DIVIDE(spend, new_customers) — all spend over new customers",
@@ -825,9 +833,11 @@ _EFFICIENCY_MARKDOWN_COLUMNS = [
     "orders",
     "new_customers",
     "demand",
+    "nc_demand",
     "gross_sales",
     "admin_net_revenue",
     "mer_demand",
+    "nc_roas",
     "mer_gross",
     "blended_cac",
     "platform_roas",
@@ -908,6 +918,7 @@ WITH sales AS (
 orders AS (
     SELECT {_q(o["order_id"])} AS order_id,
            ANY_VALUE({o_date}) AS d,
+           ANY_VALUE({_q(o["customer_id"])}) AS customer_id,
            ANY_VALUE({_q(o["order_subtotal"])}) AS order_subtotal,
            ANY_VALUE({_q(o["order_shipping"])}) AS order_shipping
     FROM dtc_order_lines
@@ -915,10 +926,22 @@ orders AS (
       AND {_q(o["bucket"])} = '{CORE_BUCKET}' AND {_q(o["paid"])}
     GROUP BY order_id
 ),
+-- New-customer demand: the demand of orders placed on the customer's first
+-- order date (dtc_customer_first_order is one row per customer), so NC ROAS is
+-- new-customer demand / spend — the sheet's "NC RoAS", the acquisition MER.
+firsts AS (
+    SELECT {_q(n["customer_id"])} AS customer_id, {n_date} AS first_d
+    FROM dtc_customer_first_order
+    WHERE {_date_pred(n_date, start, end)}
+),
 demand AS (
-    SELECT {period_expr(g, "d")} AS period,
-           SUM(COALESCE(order_subtotal, 0.0) + COALESCE(order_shipping, 0.0)) AS demand
-    FROM orders
+    SELECT {period_expr(g, "o.d")} AS period,
+           SUM(COALESCE(o.order_subtotal, 0.0) + COALESCE(o.order_shipping, 0.0)) AS demand,
+           COUNTIF(f.customer_id IS NOT NULL) AS nc_orders,
+           SUM(IF(f.customer_id IS NOT NULL,
+                  COALESCE(o.order_subtotal, 0.0) + COALESCE(o.order_shipping, 0.0), 0.0)) AS nc_demand
+    FROM orders o
+    LEFT JOIN firsts f ON f.customer_id = o.customer_id AND f.first_d = o.d
     GROUP BY period
 ),
 rev AS (
@@ -964,10 +987,14 @@ SELECT k.period,
        COALESCE(sales.customers, 0) AS customers,
        COALESCE(newc.new_customers, 0) AS new_customers,
        COALESCE(demand.demand, 0.0) AS demand,
+       COALESCE(demand.nc_orders, 0) AS nc_orders,
+       COALESCE(demand.nc_demand, 0.0) AS nc_demand,
        COALESCE(sales.gross_sales, 0.0) AS gross_sales,
        COALESCE(sales.net_line_sales, 0.0) AS net_line_sales,
        COALESCE(rev.admin_net_revenue, 0.0) AS admin_net_revenue,
        SAFE_DIVIDE(COALESCE(demand.demand, 0.0), spend.spend) AS mer_demand,
+       SAFE_DIVIDE(COALESCE(demand.nc_demand, 0.0), spend.spend) AS nc_roas,
+       SAFE_DIVIDE(demand.nc_demand, demand.nc_orders) AS nc_aov,
        SAFE_DIVIDE(COALESCE(sales.gross_sales, 0.0), spend.spend) AS mer_gross,
        SAFE_DIVIDE(COALESCE(rev.admin_net_revenue, 0.0), spend.spend) AS mer_net,
        SAFE_DIVIDE(spend.spend, newc.new_customers) AS blended_cac,

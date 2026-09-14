@@ -322,7 +322,7 @@ definitions, stated in each response's `extra.definitions`:
 | ------------------------------- | ------- |
 | `bpd_get_dtc_sales_summary`     | Shopify DTC by `day`/`week`/`month` × bucket (default `core_d2c`): paid orders, customers, new customers, product units, gross and net line sales, AOV, and `admin_net_revenue` with its allocated refunds. Unpaid orders and their list value are reported beside the paid figures. `by_purchase_type` splits One Time / Subscription (new customers are then NULL rather than repeated). |
 | `bpd_get_ads_performance`       | Spend, impressions, clicks, platform conversions and value by period × channel with CTR/CPC/CPM/CPA/platform ROAS, plus each period's delivery integrity: delivered, confirmed-zero, undiagnosed-gap and unclassified days, summarised as `delivery_flag`. `by_campaign` returns the top-N campaigns by window spend with names and status from `ads_campaigns`. |
-| `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — **demand** (order-level subtotal + shipping, the pacing sheet's definition) with MER on demand, on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
+| `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — **demand** (order-level subtotal + shipping, the pacing sheet's definition) and **new-customer demand** (orders on the customer's first order date) with blended MER on demand, NC ROAS (new-customer demand / spend, the sheet's NC RoAS), MER on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
 | `bpd_get_dtc_pacing`            | Month-to-date pacing through the last complete day. **Demand** is the ecomm sheet's definition — order-level subtotal + shipping (Shopify total less tax) over paid core-D2C orders, one row per order — plus spend and new customers, each against the team's daily **forecast** from `config/dtc_pacing_targets.json`: MTD variance, month forecast, to-go, required daily average, run-rate projection. Period over period: the same number of days immediately before the month, the same days last month, and the weekday-aligned (364-day) span last year. Monday-anchored weekly rows and daily rows, each with its plan and weekday-aligned LY. Every actual is the warehouse's; the sheet contributes targets only. Targets missing → actuals still return, `extra.targets` says how to refresh. |
 
 #### Pacing targets: the ecomm team's sheet as config
@@ -379,10 +379,17 @@ taken as `demand` from the efficiency tool for weeks and days and from the
 pacing tool for the month; MER is demand over spend on both. Every line with a
 plan is a **scorecard line** — light first, then the stat: 🟢 at or above plan,
 🟡 within 10% below, 🔴 beyond; CAC reads the other way; spend is ⚪ because
-under-plan spend is a decision rather than a miss. Demand, MER, new customers,
-CAC and spend are scored for the week and again for the month, plus NC demand
-and NC ROAS for the month. **Notes** carry only what the lights cannot show: a
-month with no plan loaded, the Meta-history caveat on LY comparisons.
+under-plan spend is a decision rather than a miss. The order is fixed: demand,
+**NC ROAS (aMER)**, **MER (blended)**, new customers, NC demand (month only),
+CAC, spend. NC ROAS — new-customer demand over spend, the sheet's "NC RoAS",
+what acquisition spend actually controls — leads the efficiency pair; blended
+MER follows as the P&L guardrail. Read together they say whether a miss is
+acquisition or the repeat base: NC ROAS red with MER green means repeat revenue
+is carrying the spend; the reverse means acquisition is fine and the repeat
+base is soft. Both plans are ratios of the sheet's summed daily forecasts, like
+the sheet's own BRoAS and NC RoAS columns. **Notes** carry only what the lights
+cannot show: a month or week with no plan loaded, the Meta-history caveat on
+LY comparisons.
 
 ```bash
 uv run python scripts/dtc_brief.py --mode weekly            # prints main + [threaded reply]
