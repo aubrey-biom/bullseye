@@ -788,6 +788,10 @@ async def test_marketing_efficiency_by_week(fixture_warehouse: Any) -> None:
     assert w1["new_customers"] == 2
     assert w1["gross_sales"] == pytest.approx(65.0)  # gifting's 90 is NOT here
     assert w1["demand"] == pytest.approx(65.0)  # o1's order-level 36+4 counted ONCE over 2 lines
+    # o1 (cust 1, first order Aug 3) and o2 (cust 2, first order Aug 4) are both first orders.
+    assert (w1["nc_orders"], w1["nc_demand"]) == (2, pytest.approx(65.0))
+    assert w1["nc_roas"] == pytest.approx(65.0 / 250.0)
+    assert w1["nc_aov"] == pytest.approx(32.5)
     assert w1["net_line_sales"] == pytest.approx(61.0)
     assert w1["admin_net_revenue"] == pytest.approx(59.0)
     assert w1["mer_demand"] == pytest.approx(65.0 / 250.0)
@@ -808,6 +812,8 @@ async def test_marketing_efficiency_by_week(fixture_warehouse: Any) -> None:
     assert w2["new_customers"] == 0
     assert w2["blended_cac"] is None  # no new customers: NULL, never inf or a crash
     assert w2["demand"] == pytest.approx(20.0)  # o4: 18 + 2 shipping
+    assert (w2["nc_orders"], w2["nc_demand"]) == (0, 0.0)  # o4 is customer 1's REPEAT order
+    assert w2["nc_roas"] == pytest.approx(0.0) and w2["nc_aov"] is None
     assert w2["mer_demand"] == pytest.approx(0.4)
     assert w2["mer_gross"] == pytest.approx(0.4)
     assert w2["cost_per_order"] == pytest.approx(50.0)
