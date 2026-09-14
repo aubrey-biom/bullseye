@@ -18,9 +18,14 @@ from an .xlsx export of the sheet by `scripts/refresh_pacing_targets.py`
 (the same pattern as `config/pspw_goals.json` for the Target brief). The file
 records which export it came from and when, and the pacing tool reports that
 provenance with every response, so a stale file is visible rather than silent.
-Actuals are never taken from the file: the warehouse is the source for those,
-and the sheet's own actuals are kept only as `sheet_actual_*` so the tool can
-show the reconciliation between the two.
+
+ONLY THE FORECAST COLUMNS ARE READ. The sheet also carries the team's own
+actuals (Actual DMD, Actual Spend, Total NCs, LY Total DMD), pulled by hand from
+Shopify and the ad platforms. Those are deliberately not in FIELD_MAP: every
+actual the tools report comes from BigQuery, and the sheet is the source of
+targets and nothing else. (An earlier revision kept them for a per-day
+reconciliation display; it mostly flagged the sheet's not-yet-filled rows and
+invited confusion about which number was the real one.)
 
 This module is the read side. It has no BigQuery dependency and is safe to
 import anywhere.
@@ -52,10 +57,6 @@ FIELD_MAP: dict[str, str] = {
     "forecast_nc_demand": "Forecasted NC DMD",
     "forecast_nc_roas": "Forecasted NC RoAS",
     "forecast_nc_aov": "Forecasted NC AOV",
-    "sheet_ly_demand": "LY Total DMD",
-    "sheet_actual_demand": "Actual DMD",
-    "sheet_actual_spend": "Actual Spend",
-    "sheet_actual_new_customers": "Total NCs",
 }
 
 TARGET_FIELDS: tuple[str, ...] = tuple(FIELD_MAP)

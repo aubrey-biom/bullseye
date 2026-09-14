@@ -276,8 +276,8 @@ def test_refresh_script_reads_the_sheet_layout(tmp_path: Path) -> None:
     d1 = jul.days[date(2026, 7, 1)]
     assert d1.get("forecast_demand") == 10.0
     assert d1.get("forecast_spend") == 20.0  # header had a double space: normalised
-    assert d1.get("sheet_actual_demand") == 100.0
-    assert jul.days[date(2026, 7, 3)].get("sheet_actual_demand") is None  # "-" -> null
+    # The sheet's own actuals are not read: targets only.
+    assert "sheet_actual_demand" not in d1.values and "Actual DMD" not in t.source["field_map"].values()
     assert jul.totals["forecast_demand"] == 310.0
     assert jul.totals["forecast_spend"] == 620.0
     # The renamed spend column is a MISSING series, never the wrong one.
@@ -552,7 +552,7 @@ SPEND = [
 
 def _targets(days: int = 31) -> pt.PacingTargets:
     """Aug 2026: forecast demand 10/day, spend 20/day, 1 new customer/day, NC demand 8/day,
-    NC RoAS 0.4 and BRoAS 3.0 (rate targets, constant per day). Sheet actual demand for Aug 1 = 50."""
+    NC RoAS 0.4 and BRoAS 3.0 (rate targets, constant per day)."""
     d = {
         f"2026-08-{i:02d}": {
             "forecast_demand": 10.0,
@@ -561,7 +561,6 @@ def _targets(days: int = 31) -> pt.PacingTargets:
             "forecast_nc_demand": 8.0,
             "forecast_nc_roas": 0.4,
             "forecast_broas": 3.0,
-            "sheet_actual_demand": 50.0 if i == 1 else None,
         }
         for i in range(1, days + 1)
     }
@@ -674,8 +673,7 @@ async def test_pacing_month_to_date_against_targets(
     assert (str(d1["ly_day"]), d1["ly_demand"]) == ("2025-08-02", 22.0)
     assert (d1["nc_orders"], d1["nc_demand"]) == (1, 45.0)
     assert d1["act_vs_ly_pct"] == pytest.approx((45.0 - 22.0) / 22.0 * 100, abs=0.01)
-    assert d1["sheet_actual_demand"] == 50.0
-    assert d1["sheet_vs_warehouse_pct"] == pytest.approx((50.0 - 45.0) / 45.0 * 100, abs=0.01)
+    assert "sheet_actual_demand" not in d1  # actuals are the warehouse's alone
     d2 = days["2026-08-02"]
     assert (d2["demand"], d2["orders"], d2["spend"], d2["forecast_demand"]) == (0.0, 0, 0.0, 10.0)
     assert d2["act_vs_fcst_pct"] == pytest.approx(-100.0)
