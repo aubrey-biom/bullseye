@@ -269,6 +269,12 @@ def test_shipped_goals_file_is_well_formed() -> None:
             assert meta["goal_pspw"], f"{dpci}: no doors and no goal"
     for dpci, meta in cfg["excluded"].items():
         assert meta["name"] and meta["reason"], dpci
+        # An excluded entry must state its doors even when the answer is "none".
+        # Omitting the key buys the inventory fallback, which for an online-only
+        # or de-listed SKU invents a $PSPW out of the few doors holding stock —
+        # the exact thing excluding it was meant to prevent.
+        assert "pog_doors" in meta, f"{dpci}: pog_doors must be explicit, null included"
+        assert meta["pog_doors"] is None or meta["pog_doors"] > 0, dpci
 
 
 # ---------- end-to-end render ----------
@@ -447,6 +453,18 @@ def _with_extra_sku(sku) -> dict:
     return d
 
 
+def test_an_unrecognised_dpci_gets_its_estimated_doors_explained_too() -> None:
+    """The "~" is a promise the footer explains it. A DPCI with no KMG entry at
+    all is on inventory doors for a different reason than a goaled item awaiting
+    a door count, and both reasons have to reach the reader."""
+    new = pos_brief._annotate([_sku("999-99-9999", amt=5_000.0, units=400.0, doors=50)], CFG)[0]
+    new.prev_amt, new.eoh_ow, new.wip, new.oos = 4_000.0, 900.0, 99.0, 1.0
+    new.prev_oos, new.prev_eoh_ow = 1.0, 950.0
+    out = pos_brief.render_weekly(_with_extra_sku(new))
+    assert "~50" in out["replies"][0]
+    assert "does not carry" in out["main"] and "(~50 doors)" in out["main"]
+
+
 def test_render_says_which_doors_are_estimated() -> None:
     """A % to goal built on an inventory door count is not one KMG could
     reproduce, and a newly-listed item is where a reader is least likely to
@@ -460,6 +478,9 @@ def test_render_says_which_doors_are_estimated() -> None:
     assert "publishes a $PSPW goal but not yet a door count" in out["main"]
     assert "Mini Disp w/LM 40ct Peri (~1,053 doors)" in out["main"]
     assert "~1,053" in out["replies"][0]
+    # The Top 5 is what most readers stop at, so the marker has to survive there.
+    top5 = out["main"].split("**Top 5 SKUs")[1]
+    assert "~237%" in top5
 
 
 def test_a_goaled_sku_with_no_doors_stays_out_of_the_goal_tables() -> None:

@@ -725,7 +725,9 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
                 f"${s.amt:,.0f}",
                 f"${s.pspw:,.2f}",
                 f"${s.goal:,.2f}",
-                f"{s.pct_goal:.0f}%",
+                # The Top 5 is the table leadership actually reads, so it needs
+                # the estimated-doors marker as much as the detail reply does.
+                f"{'~' if s.doors_estimated else ''}{s.pct_goal:.0f}%",
                 _pct(s.amt, s.prev_amt),
             ]
         )
@@ -745,17 +747,25 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         f"inventory through {d['inv_through']}. Target restates recent weeks, so "
         f"figures can move.",
     ]
-    # Never let a % to goal computed on an estimated denominator pass as one
-    # KMG could reproduce — a newly-listed item is exactly where a reader is
-    # least able to spot it.
-    estimated = [s for s in listed if s.doors_estimated and s.goal]
-    if estimated:
+
+    # Never let a per-door figure computed on an estimated denominator pass as
+    # one KMG could reproduce. Every "~" printed above has to be accounted for
+    # here, and a SKU earns one for either of two reasons.
+    def _names(skus: list[Any]) -> str:
+        return ", ".join(f"{s.name} (~{s.doors_pog:,} doors)" for s in skus)
+
+    pending = [s for s in listed if s.doors_estimated and s.known]
+    unnamed = [s for s in listed if s.doors_estimated and not s.known]
+    why = []
+    if pending:
+        why.append("KMG publishes a $PSPW goal but not yet a door count for " + _names(pending))
+    if unnamed:
+        why.append("KMG's file does not carry " + _names(unnamed) + " at all")
+    if why:
         notes.append(
-            "KMG publishes a $PSPW goal but not yet a door count for "
-            + ", ".join(f"{s.name} (~{s.doors_pog:,} doors)" for s in estimated)
-            + ", so their doors are this week's inventory-derived count (marked ~). "
-            "Those run a few percent above POG authorization, which reads $PSPW and "
-            "% to goal slightly low.",
+            "; ".join(why) + ", so those doors are this week's inventory-derived count "
+            "(marked ~). Inventory doors run a few percent above POG authorization, "
+            "which reads $PSPW and % to goal slightly low."
         )
     if d["dropped"]:
         notes.append(
