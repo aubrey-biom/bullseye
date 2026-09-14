@@ -59,9 +59,6 @@ from bpd_mcp.schemas import (
 )
 from bpd_mcp.tools import dtc
 
-#: The channel the ecomm team's own updates live in.
-SLACK_CHANNEL = "#ecommerce"
-
 #: The yellow band: a paced series this far below plan is 🟡, beyond it 🔴.
 WATCH_VARIANCE_PCT = 10.0
 
@@ -250,7 +247,7 @@ async def gather(
             pacing = _ok(
                 await dtc.get_dtc_pacing(
                     wh,
-                    DtcPacingInput(as_of=today, month=ym, response_format="json"),
+                    DtcPacingInput(as_of=yesterday, month=ym, response_format="json"),
                     targets=targets,
                 ),
                 "pacing",
@@ -268,8 +265,10 @@ async def gather(
             return {"mode": mode, "today": today, "pacing": pacing, "month": month}
 
         pacing = _ok(
+            # as_of is the last COMPLETE day, so a --as-of backtest paces through the
+            # day before the simulated today, exactly as a live run does.
             await dtc.get_dtc_pacing(
-                wh, DtcPacingInput(as_of=today, response_format="json"), targets=targets
+                wh, DtcPacingInput(as_of=yesterday, response_format="json"), targets=targets
             ),
             "pacing",
         )
@@ -354,10 +353,19 @@ def scorecard(
     volumes as a % change (`compare_label`, e.g. WoW), rates as the earlier level
     (`prev_label`, e.g. "prior week 3.05x")."""
 
-    def vs(key: str, fmt: Any) -> str:
+    def vs(key: str) -> str:
         if compare is None:
             return ""
         return f" · {_pct(_pct_change(cur.get(key), compare.get(key)))} {compare_label}"
+
+    # Spend is never scored, but being materially off plan in EITHER direction is
+    # worth a word: over plan is where efficiency needs a look, under plan is room.
+    spend_var = _pct_change(cur["spend"], plan.get("spend"))
+    spend_note = ""
+    if spend_var is not None and spend_var >= WATCH_VARIANCE_PCT:
+        spend_note = " · over plan — check efficiency"
+    elif spend_var is not None and spend_var <= -WATCH_VARIANCE_PCT:
+        spend_note = spend_extra or " · under plan"
 
     def was(key: str, fmt: Any) -> str:
         if compare is None or compare.get(key) is None:
@@ -368,7 +376,7 @@ def scorecard(
         _stat(
             _light(_pct_change(cur["demand"], plan.get("demand"))),
             "Demand",
-            _vs_plan(cur["demand"], plan.get("demand"), _k) + vs("demand", _k) + demand_extra,
+            _vs_plan(cur["demand"], plan.get("demand"), _k) + vs("demand") + demand_extra,
         ),
         _stat(
             _light(_pct_change(cur["mer"], plan.get("mer"))),
@@ -378,7 +386,7 @@ def scorecard(
         _stat(
             _light(_pct_change(cur["new_customers"], plan.get("new_customers"))),
             "New customers",
-            _vs_plan(cur["new_customers"], plan.get("new_customers"), _n) + vs("new_customers", _n),
+            _vs_plan(cur["new_customers"], plan.get("new_customers"), _n) + vs("new_customers"),
         ),
         _stat(
             _light(_pct_change(cur["cac"], plan.get("cac")), good_when_high=False),
@@ -388,7 +396,7 @@ def scorecard(
         _stat(
             NEUTRAL,
             "Spend",
-            _vs_plan(cur["spend"], plan.get("spend"), _k) + vs("spend", _k) + spend_extra,
+            _vs_plan(cur["spend"], plan.get("spend"), _k) + vs("spend") + spend_note,
         ),
     ]
     return lines
@@ -418,10 +426,7 @@ def month_block(p: dict[str, Any]) -> list[str]:
             f" · run-rate {_k(rr['demand'])} vs {_k(fm['demand'])} forecast "
             f"({_pct(pvf.get('demand_pct'))})"
         )
-    sp = fc.get("spend")
-    spend_extra = ""
-    if sp and mtd["spend"] < sp * (1 - WATCH_VARIANCE_PCT / 100):
-        spend_extra = " · room to scale if efficiency holds"
+    spend_extra = " · room to scale if efficiency holds"  # used only when spend is under plan
     plan = {
         "demand": fc.get("demand"),
         "spend": fc.get("spend"),
@@ -440,7 +445,14 @@ def month_block(p: dict[str, Any]) -> list[str]:
     )
     tail = []
     if not done and tg.get("demand") is not None and rd.get("demand") is not None:
-        tail.append(f"To go {_k(tg['demand'])} over {s['days_left']} days ({_k(rd['demand'])}/day)")
+        if tg["demand"] > 0:
+            tail.append(
+                f"To go {_k(tg['demand'])} over {s['days_left']} days ({_k(rd['demand'])}/day)"
+            )
+        else:
+            tail.append(
+                f"Already {_k(-tg['demand'])} past the month forecast with {s['days_left']} days left"
+            )
     tail.append(f"vs LY {_pct(ly['demand_change_pct'])}")
     tail.append(f"vs same days last month {_pct(pm['demand_change_pct'])}")
     lines.append(" · ".join(tail))
@@ -460,6 +472,17 @@ def notes_block(p: dict[str, Any]) -> list[str]:
             f"only. {t.get('note') or ''}".strip()
         )
     return notes
+
+
+def week_plan_note(plan: dict[str, Any], start: date, end: date) -> list[str]:
+    """Why the week lines are unscored, when they are: a day in the span has no
+    forecast (its month's tab is not in the config), so there is no week plan."""
+    if plan.get("demand") is not None:
+        return []
+    return [
+        f"No plan for {_span(start, end)}: the pacing sheet has no forecast for every day in "
+        f"it (a month's tab is missing from the config), so those lines show actuals only."
+    ]
 
 
 def footer(p: dict[str, Any], through: date) -> str:
@@ -572,7 +595,7 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
         f"{share} of orders were first orders"
     )
     lines += ["", *month_block(d["pacing"])]
-    notes = notes_block(d["pacing"])
+    notes = week_plan_note(d["plan"], wk_start, wk_end) + notes_block(d["pacing"])
     if notes:
         lines += ["", "**Notes**", *[f"• {n}" for n in notes]]
     lines += ["", footer(d["pacing"], wk_end)]
@@ -627,7 +650,7 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
     if n <= 1:
         lines.append("ⓘ Only one day of the week has closed — read this as directional.")
     lines += ["", *month_block(d["pacing"])]
-    notes = notes_block(d["pacing"])
+    notes = week_plan_note(d["plan"], wk_start, through) + notes_block(d["pacing"])
     if notes:
         lines += ["", "**Notes**", *[f"• {x}" for x in notes]]
     lines += ["", footer(d["pacing"], through)]
@@ -671,8 +694,11 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
     ncd = _vs_plan(mtd["nc_demand"], fm.get("nc_demand"), _k)
     if fc.get("nc_roas") is not None:
         ncd += f" · NC ROAS {_x(mtd['nc_roas'])} vs {_x(fc['nc_roas'])} target"
+    else:
+        ncd += f" · NC ROAS {_x(mtd['nc_roas'])}"
+    # After New customers, as in month_block, so the two posts read in the same order.
     lines.insert(
-        7, _stat(_light(_pct_change(mtd["nc_demand"], fm.get("nc_demand"))), "NC demand", ncd)
+        6, _stat(_light(_pct_change(mtd["nc_demand"], fm.get("nc_demand"))), "NC demand", ncd)
     )
     lines.append(
         f"{_n(mtd['orders'])} orders · AOV {_money(mtd['aov'])} · platform ROAS "

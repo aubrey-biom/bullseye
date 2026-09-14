@@ -151,7 +151,12 @@ def test_scorecard_colours_each_line_against_its_own_plan() -> None:
     assert lines[1] == f"{G} **MER**  3.06x vs 2.90x plan · prior week 3.05x"
     assert lines[2].startswith(f"{R} **New customers**  465 vs 576 plan (-19.3%)")
     assert lines[3] == f"{Y} **CAC**  $45 vs $42 plan · prior week $45"
-    assert lines[4] == f"{W} **Spend**  $20.7K vs $24.5K plan (-15.5%) · -8.4% WoW"  # never judged
+    assert lines[4] == f"{W} **Spend**  $20.7K vs $24.5K plan (-15.5%) · -8.4% WoW · under plan"
+    # Spend is never scored, but a material overspend is still called out.
+    over = brief.scorecard({**cur, "spend": 30_600.0}, plan)
+    assert (
+        over[4] == f"{W} **Spend**  $30.6K vs $24.5K plan (+24.9%) · over plan — check efficiency"
+    )
     # No plan: the actual alone, neutral light, no invented percentage.
     bare = brief.scorecard(cur, dict.fromkeys(plan))
     assert bare[0] == f"{W} **Demand**  $63.4K" and "plan" not in bare[2]
@@ -175,6 +180,17 @@ def test_month_block_scores_the_month_and_flags_spend_room() -> None:
     )
 
 
+def test_month_block_ahead_of_forecast_never_prints_a_negative_to_go() -> None:
+    p = _pacing(
+        mtd={**_pacing()["summary"]["mtd"], "demand": 320_000.0},
+        to_go={"demand": -3_900.0},
+        required_daily_average={"demand": -780.0},
+    )
+    tail = brief.month_block(p)[-1]
+    assert tail.startswith("Already $3,900 past the month forecast with 17 days left")
+    assert "$-" not in tail
+
+
 def test_month_block_for_a_finished_month_has_no_run_rate_or_to_go() -> None:
     p = _pacing(complete_through="2026-08-31", elapsed_days=31, days_in_month=31, days_left=0)
     lines = brief.month_block(p)
@@ -189,6 +205,16 @@ def test_notes_only_carry_what_the_lights_cannot_show() -> None:
     notes = brief.notes_block(p)
     assert notes[0] == "Meta history starts 2025-07-02."
     assert notes[1].startswith("No plan loaded for this month (missing_month)")
+
+
+def test_week_without_a_plan_says_why() -> None:
+    plan = brief.plan_for(pacing_fx._targets(), date(2026, 7, 27), date(2026, 8, 2))
+    notes = brief.week_plan_note(plan, date(2026, 7, 27), date(2026, 8, 2))
+    assert notes == [
+        "No plan for Mon Jul 27–Sun Aug 2: the pacing sheet has no forecast for every day in "
+        "it (a month's tab is missing from the config), so those lines show actuals only."
+    ]
+    assert brief.week_plan_note({"demand": 1.0}, date(2026, 8, 3), date(2026, 8, 9)) == []
 
 
 def test_footer_shows_both_dates_when_the_month_runs_past_the_window() -> None:
@@ -342,6 +368,7 @@ async def test_weekly_brief_end_to_end(fixture_warehouse: Any, monkeypatch: Any)
     assert f"{G} **Demand**  $75 vs $50 plan (+50.0%)" in main
     assert f"{G} **NC demand**  $75 vs $40 plan (+87.5%) · NC ROAS 0.50x vs 0.40x target" in main
     assert "data through Sun Aug 2 (month through Wed Aug 5)" in main
+    assert "• No plan for Mon Jul 27–Sun Aug 2" in main
     assert len(out["replies"]) == 2
     days, trend = out["replies"]
     assert days.startswith("**Day by day — Mon Jul 27–Sun Aug 2**")
@@ -379,8 +406,11 @@ async def test_recap_brief_end_to_end(fixture_warehouse: Any, monkeypatch: Any) 
     assert main.startswith(
         f"🛒 **DTC — August 2026 recap** — **miss**\n\n**Month vs forecast**\n{R} **Demand**  $75 vs $310 plan (-75.8%)"
     )
-    assert f"{R} **New customers**  2 vs 31 plan (-93.5%)" in main
-    assert f"{W} **Spend**  $150 vs $620 plan (-75.8%)" in main
+    # Same line order as the month block: NC demand follows New customers.
+    assert (
+        f"{R} **New customers**  2 vs 31 plan (-93.5%)\n{R} **NC demand**  $75 vs $248 plan" in main
+    )
+    assert f"{W} **Spend**  $150 vs $620 plan (-75.8%) · under plan" in main
     # Certified net revenue for the month: o1 (30 + 10) + o2 (25) = 65 vs demand 75.
     assert "**Net revenue (certified, after refunds)** $65 · -13.3% vs demand" in main
     assert "Best day Sat Aug 1 at $45 · softest" in main
