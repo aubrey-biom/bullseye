@@ -857,6 +857,28 @@ def _channels_reporting(meta_spend: Any, google_spend: Any) -> str:
     return "none"
 
 
+def _nc_sql(n: Mapping[str, Any], n_date: str, lo: date, hi: date) -> tuple[str, str]:
+    """The ONE definition of a new-customer order, shared by the efficiency and
+    pacing queries so the brief's week and month NC figures can never drift apart.
+
+    Returns (firsts_cte, nc_aggregates): a `firsts` CTE — one row per customer
+    whose first paid core-D2C order (dtc_customer_first_order) falls in the
+    window — and the two aggregate expressions to select from an order-level
+    table aliased `o` LEFT JOINed to it as `f` on customer_id and day
+    (`LEFT JOIN firsts f ON f.customer_id = o.customer_id AND f.first_d = o.d`).
+    A guest order (NULL customer_id) never matches, so it is never NC.
+    """
+    firsts = f"""firsts AS (
+    SELECT {_q(n["customer_id"])} AS customer_id, {n_date} AS first_d
+    FROM dtc_customer_first_order
+    WHERE {_date_pred(n_date, lo, hi)}
+)"""
+    aggs = """COUNTIF(f.customer_id IS NOT NULL) AS nc_orders,
+           SUM(IF(f.customer_id IS NOT NULL,
+                  COALESCE(o.order_subtotal, 0.0) + COALESCE(o.order_shipping, 0.0), 0.0)) AS nc_demand"""
+    return firsts, aggs
+
+
 async def get_marketing_efficiency(
     warehouse: Warehouse, params: MarketingEfficiencyInput
 ) -> ToolResponse:
@@ -899,6 +921,7 @@ async def get_marketing_efficiency(
     o_date, r_date = o["date"].select_as_date(), r["date"].select_as_date()
     n_date, s_date = n["date"].select_as_date(), s["date"].select_as_date()
     g = params.grain
+    firsts_cte, nc_aggs = _nc_sql(n, n_date, start, end)
 
     sql = f"""
 WITH sales AS (
@@ -927,19 +950,13 @@ orders AS (
     GROUP BY order_id
 ),
 -- New-customer demand: the demand of orders placed on the customer's first
--- order date (dtc_customer_first_order is one row per customer), so NC ROAS is
--- new-customer demand / spend — the sheet's "NC RoAS", the acquisition MER.
-firsts AS (
-    SELECT {_q(n["customer_id"])} AS customer_id, {n_date} AS first_d
-    FROM dtc_customer_first_order
-    WHERE {_date_pred(n_date, start, end)}
-),
+-- order date (see _nc_sql), so NC ROAS is new-customer demand / spend — the
+-- sheet's "NC RoAS", the acquisition MER.
+{firsts_cte},
 demand AS (
     SELECT {period_expr(g, "o.d")} AS period,
            SUM(COALESCE(o.order_subtotal, 0.0) + COALESCE(o.order_shipping, 0.0)) AS demand,
-           COUNTIF(f.customer_id IS NOT NULL) AS nc_orders,
-           SUM(IF(f.customer_id IS NOT NULL,
-                  COALESCE(o.order_subtotal, 0.0) + COALESCE(o.order_shipping, 0.0), 0.0)) AS nc_demand
+           {nc_aggs}
     FROM orders o
     LEFT JOIN firsts f ON f.customer_id = o.customer_id AND f.first_d = o.d
     GROUP BY period
@@ -1339,6 +1356,7 @@ async def get_dtc_pacing(
         s["date"].select_as_date(),
     )
     lo, hi = w.query_start, w.query_end
+    firsts_cte, nc_aggs = _nc_sql(n, n_date, lo, hi)
     sql = f"""
 WITH o AS (
     SELECT {o_date} AS d, {_q(o["order_id"])} AS order_id,
@@ -1350,21 +1368,15 @@ WITH o AS (
       AND {_q(o["bucket"])} = '{CORE_BUCKET}' AND {_q(o["paid"])}
     GROUP BY d, order_id
 ),
-firsts AS (
-    SELECT {_q(n["customer_id"])} AS customer_id, {n_date} AS first_d
-    FROM dtc_customer_first_order
-    WHERE {_date_pred(n_date, lo, hi)}
-),
+{firsts_cte},
 -- An order is a NEW-customer order when its customer's first paid core-D2C
--- order fell on the same day (the sheet's "NC Demand").
+-- order fell on the same day (the sheet's "NC Demand"; see _nc_sql).
 sales AS (
     SELECT o.d, COUNT(*) AS orders,
            SUM(COALESCE(o.order_subtotal, 0.0) + COALESCE(o.order_shipping, 0.0)) AS demand,
            SUM(COALESCE(o.order_subtotal, 0.0)) AS net_sales,
            SUM(COALESCE(o.order_shipping, 0.0)) AS shipping,
-           COUNTIF(f.customer_id IS NOT NULL) AS nc_orders,
-           SUM(IF(f.customer_id IS NOT NULL,
-                  COALESCE(o.order_subtotal, 0.0) + COALESCE(o.order_shipping, 0.0), 0.0)) AS nc_demand
+           {nc_aggs}
     FROM o
     LEFT JOIN firsts f ON f.customer_id = o.customer_id AND f.first_d = o.d
     GROUP BY o.d

@@ -70,9 +70,14 @@ TREND_WEEKS = 8
 
 GREEN, YELLOW, RED, NEUTRAL = "🟢", "🟡", "🔴", "⚪"
 
-#: The plan series the sheet carries per day; MER, NC ROAS and CAC are derived from them.
-PLAN_FIELDS = ("forecast_demand", "forecast_spend", "forecast_new_customers", "forecast_nc_demand")
-PLAN_KEYS = ("demand", "spend", "new_customers", "nc_demand")
+#: Plan key -> the sheet's daily forecast series it is summed from. MER, NC ROAS
+#: and CAC are derived from these as ratios of the sums.
+PLAN_SERIES = {
+    "demand": "forecast_demand",
+    "spend": "forecast_spend",
+    "new_customers": "forecast_new_customers",
+    "nc_demand": "forecast_nc_demand",
+}
 
 
 # --------------------------------------------------------------------------------------
@@ -152,25 +157,34 @@ def _vs_plan(actual: float | None, plan: float | None, fmt: Any, *, pct: bool = 
 
 def plan_for(targets: PacingTargets | None, start: date, end: date) -> dict[str, float | None]:
     """The team's plan for a span of days: the daily forecasts summed, plus the
-    implied MER and CAC. A series is None unless EVERY day in the span carries it —
-    a week straddling a month whose tab has not landed has no plan, not half of one."""
-    out: dict[str, float | None] = dict.fromkeys(PLAN_KEYS)
+    implied MER, NC ROAS and CAC as ratios of those sums (how the sheet's own BRoAS
+    and NC RoAS columns are built). A series is None unless EVERY day in the span
+    carries it — a week straddling a month whose tab has not landed has no plan,
+    not half of one. NC ROAS falls back to the mean of the sheet's daily NC RoAS
+    column when a tab carries that but not NC DMD, mirroring the pacing tool."""
+    out: dict[str, float | None] = dict.fromkeys(PLAN_SERIES)
+    out.update(mer=None, nc_roas=None, cac=None)
     if targets is None:
-        out.update(mer=None, nc_roas=None, cac=None)
         return out
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
-    for fld, key in zip(PLAN_FIELDS, PLAN_KEYS, strict=True):
+
+    def series(fld: str) -> list[float] | None:
         vals: list[float] = []
         for d in days:
-            m = targets.month(d.strftime("%Y-%m"))
-            v = m.days[d].get(fld) if m is not None and d in m.days else None
+            v = _plan_day(targets, d, fld)
             if v is None:
-                vals = []
-                break
+                return None
             vals.append(v)
+        return vals
+
+    for key, fld in PLAN_SERIES.items():
+        vals = series(fld)
         out[key] = sum(vals) if vals else None
     out["mer"] = dtc._ratio(out["demand"], out["spend"])
-    out["nc_roas"] = dtc._ratio(out["nc_demand"], out["spend"])  # ratio of sums, like MER
+    out["nc_roas"] = dtc._ratio(out["nc_demand"], out["spend"])
+    if out["nc_roas"] is None:
+        rates = series("forecast_nc_roas")
+        out["nc_roas"] = sum(rates) / len(rates) if rates else None
     out["cac"] = dtc._ratio(out["spend"], out["new_customers"])
     return out
 
@@ -398,12 +412,13 @@ def scorecard(
             return ""
         return f" · {prev_label or compare_label} {fmt(compare[key])}"
 
-    def rate_light(key: str, nd: int, *, good_when_high: bool = True) -> str:
-        """Rates are judged at the precision they are printed at, so "1.60x vs
-        1.60x plan" is never yellow because of a difference in the third decimal."""
+    def rate_light(key: str, fmt: Any, *, good_when_high: bool = True) -> str:
+        """Rates are judged at the precision they are PRINTED at: if the actual and
+        the plan render identically ("1.60x vs 1.60x plan") the line is on plan,
+        never yellow over a third decimal the reader cannot see."""
         a, b = cur.get(key), plan.get(key)
-        a = round(a, nd) if a is not None else None
-        b = round(b, nd) if b is not None else None
+        if a is not None and b is not None and fmt(a) == fmt(b):
+            return GREEN
         return _light(_pct_change(a, b), good_when_high=good_when_high)
 
     lines = [
@@ -413,14 +428,14 @@ def scorecard(
             _vs_plan(cur["demand"], plan.get("demand"), _k) + vs("demand") + demand_extra,
         ),
         _stat(
-            rate_light("nc_roas", 2),
+            rate_light("nc_roas", _x),
             "NC ROAS (aMER)",
             _vs_plan(cur.get("nc_roas"), plan.get("nc_roas"), _x, pct=False)
             + was("nc_roas", _x)
             + (f" · NC AOV {_money(cur['nc_aov'])}" if cur.get("nc_aov") is not None else ""),
         ),
         _stat(
-            rate_light("mer", 2),
+            rate_light("mer", _x),
             "MER (blended)",
             _vs_plan(cur["mer"], plan.get("mer"), _x, pct=False) + was("mer", _x),
         ),
@@ -430,7 +445,7 @@ def scorecard(
             _vs_plan(cur["new_customers"], plan.get("new_customers"), _n) + vs("new_customers"),
         ),
         _stat(
-            rate_light("cac", 0, good_when_high=False),
+            rate_light("cac", _money, good_when_high=False),
             "CAC",
             _vs_plan(cur["cac"], plan.get("cac"), _money, pct=False) + was("cac", _money),
         ),
@@ -721,7 +736,7 @@ def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
 def render_recap(d: dict[str, Any]) -> dict[str, Any]:
     p = d["pacing"]
     s = p["summary"]
-    mtd, fm = s["mtd"], s.get("month_forecast") or {}
+    mtd, fm, fc = s["mtd"], s.get("month_forecast") or {}, s.get("forecast_mtd") or {}
     ly, lym, pm = s["last_year_mtd"], s["last_year_month"], s["prior_month_to_date"]
     month_end = date.fromisoformat(s["complete_through"])
     label = month_end.strftime("%B %Y")
@@ -740,7 +755,10 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
         "new_customers": fm.get("new_customers"),
         "nc_demand": fm.get("nc_demand"),
         "mer": dtc._ratio(fm.get("demand"), fm.get("spend")),
-        "nc_roas": dtc._ratio(fm.get("nc_demand"), fm.get("spend")),
+        # The month is closed, so the pacing tool's MTD forecast ratio IS the month's
+        # (summed daily NC demand / summed daily spend, with the sheet's NC RoAS
+        # column as its fallback) — the same base the month block used all month.
+        "nc_roas": fc.get("nc_roas"),
         "cac": dtc._ratio(fm.get("spend"), fm.get("new_customers")),
     }
     lines += scorecard(mtd, plan, with_nc_demand=True)

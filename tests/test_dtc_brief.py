@@ -77,6 +77,21 @@ def test_plan_for_is_none_when_any_day_lacks_a_forecast() -> None:
     p = brief.plan_for(t, date(2026, 7, 27), date(2026, 8, 2))
     assert set(p) == {"demand", "spend", "new_customers", "nc_demand", "mer", "nc_roas", "cac"}
     assert all(v is None for v in p.values())
+
+
+def test_plan_nc_roas_falls_back_to_the_sheets_rate_column() -> None:
+    """A tab with 'Forecasted NC RoAS' but no 'Forecasted NC DMD' still yields a
+    week NC ROAS plan (the mean of the daily rates), as the pacing tool does."""
+    raw = pacing_fx._targets()
+    days = {
+        d.isoformat(): {k: v for k, v in t.values.items() if k != "forecast_nc_demand"}
+        for d, t in raw.month("2026-08").days.items()
+    }
+    t = pt.parse_targets(
+        {"schema_version": 1, "source": {}, "months": {"2026-08": {"tab": "Aug", "days": days}}}
+    )
+    p = brief.plan_for(t, date(2026, 8, 3), date(2026, 8, 9))
+    assert p["nc_demand"] is None and p["nc_roas"] == pytest.approx(0.4)
     assert brief.plan_for(None, date(2026, 8, 1), date(2026, 8, 7))["demand"] is None
 
 
@@ -149,7 +164,7 @@ def test_scorecard_colours_each_line_against_its_own_plan() -> None:
     cur = {
         "demand": 63_400.0,
         "mer": 3.06,
-        "nc_roas": 1.5996,  # prints as 1.60x: judged at that precision, so green vs a 1.6 plan
+        "nc_roas": 1.5996,  # prints as 1.60x, same as the plan: on plan, so green
         "nc_aov": 70.0,
         "nc_demand": 33_200.0,
         "new_customers": 465,
