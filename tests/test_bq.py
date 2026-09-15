@@ -632,6 +632,58 @@ def test_failed_write_leaves_no_temp_file_behind(isolated_creds, monkeypatch):
     assert list(dest.parent.glob(".sa-key-*")) == [], "temp file leaked on failure"
 
 
+def test_credential_env_is_restored_even_when_monkeypatch_cannot(monkeypatch):
+    """conftest's `_restore_credential_env` covers the gap monkeypatch leaves.
+
+    `monkeypatch.delenv(name, raising=False)` records nothing when the variable
+    is ALREADY ABSENT, so a later `os.environ[name] = ...` inside production
+    code is never undone. That is not hypothetical: it left
+    `GOOGLE_APPLICATION_CREDENTIALS` pointing at this module's stub key for the
+    rest of the worker, and four production tests in `test_health_check` and
+    `test_validate_kmg` failed in whole-suite runs while passing in isolation.
+
+    Driving the fixture's generator by hand is what makes this observable — a
+    test cannot watch its own teardown, and the leak only shows up one test
+    later.
+    """
+    import conftest
+
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ
+
+    restore = conftest._restore_credential_env.__wrapped__(None)
+    next(restore)
+    # Exactly what resolve_credentials() does, and what monkeypatch cannot see.
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/a-stub-that-is-not-a-key.json"
+    with pytest.raises(StopIteration):
+        next(restore)
+
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ, (
+        "the credential env leaked past teardown; the next test to build a real "
+        "BigQuery client will die on MalformedError"
+    )
+
+
+def test_credential_env_restore_puts_back_a_real_value(monkeypatch):
+    """The other direction: restoring must not simply delete.
+
+    Once `_session_credential` has materialised the real key, every subsequent
+    test needs that value back — deleting it would break exactly the production
+    tests this fixture exists to keep green.
+    """
+    import conftest
+
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/real/key.json")
+
+    restore = conftest._restore_credential_env.__wrapped__(None)
+    next(restore)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/stub.json"
+    with pytest.raises(StopIteration):
+        next(restore)
+
+    assert os.environ["GOOGLE_APPLICATION_CREDENTIALS"] == "/real/key.json"
+
+
 # ---------------------------------------------------------------------------
 # The production registry itself
 # ---------------------------------------------------------------------------

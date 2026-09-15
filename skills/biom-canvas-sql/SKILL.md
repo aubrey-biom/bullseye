@@ -54,9 +54,11 @@ These are the highest-frequency failure modes. The full rule set is reference Se
 
 ## Running the query
 
-Connection/setup lives in `references/setup_guide.md` — **Part A for Claude Code, Part B for a Mac terminal.** They authenticate differently and there is no `bq` CLI in Code.
+Connection/setup lives in `references/setup_guide.md` — **Part A for Claude Code, Part B for a Mac terminal, Part C for Claude Chat / Desktop.** They authenticate differently and there is no `bq` CLI in Code.
 
 **In Claude Code** the service account already reaches all 12 datasets, so there is no compose-here-run-there step: go from the question to `client.query(sql).result()` in one move, then straight into whatever the deliverable is (Excel via the `xlsx` skill, a deck via `pptx`, a hosted page via an artifact). Writing a `.sql` file first is only worth it when the query is something to keep and re-run.
+
+**In Claude Chat / Desktop** there is no Python and no shell, so the only path is the **BPD MCP connector** (`bpd_run_sql` and the typed `bpd_get_*` tools). It wraps the same read-only service account. Two things to know, both of which have already caused a real wrong answer: the `bpd_` prefix is historical and the connector is **not** Target-only, and `bpd_describe_schema` lists only the names pre-defined as CTEs — every other table in the project is reachable by fully-qualifying it. Never answer "the warehouse doesn't have that" from the schema listing. Part C has the tool map.
 
 Easier access raises the stakes on step 3, not lowers them. A wrong number now arrives faster and with more polish on it.
 
@@ -88,5 +90,5 @@ Two-file split: **judgment** (curated, partial coverage, authoritative) vs **str
 
 - **`references/database_reference.md`** — the judgment layer: Section 1 rules, core tables + keys, bridges, product taxonomy, non-certified traps, locked anchors, SCD2 columns, join-key cheat sheet, and Section 9 order-line classification + channel scoping (join key, keyless-line trap, non-product exclusions, `order_source` taxonomy). **Read Section 1 before every query; read Section 9 before any product/category/channel query.**
 - **`references/schema_map.md`** — the structure layer: complete column-level inventory of all 41 `biom_canvas` objects (types, partition/cluster keys, and full view SELECT logic). Consult when you need exact column names/types or a view's derivation. Objects flagged 🆕 there exist but aren't yet annotated in `database_reference.md` — verify grain/quirks live before relying on them. **It drifts, and silently:** it sat at 36 objects while the warehouse had 41, so five objects — including `vw_order_line_sku_resolved`, which supersedes a hand-rolled recipe in Section 9 — were invisible to anyone reading only this skill. Regenerate with `python scripts/refresh_schema.py` (works in Code and on a laptop; `refresh_schema.sh` is the older `bq`-only version and does not run in Code).
-- **`references/setup_guide.md`** — one-time connection: gcloud install, the two required logins, project set, verification, CLI gotchas.
+- **`references/setup_guide.md`** — one-time connection, three ways: Part A the Claude Code service account, Part B gcloud on a Mac (install, the two required logins, project set, verification, CLI gotchas), Part C the BPD MCP connector in Claude Chat / Desktop.
 - **`references/validated_queries.md`** — a growing library of queries already run and checked. Check here first before writing a new query from scratch — the answer may already exist. Deposit each validated query here.

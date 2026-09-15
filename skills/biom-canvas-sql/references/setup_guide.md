@@ -1,11 +1,13 @@
 # BigQuery Setup Guide — BIOM CANVAS
 **Project:** `biom-reporting-s26` · **Region:** `us-central1` · **Primary dataset:** `biom_canvas`
 
-**Two environments connect two different ways. Pick yours:**
+**Three environments connect three different ways. Pick yours:**
 
 - **Claude Code** (web or cloud session) — a service account is already wired up.
-  Nothing to install, no browser login. **Read Part A, skip Part B entirely.**
+  Nothing to install, no browser login. **Read Part A, skip the rest.**
 - **Your own Mac terminal** — browser login as yourself. **Part B.**
+- **Claude Chat / Claude Desktop** — no Python, no `bq`, no shell. Queries go
+  through the **BPD MCP connector**. **Part C.**
 
 ---
 
@@ -182,6 +184,57 @@ This has caused real confusion on this project before (looked like a data gap; w
 
 ### Where to find the actual schema/business logic
 See the companion file **`BIOM_CANVAS_Database_Reference.md`** — that's the real reference for table structure, join keys, known gotchas, and locked revenue figures. This setup guide only gets you connected; that file explains what you're looking at once you are.
+
+---
+
+# Part C — Claude Chat / Claude Desktop (the BPD connector)
+
+*(Skip Part C in Claude Code and in a Mac terminal.)*
+
+There is no Python, no `bq` and no shell here, so neither Part A nor Part B
+applies. The warehouse is reachable through one thing: the **BPD MCP
+connector**, which wraps the same read-only service account
+(`claude-code-bq-readonly`) as Part A.
+
+**The connector is not Target-only.** The `bpd_` prefix is historical — it
+reads the whole warehouse, DTC and paid media included. Two traps have bitten
+here already:
+
+1. **`bpd_describe_schema` is not the access boundary.** It lists the
+   logical tables the server pre-defines as bare names. Anything else in the
+   project is queryable by fully-qualifying it. Never conclude "the warehouse
+   doesn't have that" from the schema listing — it says what is *pre-named*,
+   not what *exists*.
+2. **Check the roster before trusting its absence.** If
+   `bpd_get_dtc_sales_summary` is missing from the tool list, the connector is
+   running a checkout from before 2026-09-11 and genuinely has no DTC tables.
+   That is a stale install, not a missing data source — see the README.
+
+| Want to… | Call |
+|---|---|
+| arbitrary SQL | `bpd_run_sql` — logical tables by bare name, everything else fully-qualified |
+| see what is pre-named | `bpd_describe_schema` (leads with a per-domain index) |
+| DTC sales / AOV / new customers | `bpd_get_dtc_sales_summary` |
+| MTD pacing vs the ecomm forecast | `bpd_get_dtc_pacing` |
+| Meta + Google performance | `bpd_get_ads_performance` |
+| blended MER / CAC | `bpd_get_marketing_efficiency` |
+| results as a file | `bpd_export_query_to_csv` |
+
+Reaching an unregistered table looks exactly like Part A's SQL, just handed to
+`bpd_run_sql` instead of `client.query`:
+
+```sql
+SELECT status, COUNT(*) AS n
+FROM `biom-reporting-s26.biom_canvas.fct_subscriptions`
+WHERE is_current
+GROUP BY status
+```
+
+Every rule in `database_reference.md` still applies — `is_current`, SUM-safe
+money columns, `variant_id` joins, the keyless-line resolver. The connector
+changes how the query is *sent*, never what makes it correct. Cost control is
+automatic: each query is dry-run first and the response echoes
+`estimated_bytes_scanned`.
 
 ---
 

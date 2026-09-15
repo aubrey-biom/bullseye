@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -56,12 +57,108 @@ def bigquery_available() -> bool:
     return bool(os.environ.get("GCP_SA_KEY_B64") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
 
 
+_CREDENTIAL_ENV = ("GOOGLE_APPLICATION_CREDENTIALS", "GCP_SA_KEY_B64", "HOME")
+
+# Set by `pytest_collection_modifyitems` below: did THIS run select any test
+# that talks to BigQuery? Default False so that a run which never reaches
+# collection cannot trigger the materialisation below.
+_BQ_TIER_SELECTED = False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _session_credential() -> None:
+    """Materialise the real service-account key ONCE, before any test runs.
+
+    Without this, `GOOGLE_APPLICATION_CREDENTIALS` was only ever set as a side
+    effect of whichever test happened to call `resolve_credentials()` first —
+    usually the session `bq_client` fixture, sometimes a test that materialised
+    a STUB key into its own tmp_path. Tests that construct a bare
+    `BigQueryWarehouse()` and rely on ADC therefore passed or failed on
+    collection order, and the four production checks in `test_health_check` and
+    `test_validate_kmg` failed only in a whole-suite run.
+
+    Making it a session invariant also gives `_restore_credential_env` below a
+    correct value to restore TO, rather than only an absence to restore.
+
+    Either this fixture or that one closes the observed failure on its own
+    (verified by disabling each in turn), and they are kept together on
+    purpose. This one fixes the ordering dependency itself; that one contains
+    the blast radius of any future test that points the credential env
+    somewhere of its own. Neither is redundant: drop this and the production
+    tests go back to depending on what ran before them, drop that and the next
+    such test re-opens the leak.
+    """
+    # The default tier's contract, stated at the top of this file, is "no
+    # network, no credentials, no cost". Materialising a key writes a private
+    # key to ~/.config/gcloud, which is a credential side effect a hermetic run
+    # must not have — so do nothing unless this run actually selected a
+    # BigQuery test. `-m "not bq and not bq_live"` therefore writes nothing,
+    # exactly as before this fixture existed.
+    if not _BQ_TIER_SELECTED or not bigquery_available():
+        return
+    from bpd_mcp.bq import CredentialsUnavailable, resolve_credentials
+
+    try:
+        resolve_credentials()
+    except (CredentialsUnavailable, OSError):
+        # `bigquery_available()` only proves an env var is set, not that it
+        # names a usable key, and materialisation also does mkdir/mkstemp/
+        # fchmod/replace — a read-only or full $HOME raises OSError. The bq
+        # tiers will skip or fail on their own terms; a session-scoped autouse
+        # fixture that raises would error EVERY test in the run instead.
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _restore_credential_env(_session_credential: None) -> Iterator[None]:
+    """Snapshot and restore the credential env around EVERY test.
+
+    `monkeypatch.delenv(name, raising=False)` records NOTHING when the variable
+    is already absent (see `MonkeyPatch.delitem`: the no-key branch only raises
+    or returns). `resolve_credentials()` then writes
+    `os.environ["GOOGLE_APPLICATION_CREDENTIALS"]` itself — a write monkeypatch
+    never saw and therefore never undoes. So `test_sa_key_b64_is_materialised_0600`
+    left the variable pointing at its own tmp_path stub
+    (`{"type": "service_account", "project_id": ...}` and nothing else) for the
+    rest of the worker, and the next test to build a real client died on
+    `MalformedError: ... missing fields token_uri, client_email`.
+
+    Note the trap only springs where the variable starts out UNSET — a machine
+    authenticating via `GCP_SA_KEY_B64` alone, which is exactly CI and this
+    container. With a key file already exported, monkeypatch records the old
+    value and restores it, and the suite looks clean. That is why this survived:
+    it is invisible on any laptop that has run `gcloud auth application-default
+    login`. (It is also why `_session_credential` above independently fixes it —
+    materialising the key makes the variable present, so monkeypatch starts
+    recording. This fixture is the backstop for the next test that mutates the
+    credential env, not a duplicate of that one.)
+
+    Autouse fixtures are torn down last, so this runs after `monkeypatch.undo()`
+    and has the final word.
+    """
+    saved = {name: os.environ.get(name) for name in _CREDENTIAL_ENV}
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
     """Skip the BigQuery tiers when there is no credential, rather than erroring.
 
     A contributor without warehouse access still gets a meaningful green run
     from the default tier; CI with a key gets everything.
+
+    Also records whether this RUN selected any BigQuery test at all, which is
+    what keeps `_session_credential` from materialising a key during a
+    hermetic-only run — see its docstring.
     """
+    global _BQ_TIER_SELECTED
+    _BQ_TIER_SELECTED = any(
+        "bq" in item.keywords or "bq_live" in item.keywords for item in items
+    )
     if bigquery_available():
         return
     skip = pytest.mark.skip(reason="no BigQuery credential (GCP_SA_KEY_B64 / ADC) in this env")
