@@ -656,11 +656,14 @@ def test_non_target_sources_declare_their_domain() -> None:
         "fct_refunds",
         "fct_revenue",
         "vw_revenue_subscriptions",
+        "fct_shopify_orders",  # the seam comment's own worked example
+        "fct_subscriptions",  # follow-up 8's candidate, not yet registered
         "fct_meta_performance",
         "fct_ad_performance",
         "fct_shopping_performance",
         "fct_keyword_performance",
         "dim_campaign",
+        "dim_campaign_meta",
         "vw_media_delivery_status",
     )
     mislabelled = {

@@ -141,12 +141,17 @@ that the schema has no such table, and a caller reading the reply has no way to
 tell a stale install from a missing data source. This is the same class of bug
 as the Routine that pinned a merged branch and ran 27 commits behind.
 
-One call tells you which you have:
+One call tells you which you have. Diagnose on the **presence of the DTC
+surface**, not on a count — the counts here grow every time a table or tool is
+added, and a table of stale numbers would start calling current installs stale:
 
 | Check | Current | Pre-2026-09-11 |
 | ----- | ------- | -------------- |
-| `bpd_describe_schema` | 26 logical tables, DTC + ads in the index | 15, all Target |
-| tool roster | 18 tools | 14, no `bpd_get_dtc_*` |
+| `bpd_describe_schema` | a Shopify DTC section in the domain index | 15 tables, all Target, no index |
+| tool roster | `bpd_get_dtc_sales_summary` present | 14 tools, no `bpd_get_dtc_*` |
+
+(The pre-2026-09-11 numbers are history and cannot drift; they are what
+`7080cf0^` really served.)
 
 `git -C /path/to/bpd-mcp pull` and restart the client. Restarting matters: the
 server is spawned once per client session, so a pull alone changes nothing

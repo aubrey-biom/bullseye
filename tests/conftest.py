@@ -59,6 +59,11 @@ def bigquery_available() -> bool:
 
 _CREDENTIAL_ENV = ("GOOGLE_APPLICATION_CREDENTIALS", "GCP_SA_KEY_B64", "HOME")
 
+# Set by `pytest_collection_modifyitems` below: did THIS run select any test
+# that talks to BigQuery? Default False so that a run which never reaches
+# collection cannot trigger the materialisation below.
+_BQ_TIER_SELECTED = False
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _session_credential() -> None:
@@ -83,16 +88,24 @@ def _session_credential() -> None:
     tests go back to depending on what ran before them, drop that and the next
     such test re-opens the leak.
     """
-    if not bigquery_available():
+    # The default tier's contract, stated at the top of this file, is "no
+    # network, no credentials, no cost". Materialising a key writes a private
+    # key to ~/.config/gcloud, which is a credential side effect a hermetic run
+    # must not have — so do nothing unless this run actually selected a
+    # BigQuery test. `-m "not bq and not bq_live"` therefore writes nothing,
+    # exactly as before this fixture existed.
+    if not _BQ_TIER_SELECTED or not bigquery_available():
         return
     from bpd_mcp.bq import CredentialsUnavailable, resolve_credentials
 
     try:
         resolve_credentials()
-    except CredentialsUnavailable:
+    except (CredentialsUnavailable, OSError):
         # `bigquery_available()` only proves an env var is set, not that it
-        # names a usable key. The bq tiers will skip or fail on their own terms;
-        # this fixture must not turn that into a collection error.
+        # names a usable key, and materialisation also does mkdir/mkstemp/
+        # fchmod/replace — a read-only or full $HOME raises OSError. The bq
+        # tiers will skip or fail on their own terms; a session-scoped autouse
+        # fixture that raises would error EVERY test in the run instead.
         pass
 
 
@@ -137,7 +150,15 @@ def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
 
     A contributor without warehouse access still gets a meaningful green run
     from the default tier; CI with a key gets everything.
+
+    Also records whether this RUN selected any BigQuery test at all, which is
+    what keeps `_session_credential` from materialising a key during a
+    hermetic-only run — see its docstring.
     """
+    global _BQ_TIER_SELECTED
+    _BQ_TIER_SELECTED = any(
+        "bq" in item.keywords or "bq_live" in item.keywords for item in items
+    )
     if bigquery_available():
         return
     skip = pytest.mark.skip(reason="no BigQuery credential (GCP_SA_KEY_B64 / ADC) in this env")

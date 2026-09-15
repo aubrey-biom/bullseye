@@ -909,7 +909,12 @@ async def bpd_health_check(
 
 @mcp.resource(
     "bpd://schema",
-    description="The BPD logical-table schema (BigQuery-backed) as markdown.",
+    description=(
+        "The full logical-table schema as markdown — Target retail, Shopify DTC "
+        "and paid media — led by a per-domain index. Same content as "
+        "bpd_describe_schema, including the note that the listing is not the "
+        "limit of what bpd_run_sql can query."
+    ),
 )
 async def bpd_schema_resource() -> str:
     # FastMCP resources don't receive Context; reach into the module-level

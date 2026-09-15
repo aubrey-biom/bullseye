@@ -200,7 +200,7 @@ connector**, which wraps the same read-only service account
 reads the whole warehouse, DTC and paid media included. Two traps have bitten
 here already:
 
-1. **`bpd_describe_schema` is not the access boundary.** It lists the 26
+1. **`bpd_describe_schema` is not the access boundary.** It lists the
    logical tables the server pre-defines as bare names. Anything else in the
    project is queryable by fully-qualifying it. Never conclude "the warehouse
    doesn't have that" from the schema listing — it says what is *pre-named*,
