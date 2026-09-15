@@ -34,6 +34,7 @@ outermost, so nothing in this module needs injection awareness.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date, timedelta
 from typing import Any
 
@@ -313,12 +314,58 @@ async def run_sql(read_only_warehouse: Warehouse, params: RunSqlInput) -> ToolRe
 # ---------- bpd_describe_schema ----------
 
 
+_DOMAIN_LABELS: tuple[tuple[str, str], ...] = (
+    ("target", "Target retail (BPD vendor feeds + canvas Target facts)"),
+    ("dtc", "Shopify DTC (orders, refunds, certified net revenue, first orders)"),
+    ("ads", "Paid media (Meta + Google Ads, spend spine, delivery integrity)"),
+)
+
+
+def _domain_index(tables: Mapping[str, Mapping[str, Any]]) -> str:
+    """A grouped index of the registry, emitted BEFORE the per-table detail.
+
+    The detail below is registry-ordered, so the 11 DTC and ads tables sit
+    after all 15 Target ones and a reader who skims the first screen concludes
+    the server is Target-only — which has really happened, in a chat that then
+    answered a DTC question with "not in the schema" instead of querying it.
+    Three lines at the top cost ~60 tokens and make the whole surface legible
+    before the first `####`.
+
+    The closing line is the more important half: this list is what the server
+    pre-defines as bare names, NOT the limit of what it can read. A
+    fully-qualified reference goes straight through to BigQuery, where the
+    credential reads every dataset in the project.
+    """
+    grouped: dict[str, list[str]] = {}
+    for name, body in tables.items():
+        grouped.setdefault(str(body.get("domain", "target")), []).append(name)
+
+    lines: list[str] = [f"**{len(tables)} logical tables**, by domain:"]
+    for key, label in _DOMAIN_LABELS:
+        names = grouped.pop(key, [])
+        if names:
+            lines.append(f"- **{label}** — " + ", ".join(f"`{n}`" for n in names))
+    # Any domain the label table doesn't know about still gets printed: a new
+    # source must never be silently invisible here, which is the whole bug.
+    for key in sorted(grouped):
+        lines.append(f"- **{key}** — " + ", ".join(f"`{n}`" for n in grouped[key]))
+    lines.append(
+        "\nThese are the names pre-defined as CTEs, **not** the limit of what "
+        "`bpd_run_sql` can read: any table in `biom-reporting-s26` is queryable "
+        "by its fully-qualified name (e.g. "
+        "`` `biom-reporting-s26.biom_canvas.fct_subscriptions` ``), and the "
+        "read-only credential reaches every dataset in the project."
+    )
+    return "\n".join(lines)
+
+
 async def describe_schema(warehouse: Warehouse, params: DescribeSchemaInput) -> ToolResponse:
     info = warehouse.describe()
     if params.response_format == "json":
         return make_kv_response(data=info, title="Warehouse schema", fmt="json")
     # Render each table as a sub-table.
     parts: list[str] = ["### Warehouse schema"]
+    parts.append(_domain_index(info["tables"]))
     if info["views"]:
         parts.append("**Views**: " + ", ".join(info["views"]))
     for name, body in info["tables"].items():

@@ -17,6 +17,7 @@ that agrees with itself.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import typing
 
@@ -617,4 +618,112 @@ def test_every_resolvable_date_column_is_pinned(bq_client) -> None:
     assert missing == [], (
         "production DATE columns a role can resolve to, unpinned in "
         f"conftest._TYPES — fixtures using them silently become STRING: {missing}"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# `domain` — the field that keeps the DTC surface visible in the schema listing
+# --------------------------------------------------------------------------------------
+
+
+def test_every_domain_is_one_the_index_can_label() -> None:
+    """A typo'd domain still renders, but under its raw key and at the bottom.
+
+    `_domain_index` deliberately prints unknown domains rather than dropping
+    them — silently invisible is the exact bug the index exists to fix — so
+    nothing at runtime catches `domain="DTC"` or `domain="shopify"`. This does.
+    """
+    from bpd_mcp.tools.query import _DOMAIN_LABELS
+
+    known = {key for key, _ in _DOMAIN_LABELS}
+    wrong = {n: t.domain for n, t in LOGICAL_TABLES.items() if t.domain not in known}
+    assert wrong == {}, (
+        f"logical tables carry a domain _DOMAIN_LABELS cannot label: {wrong}. "
+        f"Add the label or fix the entry; known domains are {sorted(known)}"
+    )
+
+
+def test_non_target_sources_declare_their_domain() -> None:
+    """`domain` defaults to "target", so a DTC table that omits it files itself
+    under Target — which is how a whole data surface became unfindable once.
+
+    Keyed off the base table's dataset rather than the logical name so renaming
+    a table cannot quietly opt it out: anything reading a Shopify or ads fact
+    must declare a non-target domain.
+    """
+    dtc_ads_sources = (
+        "fct_orders",
+        "fct_refunds",
+        "fct_revenue",
+        "vw_revenue_subscriptions",
+        "fct_meta_performance",
+        "fct_ad_performance",
+        "fct_shopping_performance",
+        "fct_keyword_performance",
+        "dim_campaign",
+        "vw_media_delivery_status",
+    )
+    mislabelled = {
+        name: t.domain
+        for name, t in LOGICAL_TABLES.items()
+        if t.domain == "target"
+        and any(src.rsplit(".", 1)[-1] in dtc_ads_sources for src in t.base_tables)
+    }
+    assert mislabelled == {}, (
+        "these tables read a Shopify/ads source but are filed under Target in "
+        f"bpd_describe_schema's index: {sorted(mislabelled)}"
+    )
+
+
+def test_domain_index_lists_every_table_exactly_once() -> None:
+    """The index is the first thing a reader sees; a table missing from it is
+    worse than no index, because the grouping reads as exhaustive."""
+    from bpd_mcp.tools.query import _domain_index
+
+    tables = {n: {"domain": t.domain} for n, t in LOGICAL_TABLES.items()}
+    rendered = _domain_index(tables)
+    for name in LOGICAL_TABLES:
+        assert rendered.count(f"`{name}`") == 1, f"{name} not listed exactly once in the index"
+    assert f"**{len(LOGICAL_TABLES)} logical tables**" in rendered
+
+
+def test_domain_index_says_the_registry_is_not_the_boundary() -> None:
+    """The load-bearing sentence. A chat session read the schema listing as the
+    set of tables that EXIST, answered a DTC question "not in the schema", and
+    never queried the data. Deleting this line re-opens that failure.
+    """
+    from bpd_mcp.tools.query import _domain_index
+
+    rendered = _domain_index({n: {"domain": t.domain} for n, t in LOGICAL_TABLES.items()})
+    assert "fully-qualified" in rendered
+    assert "not** the limit" in rendered
+
+
+def test_server_instructions_advertise_every_domain() -> None:
+    """`instructions` is the only text a client shows the model BEFORE it
+    decides whether this server is relevant. Empty (as it was) it introduced
+    itself as the token "bpd_mcp" — Target's acronym — and DTC questions went
+    elsewhere. Assert it still names all three surfaces and the escape hatch.
+    """
+    from bpd_mcp.server import mcp
+
+    text = (mcp.instructions or "").lower()
+    assert text, "server instructions are empty; the connector advertises nothing"
+    for claim in ("target", "shopify", "dtc", "paid media", "fully-qualified"):
+        assert claim in text, f"server instructions no longer mention {claim!r}"
+
+
+def test_instructions_name_only_tools_that_exist() -> None:
+    """The instructions point the model at specific DTC tools by name. A rename
+    that misses them leaves the one orientation text pointing at nothing.
+    """
+    import re
+
+    from bpd_mcp.server import mcp
+
+    roster = {t.name for t in asyncio.run(mcp.list_tools())}
+    named = set(re.findall(r"`(bpd_[a-z_]+)`", mcp.instructions or ""))
+    assert named, "instructions name no tools at all"
+    assert named <= roster, (
+        f"instructions reference tools that do not exist: {sorted(named - roster)}"
     )

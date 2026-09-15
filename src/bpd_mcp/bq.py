@@ -136,6 +136,17 @@ class LogicalTable:
     answer "how fresh is sales_daily" and to derive active/retired status.
     Empty = no direct Kiteworks file feed."""
 
+    domain: str = "target"
+    """Which business surface this table describes: `target`, `dtc` or `ads`.
+
+    Presentational, and deliberately so — nothing about querying depends on it.
+    It exists because `describe()` emits the registry in registry order, which
+    put all 11 DTC and ads tables after all 15 Target ones, and a reader (human
+    or model) who skimmed the first screen concluded the server was Target-only
+    and stopped. `describe_schema` now leads with a per-domain index built from
+    this field, so the DTC surface is legible from the first line of the output
+    rather than 65% of the way down it."""
+
     latest_state_note: str | None = None
     """Non-None when the body applies a QUALIFY/dedup to reproduce a DuckDB
     upsert semantic. Rendered by `describe()` so the reduction is never
@@ -167,7 +178,12 @@ class LogicalTable:
 #       base_tables=("biom-reporting-s26.biom_canvas.fct_shopify_orders",),
 #       date_column="order_date",
 #       patterns=(),            # not a Kiteworks BPD file feed
+#       domain="dtc",           # target | dtc | ads — groups the schema listing
 #   )
+#
+# `domain` defaults to "target", so a non-Target source that omits it files
+# itself under Target in `bpd_describe_schema`'s index and is that much less
+# likely to be found. Set it.
 #
 # Everything downstream picks it up automatically because it all reads THIS dict:
 #   - CTE injection            (build)
@@ -866,6 +882,7 @@ def is_product_line_expr(title_col: str = "product_title", sku_col: str = "sku")
 _register(
     LogicalTable(
         name="dtc_order_lines",
+        domain="dtc",
         # Line grain. `order_total`, `order_subtotal`, `order_shipping`,
         # `order_tax` and `order_discounts` are ORDER-level values repeated on
         # every line (Rule 2): reduce to one row per order_id (ANY_VALUE) before
@@ -918,6 +935,7 @@ WHERE is_current
 _register(
     LogicalTable(
         name="dtc_refunds",
+        domain="dtc",
         # Refund HEADER grain. `order_id` is INT64 at source and STRING on
         # fct_orders (Rule 7); cast here so the join needs no cast at the call site.
         sql=f"""
@@ -936,6 +954,7 @@ WHERE is_current
 _register(
     LogicalTable(
         name="dtc_revenue_lines",
+        domain="dtc",
         # Read THROUGH the certified view, not around it: `admin_net_revenue`
         # (gross minus allocated discount minus allocated refund) exists nowhere
         # else, and re-deriving it here would drift from the number leadership
@@ -982,6 +1001,7 @@ WHERE record_type = 'revenue' AND channel_key = 'shopify'
 _register(
     LogicalTable(
         name="dtc_customer_first_order",
+        domain="dtc",
         # Derived from dtc_order_lines so "first order" uses the SAME channel
         # bucket and paid-order rule as every other DTC number: a customer's
         # first PAID core-D2C order. Gifting recipients and draft orders never
@@ -1015,6 +1035,7 @@ GROUP BY customer_id
 _register(
     LogicalTable(
         name="ads_meta_daily",
+        domain="ads",
         sql=f"""
 SELECT date_start AS date, ad_id, adset_id, campaign_id, 'meta' AS channel,
        device_platform, publisher_platform,
@@ -1035,6 +1056,7 @@ FROM `{_P}.biom_canvas.fct_meta_performance`
 _register(
     LogicalTable(
         name="ads_google_daily",
+        domain="ads",
         # Campaign x day x device x network. THE source for Google total spend.
         sql=f"""
 SELECT date, CAST(campaign_id AS STRING) AS campaign_id, 'google' AS channel,
@@ -1055,6 +1077,7 @@ FROM `{_P}.biom_canvas.fct_ad_performance`
 _register(
     LogicalTable(
         name="ads_google_shopping_daily",
+        domain="ads",
         # Product-level sub-grain of ads_google_daily (Shopping campaigns only).
         # Drill-down, NOT a spend source: summing this with ads_google_daily
         # double counts. `variant_id` is the Shopify variant behind the item.
@@ -1076,6 +1099,7 @@ FROM `{_P}.biom_canvas.fct_shopping_performance`
 _register(
     LogicalTable(
         name="ads_google_keyword_daily",
+        domain="ads",
         # Keyword-level sub-grain of ads_google_daily (Search campaigns only).
         # Drill-down, NOT a spend source — same double-count warning as shopping.
         sql=f"""
@@ -1094,6 +1118,7 @@ FROM `{_P}.biom_canvas.fct_keyword_performance`
 _register(
     LogicalTable(
         name="ads_campaigns",
+        domain="ads",
         # Both channels' campaign dimensions in one shape. Google budgets are in
         # micros and are converted; Meta's `daily_budget` is projected as
         # stored — whether the pipeline already converted it from minor units
@@ -1125,6 +1150,7 @@ WHERE is_current
 _register(
     LogicalTable(
         name="ads_spend_daily",
+        domain="ads",
         # The cross-channel spend spine: (date, channel, campaign_id). Composed
         # from the two channel facts by bare name, so it can never disagree
         # with them. Google side is the CAMPAIGN fact only (see the module note).
@@ -1156,6 +1182,7 @@ GROUP BY date, channel, campaign_id
 _register(
     LogicalTable(
         name="media_delivery_status",
+        domain="ads",
         # One row per channel x calendar day from each channel's first day:
         # DELIVERED / OBSERVED_ZERO / CONFIRMED_NO_DELIVERY / ABSENT_UNDIAGNOSED.
         # A zero-spend day is only a real zero if it is CONFIRMED_NO_DELIVERY or
@@ -2054,6 +2081,12 @@ class BigQueryWarehouse:
         appear in none. The registry IS the catalogue, and entries come back in
         registry order.
 
+        Each entry carries `domain` (`target` / `dtc` / `ads`), and a renderer
+        should index by it. Emitted flat in registry order this listing reads as
+        a Target catalogue for its first 15 tables, which is exactly how it has
+        been misread — as the boundary of what the server can reach rather than
+        as the set of names it pre-defines as CTEs.
+
         `row_count` IS A DELIBERATE BEHAVIOUR CHANGE. It is now the PRIMARY BASE
         TABLE's row count from `__TABLES__` (0 bytes), not `COUNT(*)` through
         the CTE: counting through all 15 CTEs costs ~333 MB per describe() call,
@@ -2074,6 +2107,7 @@ class BigQueryWarehouse:
                 "row_count_basis": "base_table",
                 "source": primary,
                 "latest_state_note": entry.latest_state_note,
+                "domain": entry.domain,
             }
         return out
 

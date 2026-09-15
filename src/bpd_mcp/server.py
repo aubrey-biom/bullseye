@@ -43,7 +43,7 @@ from mcp.types import ToolAnnotations
 # layer actually lives, and `warehouse` is only a compatibility re-export kept
 # so `tools/query.py`'s `from ..warehouse import Warehouse, quote_ident` and its
 # `warehouse: Warehouse` annotations keep resolving.
-from .bq import BigQueryWarehouse
+from .bq import LOGICAL_TABLES, BigQueryWarehouse
 from .config import Settings, get_settings
 from .logging_setup import configure_logging, get_logger
 from .schemas import (
@@ -181,7 +181,44 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:
         await ctx.aclose()
 
 
-mcp: FastMCP = FastMCP("bpd_mcp", lifespan=lifespan)
+# The `instructions` string is the ONLY text an MCP client shows the model
+# before it decides whether this server is relevant at all. Leaving it unset
+# (as it was) meant the server introduced itself as the bare token "bpd_mcp" —
+# Target's own acronym — over a tool roster whose catalog entries all spoke
+# Target vocabulary. A DTC question in chat was answered "not in the schema"
+# without the DTC tools or tables ever being looked at. State the whole scope
+# here, and state that the registry is not the access boundary; both are the
+# facts that were missing at the moment the model had to choose.
+_INSTRUCTIONS = f"""\
+Biom's BigQuery warehouse (`biom-reporting-s26`), read-only. Despite the `bpd_`
+prefix this server is NOT Target-only. It covers three business surfaces:
+
+  * **Target retail (BPD)** — POS sales, inventory, gross margin, purchase
+    orders, PO plans and DFE forecasts, by TCIN and store.
+  * **Shopify DTC** — orders and refunds at line grain, certified net revenue,
+    new-vs-returning customers, AOV, and month-to-date pacing against the
+    ecomm team's forecast. Tools: `bpd_get_dtc_sales_summary`,
+    `bpd_get_dtc_pacing`.
+  * **Paid media** — Meta and Google Ads spend, clicks, platform conversions
+    and delivery integrity, plus blended MER/CAC against DTC revenue. Tools:
+    `bpd_get_ads_performance`, `bpd_get_marketing_efficiency`.
+
+`bpd_describe_schema` lists the {len(LOGICAL_TABLES)} logical tables the server
+pre-defines as bare names. That list is a convenience, NOT the access
+boundary: `bpd_run_sql`
+passes fully-qualified references straight through, and the credential reads
+every dataset in the project. Anything in the warehouse that has no logical
+table — `fct_subscriptions`, `dim_product`, `vw_order_line_sku_resolved` — is
+queryable today as ``SELECT ... FROM `biom-reporting-s26.biom_canvas.<table>` ``.
+So never answer "the warehouse doesn't have that" from the schema listing
+alone; the listing does not say what exists, only what is pre-named.
+
+Everything is read-only at the credential layer (dataViewer + jobUser) and at
+the input validator. BigQuery bills by byte scanned, so every query is dry-run
+for cost first and every response echoes `estimated_bytes_scanned`.
+"""
+
+mcp: FastMCP = FastMCP("bpd_mcp", instructions=_INSTRUCTIONS, lifespan=lifespan)
 
 
 def _ctx(c: Context[Any, Any, Any]) -> AppContext:
@@ -196,10 +233,13 @@ def _ctx(c: Context[Any, Any, Any]) -> AppContext:
 @mcp.tool(
     name="bpd_list_datasets",
     description=(
-        "Summary of every BPD dataset queryable in BigQuery: row count, snapshot "
-        "date range (freshness), content date range (how far order_d / fiscal "
-        "weeks / ETAs reach), the number of source files the upstream pipeline "
-        "has landed, and when it last landed one."
+        "Summary of every logical table this server pre-defines — Target "
+        "retail, Shopify DTC and Meta/Google paid media alike: row count, "
+        "snapshot date range (freshness), content date range (how far order_d "
+        "/ fiscal weeks / ETAs reach), the number of source files the upstream "
+        "pipeline has landed, and when it last landed one. Not an access "
+        "boundary: bpd_run_sql also reads any other table in "
+        "biom-reporting-s26 by its fully-qualified name."
     ),
     annotations=ToolAnnotations(
         readOnlyHint=True,
@@ -226,10 +266,17 @@ async def bpd_list_datasets(
 @mcp.tool(
     name="bpd_run_sql",
     description=(
-        "Execute arbitrary BigQuery Standard SQL against the BPD logical tables "
-        "(sales_daily, sales_weekly, inventory_daily, orders_daily, "
-        "forecast_weekly, dtc_order_lines, ads_spend_daily, ... — see bpd_describe_schema). Reference them by bare "
-        "name; the server injects each referenced table as a CTE. Read-only is "
+        "Execute arbitrary BigQuery Standard SQL against Biom's warehouse "
+        "(biom-reporting-s26) — Target retail, Shopify DTC and paid media. The "
+        "logical tables (sales_daily, inventory_daily, orders_daily, "
+        "forecast_weekly, dtc_order_lines, dtc_revenue_lines, ads_spend_daily, "
+        "... — see bpd_describe_schema) are referenced by bare name and the "
+        "server injects each as a CTE. That list is a convenience, not a "
+        "boundary: ANY other table in the project is queryable by its "
+        "fully-qualified name (e.g. SELECT ... FROM "
+        "`biom-reporting-s26.biom_canvas.fct_subscriptions`), which is how to "
+        "reach subscriptions, product taxonomy and the resolver views that have "
+        "no logical table. Read-only is "
         "enforced at the credential layer (the service account holds dataViewer "
         "+ jobUser and cannot create or write anything) AND at the input "
         "validator (multi-statement and DDL/DML tokens rejected). Every query is "
@@ -299,9 +346,14 @@ async def bpd_export_query_to_csv(
 @mcp.tool(
     name="bpd_describe_schema",
     description=(
-        "Return every BPD logical table, its columns and types, the BigQuery base "
-        "table behind it, and any latest-state reduction applied. Also exposed as "
-        "the MCP resource `bpd://schema`."
+        "Return every logical table — Target retail, Shopify DTC and paid "
+        "media — with its columns and types, the BigQuery base table behind "
+        "it, and any latest-state reduction applied. Leads with a per-domain "
+        "index so the DTC and ads surfaces are visible without reading to the "
+        "end. This is the set of names pre-defined as CTEs, NOT the limit of "
+        "what is queryable: anything else in biom-reporting-s26 is reachable "
+        "through bpd_run_sql fully-qualified. Also exposed as the MCP resource "
+        "`bpd://schema`."
     ),
     annotations=ToolAnnotations(
         readOnlyHint=True,

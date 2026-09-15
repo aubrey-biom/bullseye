@@ -128,6 +128,30 @@ logs or returns the key bytes.
 time.** Running Claude Desktop and Claude Code against this server
 concurrently is supported and is the reason the data layer changed.
 
+### Keep the connector's checkout current
+
+`--directory` points at a working copy, so **the connector runs whatever
+commit that copy is sitting on** — it does not follow `main`. A stale checkout
+does not fail; it silently serves a smaller warehouse, which is far harder to
+spot. Concretely, a checkout from before **2026-09-11** (commit `7080cf0`) has
+**15 logical tables and 14 tools** — no `dtc_*` or `ads_*` tables and none of
+the four DTC tools — while still connecting to BigQuery and answering Target
+questions perfectly well. Asked a DTC question, that server truthfully reports
+that the schema has no such table, and a caller reading the reply has no way to
+tell a stale install from a missing data source. This is the same class of bug
+as the Routine that pinned a merged branch and ran 27 commits behind.
+
+One call tells you which you have:
+
+| Check | Current | Pre-2026-09-11 |
+| ----- | ------- | -------------- |
+| `bpd_describe_schema` | 26 logical tables, DTC + ads in the index | 15, all Target |
+| tool roster | 18 tools | 14, no `bpd_get_dtc_*` |
+
+`git -C /path/to/bpd-mcp pull` and restart the client. Restarting matters: the
+server is spawned once per client session, so a pull alone changes nothing
+until the process is respawned.
+
 ---
 
 ## Configuration
@@ -180,6 +204,27 @@ FROM sales_daily
 WHERE sales_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 28 DAY)
 GROUP BY tcin ORDER BY units DESC
 ```
+
+**The registry is a convenience, not the access boundary.** `mask_sql` passes
+fully-qualified, backtick-quoted references through untouched, and the
+credential holds `dataViewer` on the whole project — so any table in
+`biom-reporting-s26`, registered or not, is queryable through `bpd_run_sql`
+today:
+
+```sql
+SELECT status, COUNT(*) AS n
+FROM `biom-reporting-s26.biom_canvas.fct_subscriptions`   -- no logical table
+WHERE is_current GROUP BY status
+```
+
+Registering a table buys a bare name, a declared `date_column`, freshness in
+`bpd_list_datasets` and typed tools on top; it has never been what gates
+reads. Worth stating twice because the opposite was assumed in a real chat
+session: the schema listing was read as the set of tables that *exist*, a DTC
+question was answered "not in the schema", and the data was never queried.
+`bpd_describe_schema` now leads with a per-domain index and says this
+explicitly, and `server.py`'s `instructions` string says it before any tool is
+called.
 
 | Logical table           | BigQuery source                                             | Note |
 | ----------------------- | ----------------------------------------------------------- | ---- |
@@ -276,8 +321,8 @@ the top of `src/bpd_mcp/bq.py`.
 | Tool                         | Purpose |
 | ---------------------------- | ------- |
 | `bpd_list_datasets`          | Per logical table: row count, `feed_kind`, `status` (active/retired), snapshot range (`min/max_date` = freshness) AND content range (`content_max_date` = how far `order_d` / fiscal weeks / ETAs reach), plus how many source files the pipeline has landed and when. |
-| `bpd_describe_schema`        | Every logical table, its columns and types, the base table behind it, and any latest-state reduction. Also the MCP resource `bpd://schema`. |
-| `bpd_run_sql`                | Arbitrary BigQuery Standard SQL. Reference logical tables by bare name. Read-only at the credential layer AND at the validator. Dry-run first for cost, then wrapped in `LIMIT N`; `extra.estimated_bytes_scanned` is echoed on every response. |
+| `bpd_describe_schema`        | Every logical table, its columns and types, the base table behind it, and any latest-state reduction, led by a per-domain index (Target / DTC / ads) and an explicit note that the list is not the access boundary. Also the MCP resource `bpd://schema`. |
+| `bpd_run_sql`                | Arbitrary BigQuery Standard SQL. Reference logical tables by bare name; reach **any other table in the project** by its fully-qualified name. Read-only at the credential layer AND at the validator. Dry-run first for cost, then wrapped in `LIMIT N`; `extra.estimated_bytes_scanned` is echoed on every response. |
 | `bpd_export_query_to_csv`    | Same query path, written to `~/.bpd-mcp/exports/<filename>`. Row cap from `BPD_EXPORT_MAX_ROWS`. |
 
 ### Analytics
@@ -826,8 +871,14 @@ The questions themselves are usable today as a manual exercise of the tools.
    them was explicitly deferred; the file carries a TODO where they were.
 8. **Subscriber health is not in the DTC brief.** The ecomm team's own update
    carries active subscribers, churn and skip rate; `fct_subscriptions` is not
-   a registered logical table, so the brief cannot. Registering it (with the
-   usual role, contract and drift-guard entries) is the prerequisite.
+   a registered logical table, so the *brief* cannot report them — it composes
+   the typed tools, which only reach the registry. The **data is not out of
+   reach**: `bpd_run_sql` reads `biom_canvas.fct_subscriptions` fully-qualified
+   today (10,229 ACTIVE / 1,017 PAUSED / 19,025 CANCELLED, checked 2026-09-15).
+   Registering it (with the usual role, contract and drift-guard entries) is
+   the prerequisite for putting it *in the brief*, not for querying it. An
+   earlier wording of this entry said only the first half and was read as "the
+   warehouse can't see subscriptions".
 9. **The plan basis includes shipping.** The team's forecast (and so the
    brief's "demand") is net sales + shipping; shipping is ~12% of it, so MER,
    AOV and CAC-adjacent ratios all carry it. Most DTC finance teams pace on net
