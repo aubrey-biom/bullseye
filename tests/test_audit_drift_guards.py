@@ -139,6 +139,7 @@ def test_dataset_and_feed_kind_values_stay_in_their_documented_vocabularies() ->
     assert set(cr.DATASET_KINDS.values()) <= {"transactional", "dimensional"}
     assert set(cr.FEED_KINDS.values()) <= {
         "delta_latest_state",
+        "scd2_history",
         "accumulating_snapshots",
         "period_replace",
         "append_daily",
@@ -206,15 +207,17 @@ def test_expected_tool_count_matches_the_registered_tools() -> None:
     )
 
 
-def test_tool_roster_is_the_post_bigquery_fourteen_plus_the_dtc_four() -> None:
+def test_tool_roster_is_the_post_bigquery_fourteen_plus_the_dtc_five() -> None:
     """Lineage: 22 tools before the swap, minus the four Kiteworks discovery
     tools, minus sync/refresh/reingest, minus clear_cache = 14; plus the three
-    DTC / paid-media analytics tools of Phase 2 and the pacing tool = 18."""
+    DTC / paid-media analytics tools of Phase 2 and the pacing tool = 18; plus
+    subscriber health = 19."""
     from bpd_mcp.server import mcp
 
-    assert EXPECTED_TOOL_COUNT == 18
+    assert EXPECTED_TOOL_COUNT == 19
     assert set(mcp._tool_manager._tools) == {
         "bpd_get_dtc_pacing",
+        "bpd_get_subscription_health",
         "bpd_get_dtc_sales_summary",
         "bpd_get_ads_performance",
         "bpd_get_marketing_efficiency",
@@ -314,7 +317,11 @@ def projected_columns(sql: str) -> list[str]:
                 cur = []
                 i += 1
                 continue
-            word = _WORD.match(s, i)
+            # Only at a word BOUNDARY: `valid_from` contains "from", and
+            # matching mid-identifier truncated that column to "valid_" and
+            # silently dropped every column after it.
+            at_boundary = i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")
+            word = _WORD.match(s, i) if at_boundary else None
             if word is not None and word.group(0).upper() == "FROM":
                 items.append("".join(cur))
                 break

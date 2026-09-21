@@ -414,6 +414,24 @@ COLUMN_ROLES: dict[str, dict[str, list[str]]] = {
         "discount": ["allocated_discount"],
         "refund": ["allocated_refund"],
     },
+    "dtc_subscriptions": {
+        # SCD2 history (see the registry entry): `valid_from` orders the row
+        # versions of one subscription, it is not a business date. The business
+        # dates are `subscription_created_date` / `cancelled_date`, and `date`
+        # resolves to the creation date so the generic date machinery has one.
+        "date": ["subscription_created_date"],
+        "subscription_id": ["subscription_id"],
+        "customer_id": ["customer_id"],
+        "status": ["status"],
+        "created_date": ["subscription_created_date"],
+        "cancelled_date": ["cancelled_date"],
+        "price": ["recurring_price"],
+        "delivery": ["recurring_delivery"],
+        "interval": ["billing_interval"],
+        "interval_count": ["billing_interval_count"],
+        "valid_from": ["valid_from"],
+        "is_current": ["is_current"],
+    },
     "dtc_customer_first_order": {
         "date": ["first_order_date"],
         "customer_id": ["customer_id"],
@@ -521,6 +539,7 @@ DATASET_KINDS: dict[str, str] = {
     "dtc_refunds": "transactional",
     "dtc_revenue_lines": "transactional",
     "dtc_customer_first_order": "transactional",
+    "dtc_subscriptions": "transactional",
     "ads_meta_daily": "transactional",
     "ads_google_daily": "transactional",
     "ads_google_shopping_daily": "transactional",
@@ -569,6 +588,16 @@ REQUIRED_ROLES: dict[str, tuple[str, ...]] = {
     ),
     "dtc_revenue_lines": ("date", "order_id", "bucket", "gross", "net"),
     "dtc_customer_first_order": ("date", "customer_id"),
+    "dtc_subscriptions": (
+        "subscription_id",
+        "customer_id",
+        "status",
+        "created_date",
+        "price",
+        "interval",
+        "interval_count",
+        "valid_from",
+    ),
     "ads_meta_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
     "ads_google_daily": ("date", "channel", "campaign", "spend", "impressions", "clicks"),
     "ads_spend_daily": (
@@ -630,8 +659,14 @@ DATE_RANGE_ROLES: dict[str, dict[str, str]] = {
 #                             the last few weeks can change after they land.
 #                             Freshness is the table's own MAX(date)/loaded_at,
 #                             not the Kiteworks ledger.
-# The DTC tables read SCD2 sources through `is_current` (or a view that does),
-# so like orders_daily they ARE the latest state: delta_latest_state.
+#   scd2_history            — every SCD2 row version is projected, NOT reduced
+#                             to is_current, because the questions asked of it
+#                             are point-in-time ("active subscribers a week
+#                             ago"). One business key has many rows; a caller
+#                             must pick the version valid at the instant it
+#                             means. dtc_subscriptions is the only one.
+# The other DTC tables read SCD2 sources through `is_current` (or a view that
+# does), so like orders_daily they ARE the latest state: delta_latest_state.
 FEED_KINDS: dict[str, str] = {
     "sales_daily": "append_daily",
     "sales_weekly": "period_replace",
@@ -653,6 +688,9 @@ FEED_KINDS: dict[str, str] = {
     "dtc_refunds": "delta_latest_state",
     "dtc_revenue_lines": "delta_latest_state",
     "dtc_customer_first_order": "delta_latest_state",
+    # The one DTC table read as HISTORY rather than latest state: every SCD2
+    # row version is projected so a point-in-time subscriber count is possible.
+    "dtc_subscriptions": "scd2_history",
     "ads_meta_daily": "append_restated",
     "ads_google_daily": "append_restated",
     "ads_google_shopping_daily": "append_restated",

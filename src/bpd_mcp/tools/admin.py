@@ -248,10 +248,12 @@ async def data_freshness(
 
 # Registered MCP tools after the BigQuery swap. Lineage: 22 before, minus the
 # four Kiteworks discovery tools, minus sync/refresh/reingest, minus
-# clear_cache = 14. Kept in lockstep with server.py by `_mcp_self_check` and by
-# a drift guard in the test suite — bump it in the SAME commit as any tool
-# addition or removal, or every user's health check hard-fails.
-EXPECTED_TOOL_COUNT = 18
+# clear_cache = 14; plus the four DTC / paid-media tools of Phase 2 = 18; plus
+# bpd_get_subscription_health (subscriber health for the weekly brief) = 19.
+# Kept in lockstep with server.py by `_mcp_self_check` and by a drift guard in
+# the test suite — bump it in the SAME commit as any tool addition or removal,
+# or every user's health check hard-fails.
+EXPECTED_TOOL_COUNT = 19
 
 
 _CheckFn = Callable[..., Awaitable[HealthCheckResult]]

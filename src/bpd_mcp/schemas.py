@@ -72,6 +72,7 @@ KnownDataset = Literal[
     "dtc_refunds",
     "dtc_revenue_lines",
     "dtc_customer_first_order",
+    "dtc_subscriptions",
     "ads_meta_daily",
     "ads_google_daily",
     "ads_google_shopping_daily",
@@ -376,6 +377,12 @@ class AdsPerformanceInput(_BaseModel):
 
 class MarketingEfficiencyInput(_BaseModel):
     grain: ReportGrain = "week"
+    start_date: _date | None = Field(default=None, description=_WINDOW_START_DOC)
+    end_date: _date | None = Field(default=None, description=_WINDOW_END_DOC)
+    response_format: ResponseFormat = "markdown"
+
+
+class SubscriptionHealthInput(_BaseModel):
     start_date: _date | None = Field(default=None, description=_WINDOW_START_DOC)
     end_date: _date | None = Field(default=None, description=_WINDOW_END_DOC)
     response_format: ResponseFormat = "markdown"

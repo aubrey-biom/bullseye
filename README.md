@@ -54,8 +54,8 @@ src/bpd_mcp/              the MCP server
   server.py               FastMCP entry point and tool roster
 scripts/
   pos_brief.py            scheduled Target POS brief (weekly + Thursday pulse) -> Slack text
-  dtc_brief.py            scheduled DTC brief (Monday weekly, Thursday pulse, 1st-of-month
-                          recap) -> Slack text, built from tools/dtc.py
+  dtc_brief.py            scheduled DTC brief (Monday weekly, mid-week subscriber
+                          pulse, 1st-of-month recap) -> Slack text, from tools/dtc.py
   setup_reporting.sh      builds the venv the brief needs on a fresh container
   validate_kmg.py         KMG POS-report tie-out: the migration's acceptance gate
   bq_query.py             read-only ad-hoc query runner through the server's data layer
@@ -196,8 +196,8 @@ once every old server process has exited.
 
 ## Data model: logical tables
 
-The analytics tools reference **26 logical tables** by bare name: 15 Target
-BPD tables, 4 DTC (Shopify) tables and 7 paid-media (Meta / Google Ads)
+The analytics tools reference **27 logical tables** by bare name: 15 Target
+BPD tables, 5 DTC (Shopify + Loop) tables and 7 paid-media (Meta / Google Ads)
 tables. They are not BigQuery views — the service account cannot create views
 — so the server injects each referenced one as a CTE immediately before the
 query runs. From a caller's point of view (including `bpd_run_sql`) they
@@ -217,9 +217,9 @@ credential holds `dataViewer` on the whole project — so any table in
 today:
 
 ```sql
-SELECT status, COUNT(*) AS n
-FROM `biom-reporting-s26.biom_canvas.fct_subscriptions`   -- no logical table
-WHERE is_current GROUP BY status
+SELECT product_category, COUNT(*) AS n
+FROM `biom-reporting-s26.biom_canvas.dim_product`         -- no logical table
+WHERE is_current GROUP BY product_category
 ```
 
 Registering a table buys a bare name, a declared `date_column`, freshness in
@@ -261,6 +261,7 @@ project lower-case names, and every Shopify money column is **CAST to FLOAT64**
 | `dtc_refunds`               | `biom_canvas.fct_refunds` (`is_current`)                     | refund-header grain; `order_id` cast to STRING |
 | `dtc_revenue_lines`         | `biom_canvas.vw_revenue_subscriptions` (`record_type='revenue'`, `channel_key='shopify'`) | the only source of `admin_net_revenue`; the view filters `is_current` itself |
 | `dtc_customer_first_order`  | derived from `dtc_order_lines` (`depends_on`)                | first **paid core-D2C** order per customer; gifting never mints a new customer |
+| `dtc_subscriptions`         | `biom_canvas.fct_subscriptions` (`NOT is_deleted`)           | Loop contracts as **SCD2 history** — the one entry that does NOT reduce to `is_current`, because "active subscribers a week ago" needs the version current *then*; one contract is many rows, so de-duplicate on `subscription_id` (latest `valid_from` before the instant you mean) before counting |
 | `ads_meta_daily`            | `biom_canvas.fct_meta_performance`                           | ad × day × device × publisher; `purchases`/`purchase_value` → `conversions`/`conversion_value` |
 | `ads_google_daily`          | `biom_canvas.fct_ad_performance`                             | campaign × day × device × network; **the** source for Google total spend |
 | `ads_google_shopping_daily` | `biom_canvas.fct_shopping_performance`                       | product sub-grain; drill-down only — summing it with the campaign fact double counts |
@@ -318,7 +319,7 @@ the top of `src/bpd_mcp/bq.py`.
 
 ## Tool reference
 
-18 tools, all prefixed `bpd_`. Every tool accepts `response_format` of
+19 tools, all prefixed `bpd_`. Every tool accepts `response_format` of
 `markdown` (default) or `json`.
 
 ### Catalog & query
@@ -344,9 +345,10 @@ the top of `src/bpd_mcp/bq.py`.
 
 ### DTC & paid-media analytics
 
-Phase 2 of the DTC performance / pacing work (`src/bpd_mcp/tools/dtc.py`).
-All three compose the DTC and ads logical tables above and share one set of
-definitions, stated in each response's `extra.definitions`:
+Phase 2 of the DTC performance / pacing work (`src/bpd_mcp/tools/dtc.py`),
+plus the subscriber tool the weekly brief's Retention bucket rests on. All
+compose the DTC and ads logical tables above and share one set of definitions,
+stated in each response's `extra.definitions`:
 
 * **Scope** is `channel_bucket`. Buckets not selected are totalled in
   `extra.other_buckets`, never dropped — that is where the $0 ShopMy gifting
@@ -374,13 +376,15 @@ definitions, stated in each response's `extra.definitions`:
 | `bpd_get_ads_performance`       | Spend, impressions, clicks, platform conversions and value by period × channel with CTR/CPC/CPM/CPA/platform ROAS, plus each period's delivery integrity: delivered, confirmed-zero, undiagnosed-gap and unclassified days, summarised as `delivery_flag`. `by_campaign` returns the top-N campaigns by window spend with names and status from `ads_campaigns`. |
 | `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — **demand** (order-level subtotal + shipping, the pacing sheet's definition) and **new-customer demand** (orders on the customer's first order date) with blended MER on demand, NC ROAS (new-customer demand / spend, the sheet's NC RoAS), MER on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
 | `bpd_get_dtc_pacing`            | Month-to-date pacing through the last complete day. **Demand** is the ecomm sheet's definition — order-level subtotal + shipping (Shopify total less tax) over paid core-D2C orders, one row per order — plus spend and new customers, each against the team's daily **forecast** from `config/dtc_pacing_targets.json`: MTD variance, month forecast, to-go, required daily average, run-rate projection. Period over period: the same number of days immediately before the month, the same days last month, and the weekday-aligned (364-day) span last year. Monday-anchored weekly rows and daily rows, each with its plan and weekday-aligned LY. Every actual is the warehouse's; the sheet contributes targets only. Targets missing → actuals still return, `extra.targets` says how to refresh. |
+| `bpd_get_subscription_health`   | Loop subscriber health for a window: **active subscribers** point-in-time (customers with an ACTIVE contract in the row version current on the day asked about — subscribers, not contracts), the **additions** and **reductions** that moved them, counted day by day and summed (daily transitions telescope, so net growth always equals additions − reductions and the change in active — while an endpoint difference would drop anyone who joined and left inside the window), **active MRR** (each contract's price normalised by its billing interval — the book's billing value, which runs above realised cash because Loop holds contracts ACTIVE through skips), **subscription revenue** split into the storefront checkout that starts a subscription and the Loop-generated renewals, and the **take rate** on new customers. A window opening before the SCD2 history starts (2026-06-11) returns null subscriber counts with a note rather than a partial book. |
 
 #### Pacing targets: the ecomm team's sheet as config
 
 The DTC ecomm team paces against a Google Sheet ("2026 Daily Pacing &
 Performance D2C | Biom"), one tab per month, one row per day, with a daily
-**Forecast** (demand), **Forecasted Spend** and **Forecasted NCs** set when the
-tab is created, and a summary block (Total / To Date / To Go / Days Left).
+**Forecast** (demand), **Forecasted Spend**, **Forecasted NCs** and
+**Projected Sub Rev** set when the tab is created, and a summary block
+(Total / To Date / To Go / Days Left).
 The server never reads the sheet: it holds one credential (the read-only
 BigQuery service account) and reads nothing but BigQuery. Instead the forecast
 series live in **`config/dtc_pacing_targets.json`**, regenerated from an
@@ -397,8 +401,11 @@ skips tabs that are not `<Month> <Year>` (the `April 2026 V2` revision, the
 source tabs); and records which export it read and when. Every pacing response
 carries that provenance in `extra.targets`, so a stale file is visible.
 
-**Only the forecast columns are read.** The sheet also carries the team's own
-hand-pulled actuals (Actual DMD, Actual Spend, Total NCs, LY Total DMD); those
+**Only the forecast columns are read** — the daily Forecast, Forecasted
+Spend / NCs / BRoAS / NC DMD / NC RoAS / NC AOV, and `Projected Sub Rev`. The
+sheet also carries the team's own hand-pulled actuals (Actual DMD, Actual
+Spend, Total NCs, LY Total DMD, and the whole "Subscription Data" block of
+active / new / cancelled subscribers and checkout / recurring revenue); those
 are deliberately not in `FIELD_MAP`. Every actual the tools and briefs report
 is BigQuery's, and the sheet is the source of targets and nothing else. The
 definitions do line up: reconciled day by day for Aug 1–Sep 8 2026, the
@@ -411,45 +418,94 @@ team paces.
 #### The scheduled DTC brief
 
 `scripts/dtc_brief.py` turns the DTC tools into the ecomm team's Slack update.
-It runs no SQL of its own: every number is a `bpd_get_dtc_pacing` or
-`bpd_get_marketing_efficiency` payload, so the brief and an interactive
-question to the server can never disagree. Every actual is BigQuery's; the
-pacing sheet supplies the plan and nothing else. Three modes, each a `main`
-message plus threaded `replies`:
+It runs no SQL of its own: every number is a `bpd_get_dtc_pacing`,
+`bpd_get_marketing_efficiency` or `bpd_get_subscription_health` payload, so the
+brief and an interactive question to the server can never disagree. Every
+actual is BigQuery's; the pacing sheet supplies the goals and nothing else.
+Three modes, each a `main` message plus threaded `replies`:
 
 | Mode | When | What it says |
 | ---- | ---- | ------------ |
-| `weekly` | Monday morning ET | The Monday–Sunday week just closed as a scorecard against the plan for those seven days (the daily forecasts summed), with WoW and the trailing four-week average; then the month to date, scored the same way. Replies: the week day by day; the 8-week trend. |
-| `pulse` | Thursday morning ET | The week so far (Monday through yesterday) against its plan and the same weekdays a week earlier, then the month to date. Reply: the days so far. |
+| `weekly` | Monday morning ET | The Monday–Sunday week just closed as a three-part scorecard — **Revenue & Efficiency**, **Acquisition**, **Retention & Subscription Health** — every line against the goal for those seven days and against the prior week; then the month to date. Replies: the week day by day; the 8-week trend. |
+| `subpulse` | Thursday morning ET | The mid-week subscriber pulse: active subscribers, new subscribers and subscriber reductions, each as the level so far with what has moved since Monday. Nothing else. |
 | `recap` | The 1st of the month | The month that just closed against the sheet's month Total, last month and last year, with the certified net revenue after refunds for the P&L tie-out, best and softest day. Replies: by week; by day. |
 
-"Demand" means one thing everywhere in a message: the plan's basis, net sales
-after discounts plus shipping (Shopify total less tax) on paid core-D2C orders,
-taken as `demand` from the efficiency tool for weeks and days and from the
-pacing tool for the month; MER is demand over spend on both. Every line with a
-plan is a **scorecard line** — light first, then the stat: 🟢 at or above plan,
-🟡 within 10% below, 🔴 beyond; CAC reads the other way; spend is ⚪ because
-under-plan spend is a decision rather than a miss. The order is fixed: demand,
-**NC ROAS (aMER)**, **MER (blended)**, new customers, NC demand (month only),
-CAC, spend. NC ROAS — new-customer demand over spend, the sheet's "NC RoAS",
-what acquisition spend actually controls — leads the efficiency pair; blended
-MER follows as the P&L guardrail. Read together they say whether a miss is
-acquisition or the repeat base: NC ROAS red with MER green means repeat revenue
-is carrying the spend; the reverse means acquisition is fine and the repeat
-base is soft. Both plans are ratios of the sheet's summed daily forecasts, like
-the sheet's own BRoAS and NC RoAS columns. **Notes** carry only what the lights
-cannot show: a month or week with no plan loaded, the Meta-history caveat on
-LY comparisons.
+**The three buckets** (weekly), in order:
+
+| Bucket | Lines |
+| ------ | ----- |
+| Revenue & Efficiency | Total revenue · New customer ROAS · Ad spend |
+| Acquisition | New customer CAC · Subscriber take rate · NC demand · New customers |
+| Retention & Subscription Health | Active subscribers · Subscriber additions · Subscriber reductions · Net subscriber growth · Subscription revenue (broken out into checkout and recurring) · Active MRR |
+
+Blended MER, platform ROAS, AOV and first-order share follow as a single
+context line — diagnostic, not scorecard.
+
+**The lights** (the team's convention, set 2026-09-21):
+
+* 🟢 on or above goal **and** improving vs the prior period;
+* 🟡 moving unfavorably by **less than 15%** against goal or the prior period —
+  worth watching, not yet concerning;
+* 🔴 moving unfavorably by **more than 15%** against either — needs attention;
+* ⚪ nothing to judge against (no goal loaded and no prior period).
+
+A line takes its colour from its **worst** available comparison, so 🟢 really
+does mean both are fine. Direction is per metric: **CAC** and **subscriber
+reductions** read the other way (higher is unfavourable), **net subscriber
+growth** is red whenever it is negative however small the move, and **ad spend**
+is scored against the goal only, as a cost — under goal is a decision the team
+made, not a miss, and it gets a word ("room to scale if efficiency holds")
+rather than a colour. Rates are judged at the precision they are *printed* at:
+"1.60x vs 1.60x goal" is on goal, never yellow over a third decimal. A
+comparison against a zero base (a week with no additions before it) has no
+percentage, so the line prints the level it moved from — but the dot still
+reads the direction.
+
+**Where the goals come from.** The pacing sheet states a goal for total
+revenue, ad spend, new customers, NC demand (and the ratios derived from them,
+NC ROAS and CAC) plus **`Projected Sub Rev`**, which paces the *recurring* half
+of subscription revenue — reconciled against BigQuery on 2026-09-21: July
+$83.9K target vs $81.7K realised recurring, August $86.2K vs $73.4K, while
+total subscription revenue those months ran $150K+. It states **no** goal for
+the take rate, active subscribers, additions, reductions, net growth or MRR;
+those lines are scored against the prior period alone, and a Note says so.
+(The sheet's own "Active subscribers / New subscribers / Cancelled subscribers
+/ Checkout Revenue / Recurring Revenue" block is the team's hand-pulled Loop
+**actuals**, not goals, and is read no more than `Actual DMD` is.)
+
+**What a subscriber is.** A customer with at least one ACTIVE Loop contract,
+counted point-in-time from the SCD2 history: the state of a contract at instant
+T is its latest `dtc_subscriptions` row version with `valid_from < T`.
+Additions and reductions are that set's daily transitions, summed — a customer
+who was not a subscriber at the end of one day and is one at the end of the next
+is an addition, and the reverse a reduction. Daily transitions telescope, so
+`net growth = additions − reductions = the change in active` **by construction**:
+the brief cannot show three numbers that do not add up. (Differencing the two
+ENDPOINT sets ties just as neatly and is wrong in a way that hides — anyone who
+joined *and* left inside the window falls out of both counts: over Sep 1–20
+2026 that was 21 customers, 2% of additions and 5% of reductions, and it grows
+with the window.) A window's days are **Central** days, cut at midnight Central
+like `order_date_ct`, and the state a window opening on day D moves from is the
+book at the end of D−1 — so a window opening on the first snapshot day has no
+prior state and returns null counts rather than reporting the whole book as
+additions. Against the Loop
+dashboard figures the team hand-pulls, this count landed within 0.5% every day
+of August 2026 (8,407 vs their 8,410 on the 31st), their day stamped one later
+than ours. `active_mrr` normalises each contract's price by its billing
+interval in months; it is the book's billing value, not next month's cash (see
+follow-up 8).
 
 ```bash
 uv run python scripts/dtc_brief.py --mode weekly            # prints main + [threaded reply]
 uv run python scripts/dtc_brief.py --mode recap --json      # {"main": ..., "replies": [...]}
-uv run python scripts/dtc_brief.py --mode pulse --as-of 2026-09-03   # backtest a past Thursday
+uv run python scripts/dtc_brief.py --mode subpulse --as-of 2026-09-17   # backtest a Thursday
 ```
 
 `--as-of` runs as if today were that date (Central); the month block still
 runs through the day before it. Off schedule, the footer shows both dates
-("data through Sun Sep 6 (month through Thu Sep 10)").
+("data through Sun Sep 6 (month through Thu Sep 10)"). `--mode pulse` is the
+retired name for the Thursday brief and still runs `subpulse`, so a bookmark or
+an un-updated Routine posts the new pulse instead of dying on an argparse error.
 
 **Routines.** Four fresh-session Routines at claude.ai/code/routines, all with
 the Slack connector, all posting to **#ecommerce** after the ads data has
@@ -458,8 +514,8 @@ POST / IF-WRONG prompt pattern:
 
 | Routine | Cron (UTC) | Runs |
 | ------- | ---------- | ---- |
-| DTC weekly brief | `30 13 * * 1` | `dtc_brief.py --mode weekly --json`; posts `main`, then each reply in the thread |
-| DTC Thursday pulse | `30 13 * * 4` | `--mode pulse --json` |
+| DTC weekly brief | `0 12 * * 1` | `dtc_brief.py --mode weekly --json`; posts `main`, then each reply in the thread |
+| DTC mid-week subscriber pulse | `30 13 * * 4` | `--mode subpulse --json`; one message, no replies |
 | DTC month-end recap | `0 14 1 * *` | `--mode recap --json` for the month that just closed; the checked-in config already carries that month's forecast. |
 | DTC pacing targets refresh | `30 14 1 * *` | Exports the pacing sheet to `.xlsx` via the Google Drive connector and runs `refresh_pacing_targets.py --check`; when the new month's tab has landed it commits the regenerated JSON on a branch and opens a PR. If the tab is not there yet (the team adds it late some months) it re-arms itself daily until it is. |
 
@@ -467,9 +523,11 @@ The refresh Routine is the only writer of `config/dtc_pacing_targets.json`
 between months, and the only Routine with a second credential (Google Drive);
 the server itself still holds nothing but the read-only BigQuery account.
 
-Not yet in the brief: subscriber health (active subscribers, churn, skip rate).
-`fct_subscriptions` is not a registered logical table, so those figures still
-come from the team's own pulls; see the follow-ups.
+Still outside the brief: skip rate and cancellation reasons. `fct_subscriptions`
+carries `cancellation_reason` and `fct_subscription_events` carries the pauses,
+but the event feed under-counts against Loop's own dashboard (11 starts on a day
+Loop reported 43), so neither is reported until that gap is understood. Both are
+queryable through `bpd_run_sql` today.
 
 ### Admin
 
@@ -477,7 +535,7 @@ come from the team's own pulls; see the follow-ups.
 | ----------------------- | ------- |
 | `bpd_bigquery_status`   | Which identity we query as (`SESSION_USER()`), where the credential came from (a path or env-var name — never key bytes), project, location, reachable datasets, and an explicit `write_capability: none`. **Replaces `bpd_auth_status`.** |
 | `bpd_data_freshness`    | Per-dataset snapshot and content date ranges, plus the upstream pipeline's own per-pattern ledger: file counts, newest file date, last download, lag in days. **Replaces `bpd_cache_status`.** |
-| `bpd_health_check`      | 12-check audit (see below). First call when diagnosing anything. Its tool smoke test covers all 14 warehouse-only tools, the three DTC/ads tools included. |
+| `bpd_health_check`      | 12-check audit (see below). First call when diagnosing anything. Its tool smoke test covers all 15 warehouse-only tools, the four DTC/ads tools included. |
 
 **Removed in this version**, with no replacement: `bpd_list_top_folders`,
 `bpd_list_folder_contents`, `bpd_get_file_metadata`, `bpd_search_files`,
@@ -874,16 +932,18 @@ The questions themselves are usable today as a manual exercise of the tools.
    are retired.
 7. **`.env.example` still contains committed Kiteworks credentials.** Rotating
    them was explicitly deferred; the file carries a TODO where they were.
-8. **Subscriber health is not in the DTC brief.** The ecomm team's own update
-   carries active subscribers, churn and skip rate; `fct_subscriptions` is not
-   a registered logical table, so the *brief* cannot report them — it composes
-   the typed tools, which only reach the registry. The **data is not out of
-   reach**: `bpd_run_sql` reads `biom_canvas.fct_subscriptions` fully-qualified
-   today (10,229 ACTIVE / 1,017 PAUSED / 19,025 CANCELLED, checked 2026-09-15).
-   Registering it (with the usual role, contract and drift-guard entries) is
-   the prerequisite for putting it *in the brief*, not for querying it. An
-   earlier wording of this entry said only the first half and was read as "the
-   warehouse can't see subscriptions".
+8. **Subscriber history starts 2026-06-11, and MRR is a book value.** The
+   subscriber lines landed in the weekly brief on 2026-09-21 (`dtc_subscriptions`
+   + `bpd_get_subscription_health`), and two limits come with them. The SCD2
+   history in `fct_subscriptions` begins with its first snapshot, so a
+   point-in-time question before 2026-06-11 has no answer — the tool nulls those
+   fields and says so rather than counting a partial book, which also means
+   there is no year-ago subscriber comparison yet. And `active_mrr` is the
+   book's monthly-normalised *billing* value: Loop holds a contract in ACTIVE
+   through skips and failed payments, and ~40% of ACTIVE contracts carry a
+   next-order date in the past, so it runs well above realised recurring
+   revenue (Aug 2026: ~$136K book vs $73K realised). Read it as the size of the
+   book, never as next month's cash.
 9. **The plan basis includes shipping.** The team's forecast (and so the
    brief's "demand") is net sales + shipping; shipping is ~12% of it, so MER,
    AOV and CAC-adjacent ratios all carry it. Most DTC finance teams pace on net
