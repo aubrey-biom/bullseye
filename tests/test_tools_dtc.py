@@ -918,15 +918,17 @@ async def test_schema_incompatible_names_the_role_and_the_columns(fixture_wareho
 # latest before the instant it means. The fixture puts one of every case inside
 # the window Aug 3..16:
 #
-#   k1  customer 1, active throughout            — in both sets, neither count
+#   k1  customer 1, active throughout            — neither count
 #   k2  customer 2, starts Aug 4                 — an ADDITION
 #   k3  customer 4, starts Aug 6                 — an ADDITION
 #   k4  customer 5, cancelled Aug 10 (2 versions)— a REDUCTION
 #   k5  customer 1's SECOND contract, Aug 12     — neither: already a subscriber
+#   k6  customer 6, starts Aug 7, gone Aug 13    — an addition AND a reduction
 #
-# so subscribers go 2 -> 3 on 2 additions and 1 reduction, while CONTRACTS go
-# 2 -> 4. MRR at the close is k1 (30+5, monthly) + k2 (24 / 2mo) + k3 (60 / 3mo)
-# + k5 (12, monthly) = 35 + 12 + 20 + 12 = 79.
+# so subscribers go 2 -> 3 on 3 additions and 2 reductions, while CONTRACTS go
+# 2 -> 4. k6 is the case endpoint differencing dropped from both counts: it is
+# in neither the opening nor the closing set. MRR at the close is k1 (30+5,
+# monthly) + k2 (24 / 2mo) + k3 (60 / 3mo) + k5 (12, monthly) = 79.
 SUBSCRIPTIONS = [
     {
         "subscription_id": "k1",
@@ -991,6 +993,32 @@ SUBSCRIPTIONS = [
         "billing_interval": "MONTH",
         "billing_interval_count": 1,
         "valid_from": "2026-08-10 11:00:00+00",
+        "is_current": True,
+    },
+    {
+        "subscription_id": "k6",
+        "customer_id": 6,
+        "status": "ACTIVE",
+        "subscription_created_date": "2026-08-07",
+        "cancelled_date": None,
+        "recurring_price": 18.0,
+        "recurring_delivery": 0.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 1,
+        "valid_from": "2026-08-07 11:00:00+00",
+        "is_current": False,
+    },
+    {
+        "subscription_id": "k6",
+        "customer_id": 6,
+        "status": "CANCELLED",
+        "subscription_created_date": "2026-08-07",
+        "cancelled_date": "2026-08-13",
+        "recurring_price": 18.0,
+        "recurring_delivery": 0.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 1,
+        "valid_from": "2026-08-13 11:00:00+00",
         "is_current": True,
     },
     {
@@ -1062,7 +1090,9 @@ async def test_subscription_health_counts_subscribers_not_contracts(
     # Customer 1 holds two contracts at the close and still counts once.
     assert (s["active"], s["active_start"]) == (3, 2)
     assert (s["active_subscriptions"], s["active_subscriptions_start"]) == (4, 2)
-    assert (s["additions"], s["reductions"], s["net_growth"]) == (2, 1, 1)
+    # k6 joined Aug 7 and was gone by Aug 13: an addition AND a reduction, in
+    # neither endpoint set. Counting the endpoints would have said (2, 1, 1).
+    assert (s["additions"], s["reductions"], s["net_growth"]) == (3, 2, 1)
     assert resp.data["point_in_time_available"] is True
     assert resp.data["history_start"] == date(2026, 7, 15)
 
@@ -1139,6 +1169,81 @@ async def test_subscription_health_take_rate_is_new_customers_who_arrived_on_a_p
 
 
 @pytest.mark.bq
+async def test_subscription_health_counts_a_join_and_leave_inside_the_window(
+    fixture_warehouse: Any,
+) -> None:
+    """k6 subscribed Aug 7 and was gone by Aug 13 — in neither the opening nor
+    the closing subscriber set. Counting day by day sees both moves; differencing
+    the two endpoints would report the week as if that customer never existed."""
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(
+        wh,
+        SubscriptionHealthInput(
+            start_date=date(2026, 8, 6), end_date=date(2026, 8, 14), response_format="json"
+        ),
+    )
+    s = resp.data["subscribers"]
+    # Aug 6..14: k3 joins (7th), k6 joins (7th) and goes (13th), k4 goes (10th).
+    assert (s["additions"], s["reductions"]) == (2, 2)
+    assert s["active"] == s["active_start"]  # two in, two out
+    assert s["net_growth"] == 0
+
+
+@pytest.mark.bq
+async def test_subscription_health_refuses_a_window_opening_on_the_first_snapshot_day(
+    fixture_warehouse: Any,
+) -> None:
+    """The state a window opening on day D moves from is the book at the end of
+    D-1. On the very first snapshot day there is no such state, so every
+    subscriber would read as an addition from zero — the counts must be null."""
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(
+        wh,
+        SubscriptionHealthInput(
+            start_date=date(2026, 7, 15), end_date=date(2026, 8, 16), response_format="json"
+        ),
+    )
+    assert resp.ok is True, resp.error
+    assert resp.data["history_start"] == date(2026, 7, 15)
+    assert resp.data["point_in_time_available"] is False
+    assert all(v is None for v in resp.data["subscribers"].values())
+    # One day later there IS a prior state, so the counts return.
+    ok = await get_subscription_health(
+        wh,
+        SubscriptionHealthInput(
+            start_date=date(2026, 7, 16), end_date=date(2026, 8, 16), response_format="json"
+        ),
+    )
+    assert ok.data["point_in_time_available"] is True
+    assert ok.data["subscribers"]["active_start"] == 1  # k1 alone, on Jul 15
+
+
+@pytest.mark.bq
+async def test_subscription_health_cuts_the_day_in_central_time(
+    fixture_warehouse: Any,
+) -> None:
+    """The window's days are Central days (order_date_ct's), so the boundary is
+    midnight Central. A snapshot at 02:00 UTC on Aug 11 happened at 21:00 Central
+    on Aug 10 and belongs to the window that ends that day — a UTC cut put it in
+    the next one."""
+    late = [
+        {**r, "valid_from": "2026-08-11 02:00:00+00"}
+        for r in SUBSCRIPTIONS
+        if r["subscription_id"] == "k2"
+    ]
+    rows = [r for r in SUBSCRIPTIONS if r["subscription_id"] != "k2"] + late
+    wh = _subscription_warehouse(fixture_warehouse, dtc_subscriptions=rows)
+    resp = await get_subscription_health(
+        wh,
+        SubscriptionHealthInput(
+            start_date=date(2026, 8, 10), end_date=date(2026, 8, 10), response_format="json"
+        ),
+    )
+    assert resp.ok is True, resp.error
+    assert resp.data["subscribers"]["additions"] == 1  # k2, at 21:00 Central
+
+
+@pytest.mark.bq
 async def test_subscription_health_refuses_a_window_before_the_history_starts(
     fixture_warehouse: Any,
 ) -> None:
@@ -1166,7 +1271,7 @@ async def test_subscription_health_markdown_leads_with_the_book(fixture_warehous
     resp = await get_subscription_health(wh, SubscriptionHealthInput(**WINDOW))
     lines = resp.rendered.splitlines()
     assert lines[0] == "### Subscriber health (2026-08-03..2026-08-16)"
-    assert "**Active subscribers** 3 (from 2) · additions 2 · reductions 1 · net 1" in lines[2]
+    assert "**Active subscribers** 3 (from 2) · additions 3 · reductions 2 · net 1" in lines[2]
     assert "**Active MRR** $79 over 4 contracts" in lines[3]
     assert "checkout $55 (1 orders) + recurring $25 (1 orders)" in lines[4]
     assert "**Take rate** 66.7% — 2 of 3 new customers" in lines[5]

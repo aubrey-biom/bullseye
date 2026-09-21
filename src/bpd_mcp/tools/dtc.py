@@ -1724,17 +1724,18 @@ def _render_pacing_markdown(
 #
 # so "active subscribers on Sunday" is the set of customers who had an active
 # contract in the snapshot that was current then, not today's book filtered by
-# a date. Additions and reductions are the two differences of the same two sets
+# a date. Additions and reductions are that set's DAILY transitions, summed:
 #
-#     additions  = subscribers at the end who were not subscribers at the start
-#     reductions = subscribers at the start who are not subscribers at the end
+#     additions  = days on which a customer became a subscriber
+#     reductions = days on which one stopped being a subscriber
 #     net growth = additions - reductions = active(end) - active(start)
 #
-# which makes the three numbers tie by construction: the brief can never show a
-# net growth that its own additions and reductions do not produce. The cost of
-# that guarantee is that a customer who cancelled AND resubscribed inside the
-# window appears in neither count — a churn-and-return nets out. That is stated
-# in `definitions` rather than papered over.
+# Daily transitions telescope, so the three numbers tie exactly: the brief can
+# never show a net growth its own additions and reductions do not produce. An
+# earlier revision took the two ENDPOINT sets and differenced them, which ties
+# just as neatly and is wrong in a way that hides: anyone who joined AND left
+# inside the window falls out of both counts (over Sep 1-20 2026, 21 customers
+# — 2% of additions and 5% of reductions, and growing with the window).
 #
 # Reconciliation (2026-09-21): against the Loop dashboard figures the ecomm team
 # hand-pulls into their sheet's "Subscription Data" tab, this active-subscriber
@@ -1753,10 +1754,11 @@ _SUBSCRIPTION_DEFINITIONS = {
         "contracts; a customer with two subscriptions counts once"
     ),
     "additions / reductions / net_growth": (
-        "set differences of the same two point-in-time subscriber sets (end vs the instant the "
-        "window opened), so net_growth == additions - reductions == active - active_start by "
-        "construction. A customer who cancelled and resubscribed inside the window nets out "
-        "and appears in neither"
+        "counted day by day over the window and summed — a customer who was not a subscriber at "
+        "the end of one day and is one at the end of the next is an addition, and the reverse a "
+        "reduction — so someone who joined AND left inside the window is counted in both, not "
+        "dropped from both. Daily transitions telescope, so net_growth == additions - reductions "
+        "== active - active_start exactly"
     ),
     "active_subscriptions": "CONTRACT count of the same ACTIVE state — the denominator MRR sums over",
     "active_mrr": (
@@ -1854,10 +1856,6 @@ async def get_subscription_health(
     scust, sstatus = _q(sub["customer_id"]), _q(sub["status"])
     months = _months_expr(_q(sub["interval"]), _q(sub["interval_count"]))
     recurring_sources = ", ".join(f"'{s}'" for s in SUBSCRIPTION_RECURRING_SOURCES)
-    # The window's two instants. "End of a day" is the following midnight, and
-    # the opening instant is the window's own first midnight, so the start state
-    # is the book as it stood before the window's first day began.
-    end_cut, start_cut = f"TIMESTAMP('{end + timedelta(days=1)}')", f"TIMESTAMP('{start}')"
 
     sql = f"""
 WITH subs AS (
@@ -1866,23 +1864,46 @@ WITH subs AS (
            {months} AS months, {vf} AS valid_from
     FROM dtc_subscriptions
 ),
--- The row version of each contract that was current at each instant: latest
--- valid_from strictly before it. This is what makes "a week ago" answerable.
-state_end AS (
-    SELECT * FROM subs WHERE valid_from < {end_cut}
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY valid_from DESC) = 1
+-- Every day boundary the window needs: the day before it opens (the book as it
+-- stood going in) through its last day. "End of day D" is midnight CENTRAL after
+-- D, the same day boundary dtc_order_lines.order_date_ct uses — a UTC cut would
+-- put the last five hours of every Central day in the next one.
+boundaries AS (
+    SELECT d, TIMESTAMP(DATE_ADD(d, INTERVAL 1 DAY), '{REPORTING_TZ}') AS cut
+    FROM UNNEST(GENERATE_DATE_ARRAY(DATE '{start - timedelta(days=1)}',
+                                    DATE '{end}')) AS d
 ),
-state_start AS (
-    SELECT * FROM subs WHERE valid_from < {start_cut}
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY valid_from DESC) = 1
+-- The row version of each contract that was current at each of those instants:
+-- latest valid_from strictly before it. This is what makes "a week ago" answerable.
+state AS (
+    SELECT b.d, s.*
+    FROM boundaries b
+    JOIN subs s ON s.valid_from < b.cut
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY b.d, s.subscription_id
+                               ORDER BY s.valid_from DESC) = 1
 ),
-subscribers_end AS (
-    SELECT DISTINCT customer_id FROM state_end
+subscribers AS (
+    SELECT DISTINCT d, customer_id FROM state
     WHERE status = 'ACTIVE' AND customer_id IS NOT NULL
 ),
-subscribers_start AS (
-    SELECT DISTINCT customer_id FROM state_start
-    WHERE status = 'ACTIVE' AND customer_id IS NOT NULL
+state_end AS (SELECT * FROM state WHERE d = DATE '{end}'),
+state_start AS (SELECT * FROM state WHERE d = DATE '{start - timedelta(days=1)}'),
+-- Additions and reductions are counted DAY BY DAY and summed, not taken as the
+-- difference of the window's two endpoint sets. Both answer "how did the book
+-- move", and over one day they are identical — but over a window the endpoint
+-- difference silently drops anyone who joined AND left inside it (measured over
+-- Sep 1-20 2026: 21 customers, 2% of additions and 5% of reductions). Daily
+-- transitions telescope, so the identity the brief rests on still holds exactly:
+-- additions - reductions == the change in active subscribers.
+transitions AS (
+    SELECT
+        COUNTIF(now.customer_id IS NOT NULL AND prev.customer_id IS NULL) AS additions,
+        COUNTIF(now.customer_id IS NULL AND prev.customer_id IS NOT NULL) AS reductions
+    FROM subscribers now
+    FULL OUTER JOIN subscribers prev
+      ON prev.customer_id = now.customer_id AND prev.d = DATE_SUB(now.d, INTERVAL 1 DAY)
+    WHERE COALESCE(now.d, DATE_ADD(prev.d, INTERVAL 1 DAY))
+          BETWEEN DATE '{start}' AND DATE '{end}'
 ),
 -- Orders at ORDER grain (demand is an order-level figure repeated on lines).
 orders AS (
@@ -1927,12 +1948,10 @@ take AS (
     LEFT JOIN orders o ON o.customer_id = f.customer_id AND o.d = f.first_d
 )
 SELECT
-    (SELECT COUNT(*) FROM subscribers_end) AS active_subscribers,
-    (SELECT COUNT(*) FROM subscribers_start) AS active_subscribers_start,
-    (SELECT COUNT(*) FROM subscribers_end
-      WHERE customer_id NOT IN (SELECT customer_id FROM subscribers_start)) AS additions,
-    (SELECT COUNT(*) FROM subscribers_start
-      WHERE customer_id NOT IN (SELECT customer_id FROM subscribers_end)) AS reductions,
+    (SELECT COUNT(*) FROM subscribers WHERE d = DATE '{end}') AS active_subscribers,
+    (SELECT COUNT(*) FROM subscribers
+      WHERE d = DATE '{start - timedelta(days=1)}') AS active_subscribers_start,
+    transitions.additions, transitions.reductions,
     (SELECT COUNTIF(status = 'ACTIVE') FROM state_end) AS active_subscriptions,
     (SELECT COUNTIF(status = 'ACTIVE') FROM state_start) AS active_subscriptions_start,
     (SELECT SUM(IF(status = 'ACTIVE',
@@ -1945,23 +1964,27 @@ SELECT
     revenue.subscription_revenue, revenue.checkout_revenue, revenue.recurring_revenue,
     revenue.checkout_orders, revenue.recurring_orders, revenue.total_demand,
     take.new_customers, take.new_subscribers
-FROM revenue, take
+FROM revenue, take, transitions
 """
     rows, err = _execute(warehouse, sql, fmt)
     if err is not None or rows is None:
         return err  # type: ignore[return-value]
     row: dict[str, Any] = rows[0] if rows else {}
 
-    # A window that opens before the first snapshot has no "state at the start"
-    # to difference against: the counts would silently describe a partial book.
+    # A window that opens before the history has no "state going in" to move
+    # from: the counts would silently describe a partial book. The boundary is
+    # STRICT — the state a window opening on day D moves from is the book at the
+    # end of D-1, and on the first snapshot day there is no such state, so the
+    # whole book would read as additions from zero.
     hist = row.get("history_start")
     history_start = hist.date() if isinstance(hist, datetime) else _as_pydate(hist)
-    point_in_time = history_start is not None and start >= history_start
+    point_in_time = history_start is not None and start > history_start
     note = None
     if not point_in_time:
         note = (
-            f"subscriber counts need the SCD2 history, which starts {history_start}; a window "
-            f"opening {start} cannot be answered point-in-time, so those fields are null"
+            f"subscriber counts need the state the day BEFORE the window opens, and the SCD2 "
+            f"history starts {history_start}; a window opening {start} cannot be answered "
+            f"point-in-time, so those fields are null"
         )
 
     def _pit(key: str) -> Any:

@@ -289,6 +289,28 @@ def test_retention_block_ties_additions_reductions_and_net_growth() -> None:
     assert len(lines) == 6
 
 
+def test_a_week_recovering_from_negative_net_growth_is_not_red() -> None:
+    """-10 last week to +5 this week is the best news the block can carry. The
+    ordinary percentage against a negative base reads (5 - -10) / -10 = -150%,
+    which painted a recovery red; the dot goes on the direction of the move."""
+    recovering = _subs(subscribers={"net_growth": 5})
+    prior = _subs(subscribers={"net_growth": -10})
+    assert brief.retention_block(recovering, prior, {})[3] == (
+        f"{G} **Net subscriber growth**  +5 · prior week -10"
+    )
+    # Still negative, and worse than an already-negative prior week: red twice over.
+    worse = _subs(subscribers={"net_growth": -25})
+    assert brief.retention_block(worse, prior, {})[3].startswith(R)
+
+
+def test_retention_block_renders_when_gather_returned_no_subscriber_payload() -> None:
+    """`render_weekly` passes `d.get("subs") or {}` — the empty dict has to reach
+    the ⚪ line, not a KeyError."""
+    assert brief.retention_block({}, {}, {}) == [
+        f"{W} **Subscribers**  n/a — no subscriber payload for this window"
+    ]
+
+
 def test_negative_net_subscriber_growth_is_always_red() -> None:
     """The book shrank. However small the move, that is not a watch item."""
     shrinking = _subs(subscribers={"additions": 100, "reductions": 140, "net_growth": -40})

@@ -816,8 +816,10 @@ async def bpd_get_dtc_pacing(
     description=(
         "Loop subscriber health for a window: active subscribers point-in-time (customers "
         "with an ACTIVE contract in the row version current on the day asked about), the "
-        "additions and reductions that moved them — the two set differences, so net growth "
-        "always equals additions minus reductions — active MRR (the book's monthly-normalised "
+        "additions and reductions that moved them, counted day by day and summed (so net "
+        "growth always equals additions minus reductions and the change in active, and a "
+        "customer who joined and left inside the window is counted in both) — active MRR "
+        "(the book's monthly-normalised "
         "billing value, which runs above realised cash because Loop keeps a contract active "
         "through skips), subscription revenue split into the storefront checkout that starts a "
         "subscription and the recurring orders Loop generates afterwards, and the subscriber "

@@ -148,7 +148,12 @@ def _chg(actual: Any, base: Any) -> float | None:
         return None
     if base == 0:
         return 0.0 if actual == 0 else (100.0 if actual > 0 else -100.0)
-    return _pct_change(actual, base)
+    # Against a NEGATIVE base the ordinary formula flips the sign: recovering
+    # from -10 to +5 is (5 - -10) / -10 = -150%, which coloured a recovering
+    # week red. Net subscriber growth is the one metric here that goes negative,
+    # and it is exactly the one where the direction must not lie. Dividing by
+    # the MAGNITUDE keeps "moved up" positive whatever side of zero it is on.
+    return round((float(actual) - float(base)) / abs(float(base)) * 100.0, 2)
 
 
 def _x(v: Any) -> str:
@@ -627,23 +632,27 @@ def retention_block(
 ) -> list[str]:
     """**Retention & Subscription Health** — the subscriber book and what it bills.
 
-    Six lines off one `bpd_get_subscription_health` payload per window, so
-    additions minus reductions is always the net growth shown and always the
-    move in active subscribers. The pacing sheet states one goal here — the
-    recurring half of subscription revenue ("Projected Sub Rev") — so the other
-    five lines are judged on the prior period alone.
+    Six lines off one `bpd_get_subscription_health` payload per window, where
+    additions and reductions are daily transitions summed — so additions minus
+    reductions is always the net growth shown and always the move in active
+    subscribers. The pacing sheet states one goal here — the recurring half of
+    subscription revenue ("Projected Sub Rev") — so the other five lines are
+    judged on the prior period alone.
 
     Two lines break the default direction. Subscriber reductions read as a cost:
     more of them is worse. Net subscriber growth is red whenever it is negative,
     whatever the percentages say — a shrinking book is not a watch item.
     """
+    if not subs.get("point_in_time_available"):
+        # No point-in-time history for this window — or no payload at all, which
+        # is what `render_weekly` hands us when `gather` returned none. Say so
+        # once instead of six ⚪ lines that look like a tool failure, and say it
+        # BEFORE reading a payload that may not have the keys.
+        note = subs.get("note") or "no subscriber payload for this window"
+        return [f"⚪ **Subscribers**  n/a — {note}"]
     s, r = subs["subscribers"], subs["revenue"]
     ps = (prev_subs or {}).get("subscribers") or {}
     pr = (prev_subs or {}).get("revenue") or {}
-    if not subs.get("point_in_time_available"):
-        # No point-in-time history for this window: say so once instead of six
-        # ⚪ lines that look like a tool failure.
-        return [f"⚪ **Subscribers**  n/a — {subs.get('note')}"]
 
     active, prior_active = s.get("active"), ps.get("active")
     net, prior_net = s.get("net_growth"), ps.get("net_growth")
@@ -839,9 +848,9 @@ def footer(p: dict[str, Any], through: date, *, with_subscribers: bool = False) 
     if with_subscribers:
         bits.append(
             "a subscriber is a customer with an ACTIVE Loop contract, counted point-in-time; "
-            "additions and reductions are the two differences of the week's opening and "
-            "closing subscriber sets, so they always net to the change in active; active MRR "
-            "is the book's monthly-normalised billing value, not cash"
+            "additions and reductions are counted day by day and summed, so they always net "
+            "to the change in active; active MRR is the book's monthly-normalised billing "
+            "value, not cash"
         )
     return "_" + " · ".join(bits) + "_"
 
@@ -1017,7 +1026,8 @@ def render_subpulse(d: dict[str, Any]) -> dict[str, Any]:
         f"_month to date {m_start:%b %-d}–{through:%b %-d}; since Monday is "
         f"{_span(wk_start, through)} · a subscriber is a customer with an ACTIVE Loop "
         f"contract, counted point-in-time from BigQuery (bpd_get_subscription_health); "
-        f"additions and reductions always net to the change in active subscribers_",
+        f"new subscribers and reductions are counted day by day and summed, so they always "
+        f"net to the change in active subscribers_",
     ]
     return {"main": "\n".join(lines), "replies": []}
 

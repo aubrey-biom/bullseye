@@ -376,7 +376,7 @@ stated in each response's `extra.definitions`:
 | `bpd_get_ads_performance`       | Spend, impressions, clicks, platform conversions and value by period × channel with CTR/CPC/CPM/CPA/platform ROAS, plus each period's delivery integrity: delivered, confirmed-zero, undiagnosed-gap and unclassified days, summarised as `delivery_flag`. `by_campaign` returns the top-N campaigns by window spend with names and status from `ads_campaigns`. |
 | `bpd_get_marketing_efficiency`  | The blended view per period: all-channel spend against core-D2C paid sales and new customers — **demand** (order-level subtotal + shipping, the pacing sheet's definition) and **new-customer demand** (orders on the customer's first order date) with blended MER on demand, NC ROAS (new-customer demand / spend, the sheet's NC RoAS), MER on gross and on `admin_net_revenue`, blended CAC, cost per order, new-customer share — beside the platforms' own attributed ROAS, so the attribution gap is visible rather than implied. `channels_reporting` says which channels had spend (Meta history starts 2025-07-02). |
 | `bpd_get_dtc_pacing`            | Month-to-date pacing through the last complete day. **Demand** is the ecomm sheet's definition — order-level subtotal + shipping (Shopify total less tax) over paid core-D2C orders, one row per order — plus spend and new customers, each against the team's daily **forecast** from `config/dtc_pacing_targets.json`: MTD variance, month forecast, to-go, required daily average, run-rate projection. Period over period: the same number of days immediately before the month, the same days last month, and the weekday-aligned (364-day) span last year. Monday-anchored weekly rows and daily rows, each with its plan and weekday-aligned LY. Every actual is the warehouse's; the sheet contributes targets only. Targets missing → actuals still return, `extra.targets` says how to refresh. |
-| `bpd_get_subscription_health`   | Loop subscriber health for a window: **active subscribers** point-in-time (customers with an ACTIVE contract in the row version current on the day asked about — subscribers, not contracts), the **additions** and **reductions** that moved them as the two set differences (so net growth always equals additions − reductions and the change in active), **active MRR** (each contract's price normalised by its billing interval — the book's billing value, which runs above realised cash because Loop holds contracts ACTIVE through skips), **subscription revenue** split into the storefront checkout that starts a subscription and the Loop-generated renewals, and the **take rate** on new customers. A window opening before the SCD2 history starts (2026-06-11) returns null subscriber counts with a note rather than a partial book. |
+| `bpd_get_subscription_health`   | Loop subscriber health for a window: **active subscribers** point-in-time (customers with an ACTIVE contract in the row version current on the day asked about — subscribers, not contracts), the **additions** and **reductions** that moved them, counted day by day and summed (daily transitions telescope, so net growth always equals additions − reductions and the change in active — while an endpoint difference would drop anyone who joined and left inside the window), **active MRR** (each contract's price normalised by its billing interval — the book's billing value, which runs above realised cash because Loop holds contracts ACTIVE through skips), **subscription revenue** split into the storefront checkout that starts a subscription and the Loop-generated renewals, and the **take rate** on new customers. A window opening before the SCD2 history starts (2026-06-11) returns null subscriber counts with a note rather than a partial book. |
 
 #### Pacing targets: the ecomm team's sheet as config
 
@@ -476,11 +476,19 @@ those lines are scored against the prior period alone, and a Note says so.
 **What a subscriber is.** A customer with at least one ACTIVE Loop contract,
 counted point-in-time from the SCD2 history: the state of a contract at instant
 T is its latest `dtc_subscriptions` row version with `valid_from < T`.
-Additions and reductions are the two differences of the window's opening and
-closing subscriber sets, so `net growth = additions − reductions = the change in
-active` **by construction** — the brief cannot show three numbers that do not
-add up. The cost of that guarantee: a customer who cancelled and resubscribed
-inside the same window nets out and appears in neither count. Against the Loop
+Additions and reductions are that set's daily transitions, summed — a customer
+who was not a subscriber at the end of one day and is one at the end of the next
+is an addition, and the reverse a reduction. Daily transitions telescope, so
+`net growth = additions − reductions = the change in active` **by construction**:
+the brief cannot show three numbers that do not add up. (Differencing the two
+ENDPOINT sets ties just as neatly and is wrong in a way that hides — anyone who
+joined *and* left inside the window falls out of both counts: over Sep 1–20
+2026 that was 21 customers, 2% of additions and 5% of reductions, and it grows
+with the window.) A window's days are **Central** days, cut at midnight Central
+like `order_date_ct`, and the state a window opening on day D moves from is the
+book at the end of D−1 — so a window opening on the first snapshot day has no
+prior state and returns null counts rather than reporting the whole book as
+additions. Against the Loop
 dashboard figures the team hand-pulls, this count landed within 0.5% every day
 of August 2026 (8,407 vs their 8,410 on the 31st), their day stamped one later
 than ours. `active_mrr` normalises each contract's price by its billing
