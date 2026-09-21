@@ -18,6 +18,12 @@ to the registry (the "DTC + ads" block of bq.py):
                                 customers against the ecomm team's daily
                                 forecast (config/dtc_pacing_targets.json), the
                                 prior period, last month and last year.
+  * `get_subscription_health`  — subscriber health for a window: active
+                                subscribers point-in-time, the additions and
+                                reductions that moved them, active MRR, and
+                                subscription revenue split into the checkout
+                                order that starts a subscription and the
+                                recurring orders that follow.
 
 Definitions are the registry's, never re-derived here:
 
@@ -68,7 +74,12 @@ from zoneinfo import ZoneInfo
 
 from ..bq import DTC_SOURCE_BUCKETS
 from ..column_roles import ColumnNotFound, ResolvedColumn, resolve_column, table_exists
-from ..formatting import make_error_response, make_table_response, render_markdown_table
+from ..formatting import (
+    make_error_response,
+    make_kv_response,
+    make_table_response,
+    render_markdown_table,
+)
 from ..logging_setup import get_logger
 from ..pacing_targets import REFRESH_COMMAND, PacingTargets, TargetsUnavailable, load_targets
 from ..schemas import (
@@ -76,6 +87,7 @@ from ..schemas import (
     DtcPacingInput,
     DtcSalesSummaryInput,
     MarketingEfficiencyInput,
+    SubscriptionHealthInput,
     ToolResponse,
 )
 from ..warehouse import Warehouse, quote_ident
@@ -97,6 +109,15 @@ ROW_CAP = 2000
 
 #: fct_meta_performance's first day. Blended spend before this is Google-only.
 META_HISTORY_START = date(2025, 7, 2)
+
+#: Loop generates the renewal orders under its own order_source; everything
+#: else with purchase_type = 'Subscription' is the storefront checkout that
+#: STARTED the subscription. 'subscription_contract' is the pre-migration
+#: spelling and carries ~0 volume, but costs nothing to keep on the recurring side.
+SUBSCRIPTION_RECURRING_SOURCES: tuple[str, ...] = (
+    "subscription_contract_checkout_one",
+    "subscription_contract",
+)
 
 DELIVERY_DELIVERED = "DELIVERED"
 DELIVERY_ZERO: tuple[str, ...] = ("OBSERVED_ZERO", "CONFIRMED_NO_DELIVERY")
@@ -1683,4 +1704,356 @@ def _render_pacing_markdown(
     lines += ["", "#### Weeks", "", render_markdown_table(weekly, columns=_PACING_WEEKLY_MARKDOWN)]
     if include_daily:
         lines += ["", "#### Days", "", table_md.split("\n\n", 1)[-1]]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------
+# bpd_get_subscription_health
+# --------------------------------------------------------------------------------------
+#
+# Subscriber health for a window: how many subscribers there are, how that
+# number moved, what the book bills per month, and what the subscription
+# revenue in the window was — split into the checkout order that STARTS a
+# subscription and the recurring orders Loop generates afterwards.
+#
+# THE ONE DEFINITION EVERYTHING ELSE FOLLOWS FROM. A subscriber is a CUSTOMER
+# with at least one ACTIVE subscription, counted point-in-time:
+#
+#     state of a subscription at instant T = its latest dtc_subscriptions row
+#                                            version with valid_from < T
+#
+# so "active subscribers on Sunday" is the set of customers who had an active
+# contract in the snapshot that was current then, not today's book filtered by
+# a date. Additions and reductions are the two differences of the same two sets
+#
+#     additions  = subscribers at the end who were not subscribers at the start
+#     reductions = subscribers at the start who are not subscribers at the end
+#     net growth = additions - reductions = active(end) - active(start)
+#
+# which makes the three numbers tie by construction: the brief can never show a
+# net growth that its own additions and reductions do not produce. The cost of
+# that guarantee is that a customer who cancelled AND resubscribed inside the
+# window appears in neither count — a churn-and-return nets out. That is stated
+# in `definitions` rather than papered over.
+#
+# Reconciliation (2026-09-21): against the Loop dashboard figures the ecomm team
+# hand-pulls into their sheet's "Subscription Data" tab, this active-subscriber
+# count landed within 0.5% every day of August 2026 (e.g. 8,407 vs their 8,410),
+# with their day stamped one day later than ours — their pull and the warehouse
+# snapshot do not close the day at the same instant.
+
+#: `next_order_date` is in the past for ~40% of ACTIVE contracts (skips, failed
+#: payments, and rows the snapshot has not revisited), so MRR is the book's
+#: monthly-normalised billing value and NOT a forecast of next month's cash: it
+#: runs materially above realised recurring revenue. Said plainly in `definitions`.
+_SUBSCRIPTION_DEFINITIONS = {
+    "active_subscribers": (
+        "customers with at least one ACTIVE subscription in the dtc_subscriptions row version "
+        "current at the end of the window (latest valid_from before it) — subscribers, not "
+        "contracts; a customer with two subscriptions counts once"
+    ),
+    "additions / reductions / net_growth": (
+        "set differences of the same two point-in-time subscriber sets (end vs the instant the "
+        "window opened), so net_growth == additions - reductions == active - active_start by "
+        "construction. A customer who cancelled and resubscribed inside the window nets out "
+        "and appears in neither"
+    ),
+    "active_subscriptions": "CONTRACT count of the same ACTIVE state — the denominator MRR sums over",
+    "active_mrr": (
+        "SUM((recurring_price + delivery) / billing interval in months) over ACTIVE contracts: "
+        "the book's monthly-normalised BILLING value, not a cash forecast. Loop keeps a "
+        "contract ACTIVE through skips and failed payments, so this runs well above realised "
+        "recurring revenue (Aug 2026: ~$136K book vs $73K realised)"
+    ),
+    "checkout_revenue": (
+        "demand (order_subtotal + order_shipping) on paid core-D2C orders with purchase_type = "
+        "'Subscription' placed through the storefront — the order that STARTS a subscription"
+    ),
+    "recurring_revenue": (
+        "the same basis on Loop-generated renewal orders (order_source in "
+        f"{SUBSCRIPTION_RECURRING_SOURCES}) — the book billing itself"
+    ),
+    "subscription_revenue": "checkout_revenue + recurring_revenue",
+    "take_rate": (
+        "new customers in the window whose acquiring (first paid core-D2C) order carried "
+        "purchase_type = 'Subscription', over all new customers in the window — the share of "
+        "acquisition that arrives on subscription"
+    ),
+    "history_start": (
+        "the first day the SCD2 history can answer a point-in-time question (the earliest "
+        "valid_from). A window opening before it returns null subscriber counts rather than a "
+        "partial book"
+    ),
+}
+
+
+def _months_expr(interval: str, count: str) -> str:
+    """Billing interval -> months, so a per-period price normalises to a month.
+
+    Every live contract bills in MONTH units (verified 2026-09-21); the other
+    arms exist so a WEEK or YEAR plan lands on the right number instead of
+    silently inflating MRR by whatever unit it happens to use."""
+    return (
+        f"CASE {interval} "
+        f"WHEN 'MONTH' THEN CAST({count} AS FLOAT64) "
+        f"WHEN 'YEAR' THEN CAST({count} AS FLOAT64) * 12 "
+        f"WHEN 'WEEK' THEN CAST({count} AS FLOAT64) / 4.345 "
+        f"WHEN 'DAY' THEN CAST({count} AS FLOAT64) / 30.44 END"
+    )
+
+
+async def get_subscription_health(
+    warehouse: Warehouse, params: SubscriptionHealthInput
+) -> ToolResponse:
+    fmt = params.response_format
+    start, end = resolve_window(params.start_date, params.end_date)
+    if err := _window_error(start, end, fmt):
+        return err
+    if err := _require_tables(
+        warehouse, ("dtc_subscriptions", "dtc_order_lines", "dtc_customer_first_order"), fmt
+    ):
+        return err
+    try:
+        sub = _cols(
+            warehouse,
+            "dtc_subscriptions",
+            (
+                "subscription_id",
+                "customer_id",
+                "status",
+                "created_date",
+                "cancelled_date",
+                "price",
+                "delivery",
+                "interval",
+                "interval_count",
+                "valid_from",
+            ),
+        )
+        o = _cols(
+            warehouse,
+            "dtc_order_lines",
+            (
+                "date",
+                "order_id",
+                "customer_id",
+                "source",
+                "bucket",
+                "paid",
+                "purchase_type",
+                "order_subtotal",
+                "order_shipping",
+            ),
+        )
+        n = _cols(warehouse, "dtc_customer_first_order", ("date", "customer_id"))
+    except ColumnNotFound as e:
+        return _column_not_found_error(e, fmt=fmt)
+
+    o_date, n_date = o["date"].select_as_date(), n["date"].select_as_date()
+    vf, sid = _q(sub["valid_from"]), _q(sub["subscription_id"])
+    scust, sstatus = _q(sub["customer_id"]), _q(sub["status"])
+    months = _months_expr(_q(sub["interval"]), _q(sub["interval_count"]))
+    recurring_sources = ", ".join(f"'{s}'" for s in SUBSCRIPTION_RECURRING_SOURCES)
+    # The window's two instants. "End of a day" is the following midnight, and
+    # the opening instant is the window's own first midnight, so the start state
+    # is the book as it stood before the window's first day began.
+    end_cut, start_cut = f"TIMESTAMP('{end + timedelta(days=1)}')", f"TIMESTAMP('{start}')"
+
+    sql = f"""
+WITH subs AS (
+    SELECT {sid} AS subscription_id, {scust} AS customer_id, {sstatus} AS status,
+           {_q(sub["price"])} AS price, {_q(sub["delivery"])} AS delivery,
+           {months} AS months, {vf} AS valid_from
+    FROM dtc_subscriptions
+),
+-- The row version of each contract that was current at each instant: latest
+-- valid_from strictly before it. This is what makes "a week ago" answerable.
+state_end AS (
+    SELECT * FROM subs WHERE valid_from < {end_cut}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY valid_from DESC) = 1
+),
+state_start AS (
+    SELECT * FROM subs WHERE valid_from < {start_cut}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY valid_from DESC) = 1
+),
+subscribers_end AS (
+    SELECT DISTINCT customer_id FROM state_end
+    WHERE status = 'ACTIVE' AND customer_id IS NOT NULL
+),
+subscribers_start AS (
+    SELECT DISTINCT customer_id FROM state_start
+    WHERE status = 'ACTIVE' AND customer_id IS NOT NULL
+),
+-- Orders at ORDER grain (demand is an order-level figure repeated on lines).
+orders AS (
+    SELECT {_q(o["order_id"])} AS order_id,
+           ANY_VALUE({o_date}) AS d,
+           ANY_VALUE({_q(o["customer_id"])}) AS customer_id,
+           ANY_VALUE({_q(o["source"])}) AS order_source,
+           ANY_VALUE({_q(o["purchase_type"])}) AS purchase_type,
+           ANY_VALUE(COALESCE({_q(o["order_subtotal"])}, 0.0)
+                     + COALESCE({_q(o["order_shipping"])}, 0.0)) AS demand
+    FROM dtc_order_lines
+    WHERE {_date_pred(o_date, start, end)}
+      AND {_q(o["bucket"])} = '{CORE_BUCKET}' AND {_q(o["paid"])}
+    GROUP BY order_id
+),
+firsts AS (
+    SELECT {_q(n["customer_id"])} AS customer_id, {n_date} AS first_d
+    FROM dtc_customer_first_order
+    WHERE {_date_pred(n_date, start, end)}
+),
+revenue AS (
+    SELECT
+        SUM(IF(purchase_type = 'Subscription', demand, 0.0)) AS subscription_revenue,
+        SUM(IF(purchase_type = 'Subscription'
+               AND order_source IN ({recurring_sources}), demand, 0.0)) AS recurring_revenue,
+        SUM(IF(purchase_type = 'Subscription'
+               AND order_source NOT IN ({recurring_sources}), demand, 0.0)) AS checkout_revenue,
+        COUNTIF(purchase_type = 'Subscription'
+                AND order_source IN ({recurring_sources})) AS recurring_orders,
+        COUNTIF(purchase_type = 'Subscription'
+                AND order_source NOT IN ({recurring_sources})) AS checkout_orders,
+        SUM(demand) AS total_demand
+    FROM orders
+),
+-- Take rate: of the customers acquired in the window, how many arrived on a
+-- subscription. The acquiring order is the one placed on their first_order_date.
+take AS (
+    SELECT COUNT(DISTINCT f.customer_id) AS new_customers,
+           COUNT(DISTINCT IF(o.purchase_type = 'Subscription', o.customer_id, NULL))
+               AS new_subscribers
+    FROM firsts f
+    LEFT JOIN orders o ON o.customer_id = f.customer_id AND o.d = f.first_d
+)
+SELECT
+    (SELECT COUNT(*) FROM subscribers_end) AS active_subscribers,
+    (SELECT COUNT(*) FROM subscribers_start) AS active_subscribers_start,
+    (SELECT COUNT(*) FROM subscribers_end
+      WHERE customer_id NOT IN (SELECT customer_id FROM subscribers_start)) AS additions,
+    (SELECT COUNT(*) FROM subscribers_start
+      WHERE customer_id NOT IN (SELECT customer_id FROM subscribers_end)) AS reductions,
+    (SELECT COUNTIF(status = 'ACTIVE') FROM state_end) AS active_subscriptions,
+    (SELECT COUNTIF(status = 'ACTIVE') FROM state_start) AS active_subscriptions_start,
+    (SELECT SUM(IF(status = 'ACTIVE',
+                   SAFE_DIVIDE(COALESCE(price, 0.0) + COALESCE(delivery, 0.0), months),
+                   0.0)) FROM state_end) AS active_mrr,
+    (SELECT SUM(IF(status = 'ACTIVE',
+                   SAFE_DIVIDE(COALESCE(price, 0.0) + COALESCE(delivery, 0.0), months),
+                   0.0)) FROM state_start) AS active_mrr_start,
+    (SELECT MIN(valid_from) FROM subs) AS history_start,
+    revenue.subscription_revenue, revenue.checkout_revenue, revenue.recurring_revenue,
+    revenue.checkout_orders, revenue.recurring_orders, revenue.total_demand,
+    take.new_customers, take.new_subscribers
+FROM revenue, take
+"""
+    rows, err = _execute(warehouse, sql, fmt)
+    if err is not None or rows is None:
+        return err  # type: ignore[return-value]
+    row: dict[str, Any] = rows[0] if rows else {}
+
+    # A window that opens before the first snapshot has no "state at the start"
+    # to difference against: the counts would silently describe a partial book.
+    hist = row.get("history_start")
+    history_start = hist.date() if isinstance(hist, datetime) else _as_pydate(hist)
+    point_in_time = history_start is not None and start >= history_start
+    note = None
+    if not point_in_time:
+        note = (
+            f"subscriber counts need the SCD2 history, which starts {history_start}; a window "
+            f"opening {start} cannot be answered point-in-time, so those fields are null"
+        )
+
+    def _pit(key: str) -> Any:
+        return row.get(key) if point_in_time else None
+
+    additions, reductions = _pit("additions"), _pit("reductions")
+    subscribers = {
+        "active": _pit("active_subscribers"),
+        "active_start": _pit("active_subscribers_start"),
+        "additions": additions,
+        "reductions": reductions,
+        "net_growth": (
+            None if additions is None or reductions is None else int(additions) - int(reductions)
+        ),
+        "active_subscriptions": _pit("active_subscriptions"),
+        "active_subscriptions_start": _pit("active_subscriptions_start"),
+        "active_mrr": _pit("active_mrr"),
+        "active_mrr_start": _pit("active_mrr_start"),
+    }
+    revenue = {
+        "subscription_revenue": _f(row.get("subscription_revenue")),
+        "checkout_revenue": _f(row.get("checkout_revenue")),
+        "recurring_revenue": _f(row.get("recurring_revenue")),
+        "checkout_orders": row.get("checkout_orders") or 0,
+        "recurring_orders": row.get("recurring_orders") or 0,
+        "total_demand": _f(row.get("total_demand")),
+        "subscription_share": _ratio(
+            _f(row.get("subscription_revenue")), _f(row.get("total_demand"))
+        ),
+    }
+    new_customers = row.get("new_customers") or 0
+    new_subscribers = row.get("new_subscribers") or 0
+    acquisition = {
+        "new_customers": new_customers,
+        "new_subscribers": new_subscribers,
+        "take_rate": _ratio(float(new_subscribers), float(new_customers)),
+    }
+    data = {
+        "window": {"start": start, "end": end, "days": (end - start).days + 1},
+        "subscribers": subscribers,
+        "revenue": revenue,
+        "acquisition": acquisition,
+        "history_start": history_start,
+        "point_in_time_available": point_in_time,
+        "note": note,
+        "definitions": _SUBSCRIPTION_DEFINITIONS,
+        "resolved_columns": _names(
+            {
+                "dtc_subscriptions": sub,
+                "dtc_order_lines": o,
+                "dtc_customer_first_order": n,
+            }
+        ),
+        "sql": sql,
+    }
+    title = f"Subscriber health ({start}..{end})"
+    resp = make_kv_response(data=data, title=title, fmt=fmt)
+    if fmt == "markdown":
+        resp.rendered = _render_subscription_markdown(title, data)
+    return resp
+
+
+def _share(v: Any) -> str:
+    """A 0-1 share as an unsigned percentage. `_pct` is for CHANGES and signs
+    them (+68.0%), which reads as growth where a share is meant."""
+    return "n/a" if v is None else f"{v * 100:.1f}%"
+
+
+def _render_subscription_markdown(title: str, d: Mapping[str, Any]) -> str:
+    s, r, a = d["subscribers"], d["revenue"], d["acquisition"]
+    lines = [f"### {title}", ""]
+    if d["point_in_time_available"]:
+        lines.append(
+            f"- **Active subscribers** {_fmt_num(s['active'])} "
+            f"(from {_fmt_num(s['active_start'])}) · additions {_fmt_num(s['additions'])} · "
+            f"reductions {_fmt_num(s['reductions'])} · net {_fmt_num(s['net_growth'])}"
+        )
+        lines.append(
+            f"- **Active MRR** {_money(s['active_mrr'])} over "
+            f"{_fmt_num(s['active_subscriptions'])} contracts (book billing value, not cash)"
+        )
+    else:
+        lines.append(f"- **Active subscribers** n/a — {d['note']}")
+    lines.append(
+        f"- **Subscription revenue** {_money(r['subscription_revenue'])} = checkout "
+        f"{_money(r['checkout_revenue'])} ({_fmt_num(r['checkout_orders'])} orders) + recurring "
+        f"{_money(r['recurring_revenue'])} ({_fmt_num(r['recurring_orders'])} orders) · "
+        f"{_share(r['subscription_share'])} of demand"
+    )
+    lines.append(
+        f"- **Take rate** {_share(a['take_rate'])} — "
+        f"{_fmt_num(a['new_subscribers'])} of {_fmt_num(a['new_customers'])} new customers "
+        f"arrived on subscription"
+    )
     return "\n".join(lines)

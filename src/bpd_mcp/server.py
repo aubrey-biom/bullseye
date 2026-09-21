@@ -64,6 +64,7 @@ from .schemas import (
     RunSqlInput,
     SalesSummaryInput,
     SellThroughInput,
+    SubscriptionHealthInput,
     ToolResponse,
     TopSkusInput,
     UpcomingPosInput,
@@ -197,8 +198,9 @@ prefix this server is NOT Target-only. It covers three business surfaces:
     orders, PO plans and DFE forecasts, by TCIN and store.
   * **Shopify DTC** — orders and refunds at line grain, certified net revenue,
     new-vs-returning customers, AOV, and month-to-date pacing against the
-    ecomm team's forecast. Tools: `bpd_get_dtc_sales_summary`,
-    `bpd_get_dtc_pacing`.
+    ecomm team's forecast, plus Loop subscriber health. Tools:
+    `bpd_get_dtc_sales_summary`, `bpd_get_dtc_pacing`,
+    `bpd_get_subscription_health`.
   * **Paid media** — Meta and Google Ads spend, clicks, platform conversions
     and delivery integrity, plus blended MER/CAC against DTC revenue. Tools:
     `bpd_get_ads_performance`, `bpd_get_marketing_efficiency`.
@@ -208,7 +210,7 @@ pre-defines as bare names. That list is a convenience, NOT the access
 boundary: `bpd_run_sql`
 passes fully-qualified references straight through, and the credential reads
 every dataset in the project. Anything in the warehouse that has no logical
-table — `fct_subscriptions`, `dim_product`, `vw_order_line_sku_resolved` — is
+table — `dim_product`, `vw_order_line_sku_resolved` — is
 queryable today as ``SELECT ... FROM `biom-reporting-s26.biom_canvas.<table>` ``.
 So never answer "the warehouse doesn't have that" from the schema listing
 alone; the listing does not say what exists, only what is pre-named.
@@ -804,6 +806,43 @@ async def bpd_get_dtc_pacing(
             as_of=as_of,
             month=month,
             include_daily=include_daily,
+            response_format=response_format,
+        ),
+    )
+
+
+@mcp.tool(
+    name="bpd_get_subscription_health",
+    description=(
+        "Loop subscriber health for a window: active subscribers point-in-time (customers "
+        "with an ACTIVE contract in the row version current on the day asked about), the "
+        "additions and reductions that moved them — the two set differences, so net growth "
+        "always equals additions minus reductions — active MRR (the book's monthly-normalised "
+        "billing value, which runs above realised cash because Loop keeps a contract active "
+        "through skips), subscription revenue split into the storefront checkout that starts a "
+        "subscription and the recurring orders Loop generates afterwards, and the subscriber "
+        "take rate on new customers. A window opening before the SCD2 history starts returns "
+        "null subscriber counts with a note rather than a partial book."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def bpd_get_subscription_health(
+    ctx: Context[Any, Any, Any],
+    start_date: _date | None = None,
+    end_date: _date | None = None,
+    response_format: ResponseFormat = "markdown",
+) -> ToolResponse:
+    app = _ctx(ctx)
+    return await dtc_tools.get_subscription_health(
+        app.warehouse,
+        SubscriptionHealthInput(
+            start_date=start_date,
+            end_date=end_date,
             response_format=response_format,
         ),
     )

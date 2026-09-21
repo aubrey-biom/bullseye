@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from bpd_mcp import bq
+from bpd_mcp import column_roles as cr
 from bpd_mcp.bq import (
     LOGICAL_TABLES,
     CircularDependency,
@@ -809,10 +810,15 @@ def test_latest_state_note_is_present_exactly_where_a_dedup_is():
     # names the view, because base_tables lists the view's row sources instead
     # (see test_registry_entry_is_well_formed).
     with_view = {n for n, t in LOGICAL_TABLES.items() if re.search(r"\.vw_\w+`", t.sql)}
+    # And a third: a body that deliberately does NOT reduce an SCD2 source to
+    # its current version. There the note is the only thing telling a caller
+    # that one business key has many rows here (FEED_KINDS: scd2_history).
+    with_history = {n for n, t in LOGICAL_TABLES.items() if cr.FEED_KINDS[n] == "scd2_history"}
     with_note = {n for n, t in LOGICAL_TABLES.items() if t.latest_state_note}
-    assert with_note == with_qualify | with_view
+    assert with_note == with_qualify | with_view | with_history
     assert with_qualify == {"orders_daily", "forecast_weekly"}
     assert with_view == {"dtc_revenue_lines", "media_delivery_status"}
+    assert with_history == {"dtc_subscriptions"}
 
 
 def test_po_plan_tables_carry_no_registry_level_dedup():

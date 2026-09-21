@@ -4,42 +4,49 @@ The DTC counterpart of scripts/pos_brief.py, on the cadence the ecomm team asked
 for in #ecommerce (weekly, not daily). Three modes, each a `main` message plus
 threaded `replies`:
 
-  weekly (Mondays)   the Mon–Sun week that just closed, scored against the
-                     team's plan for those seven days, with WoW and the trailing
-                     4-week average; then the month to date, scored the same way.
-                     Replies: the week day by day; the 8-week trend.
-  pulse  (Thursdays) the week so far (Mon–yesterday) vs plan and vs the same
-                     weekdays last week, then the month to date. Reply: the days
-                     so far.
+  weekly (Mondays)   the Mon–Sun week that just closed as a three-part
+                     scorecard — Revenue & Efficiency, Acquisition, Retention &
+                     Subscription Health — every line against the team's goal
+                     for those seven days AND the prior week; then the month to
+                     date. Replies: the week day by day; the 8-week trend.
+  subpulse (Thurs)   the mid-week subscriber pulse: active subscribers, new
+                     subscribers and subscriber reductions, each as the level
+                     so far with what has moved since Monday. Nothing else —
+                     it exists to catch a subscriber problem before the week
+                     closes, not to re-report the week.
   recap  (1st)       the month that just closed vs its forecast, last month and
                      last year, with the certified net revenue for the P&L
                      tie-out. Replies: by week; by day.
 
-Every line that has a plan gets a traffic light — 🟢 at or above plan, 🟡 within
-WATCH_VARIANCE_PCT below it, 🔴 beyond that; cost metrics (CAC) read the other
-way; spend is ⚪ because under-plan spend is a decision, not a miss. One stat
-per line, light first, so the message scans as a scorecard rather than prose.
-The efficiency pair is NC ROAS (new-customer demand / spend — the sheet's "NC
-RoAS", a.k.a. acquisition MER or aMER) first, then blended MER (demand / spend,
-the sheet's BRoAS): the first is what spend controls, the second is the P&L
-guardrail, and together they say whether a miss is acquisition or the repeat base.
+THE LIGHTS. Every scorecard line carries a dot, on one convention (the ecomm
+team's, 2026-09-21):
+
+  🟢  on or above goal AND improving vs the prior period
+  🟡  moving unfavorably by less than WATCH_VARIANCE_PCT (15%) against goal or
+      the prior period — worth watching, not yet concerning
+  🔴  moving unfavorably by more than 15% against either — needs attention
+  ⚪  nothing to judge against (no goal loaded and no prior period)
+
+A line is coloured by its WORST available comparison, so "green" really does
+mean both are fine. Direction is per metric: CAC, subscriber reductions and ad
+spend read the other way (higher is unfavourable), and net subscriber growth is
+red whenever it is negative, however small the move. Where the pacing sheet
+states no goal — every subscriber metric except recurring revenue — the line is
+judged on the prior period alone; that is the convention, not a gap.
 
 WHERE THE NUMBERS COME FROM. Every actual is BigQuery, through the server's own
 tools (tools/dtc.py): `bpd_get_dtc_pacing` for the month, `bpd_get_marketing_
-efficiency` for weeks and days. The brief can therefore never disagree with what
-someone gets from the MCP by hand. The ecomm team's pacing sheet contributes
-targets and nothing else — config/dtc_pacing_targets.json, regenerated monthly
-(see bpd_mcp/pacing_targets.py). "Demand" is the sheet's plan basis: net sales
+efficiency` for weeks and days, `bpd_get_subscription_health` for subscribers.
+The brief can therefore never disagree with what someone gets from the MCP by
+hand. The ecomm team's pacing sheet contributes targets and nothing else —
+config/dtc_pacing_targets.json, regenerated monthly (see pacing_targets.py).
+"Total revenue" is the sheet's plan basis, which it calls demand: net sales
 after discounts plus shipping (Shopify total less tax) on paid core-D2C orders,
-one row per order; MER is demand / spend on the same basis.
-
-Not covered yet: subscriber health (active / additions / reductions / take
-rate). fct_subscriptions is not in the registry; when it is, those lines belong
-in a "Retention" section between Acquisition and the month block.
+one row per order.
 
 Usage:
     uv run python scripts/dtc_brief.py --mode weekly
-    uv run python scripts/dtc_brief.py --mode pulse
+    uv run python scripts/dtc_brief.py --mode subpulse
     uv run python scripts/dtc_brief.py --mode recap
     uv run python scripts/dtc_brief.py --mode weekly --as-of 2026-09-07 --json
 """
@@ -60,24 +67,42 @@ from bpd_mcp.pacing_targets import PacingTargets, TargetsUnavailable, load_targe
 from bpd_mcp.schemas import (
     DtcPacingInput,
     MarketingEfficiencyInput,
+    SubscriptionHealthInput,
 )
 from bpd_mcp.tools import dtc
 
-#: The yellow band: a paced series this far below plan is 🟡, beyond it 🔴.
-WATCH_VARIANCE_PCT = 10.0
+#: The yellow band. A metric moving unfavorably by less than this against goal
+#: or the prior period is 🟡; beyond it, 🔴. The ecomm team set it at 15% on
+#: 2026-09-21 (it was 10% while the brief scored demand and spend alone).
+WATCH_VARIANCE_PCT = 15.0
 
 TREND_WEEKS = 8
 
 GREEN, YELLOW, RED, NEUTRAL = "🟢", "🟡", "🔴", "⚪"
 
-#: Plan key -> the sheet's daily forecast series it is summed from. MER, NC ROAS
-#: and CAC are derived from these as ratios of the sums.
+#: Plan key -> the sheet's daily forecast series it is summed from. NC ROAS and
+#: CAC are derived from these as ratios of the sums. `recurring_revenue` is the
+#: sheet's "Projected Sub Rev", which paces the RECURRING half of subscription
+#: revenue (see pacing_targets.FIELD_MAP for the reconciliation).
 PLAN_SERIES = {
     "demand": "forecast_demand",
     "spend": "forecast_spend",
     "new_customers": "forecast_new_customers",
     "nc_demand": "forecast_nc_demand",
+    "recurring_revenue": "forecast_recurring_revenue",
 }
+
+#: Metrics with no goal anywhere in the pacing sheet. Listed so the "no plan for
+#: this week" note can say the subscriber lines are prior-period-only BY DESIGN
+#: rather than leaving a reader to wonder which absence they are looking at.
+GOALLESS_METRICS = (
+    "subscriber take rate",
+    "active subscribers",
+    "subscriber additions",
+    "subscriber reductions",
+    "net subscriber growth",
+    "active MRR",
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -95,8 +120,35 @@ def _k(v: Any) -> str:
 # $ and % render exactly as the tools' own markdown does (n/a for None), so a
 # figure in the brief and the same figure from the MCP read identically.
 _money = dtc._money
-_pct = dtc._pct
 _pct_change = dtc._pct_change
+
+
+def _pct(v: Any) -> str:
+    """The tools' percentage formatter, with a hair below zero shown as zero.
+
+    A rate that is 0.03% off its goal prints "1.60x vs 1.60x goal (-0.0%)",
+    which reads as a miss of something too small to see. The line is on goal;
+    say so."""
+    if v is not None and abs(v) < 0.05:
+        v = 0.0
+    return dtc._pct(v)
+
+
+def _chg(actual: Any, base: Any) -> float | None:
+    """Percent change FOR A LIGHT, including the zero base `_pct_change` cannot
+    express (it returns None, which the lights read as "nothing to judge").
+
+    A week with 4 subscriber additions after a week with none is not
+    unknowable, it is growth; a week with none after a week with four is the
+    opposite; none after none is flat. Judging those ⚪ hid exactly the weeks
+    worth looking at. The printed line still shows "prior week 0" rather than a
+    made-up +100%, because the magnitude is what is unknowable, not the sign.
+    """
+    if actual is None or base is None:
+        return None
+    if base == 0:
+        return 0.0 if actual == 0 else (100.0 if actual > 0 else -100.0)
+    return _pct_change(actual, base)
 
 
 def _x(v: Any) -> str:
@@ -107,16 +159,64 @@ def _n(v: Any) -> str:
     return "n/a" if v is None else f"{v:,.0f}"
 
 
-def _light(variance_pct: float | None, *, good_when_high: bool = True) -> str:
-    """Traffic light on a variance vs plan; ⚪ when there is no plan to judge against."""
-    if variance_pct is None:
+def _signed(v: Any) -> str:
+    return "n/a" if v is None else f"{v:+,.0f}"
+
+
+def _share(v: Any) -> str:
+    """A 0-1 share as an unsigned percentage — a LEVEL, not a change."""
+    return "n/a" if v is None else f"{v * 100:.1f}%"
+
+
+def _light(
+    *variances: float | None,
+    good_when_high: bool = True,
+    force_red: bool = False,
+) -> str:
+    """The dot for a line, from every variance it can be judged on.
+
+    Each argument is a percent change of the actual against one base (the goal,
+    the prior period). None means "no such comparison" and is skipped. The line
+    takes its colour from the WORST of the ones it has, so 🟢 means every
+    available comparison is favourable — on/above goal AND improving — not
+    merely that the first one was.
+
+    `good_when_high=False` flips the sense for cost-type metrics (CAC, spend,
+    subscriber reductions), where a rise is the unfavourable direction.
+    `force_red` is the net-growth rule: negative net growth is red whatever the
+    percentages say.
+    """
+    if force_red:
+        return RED
+    favorable = [(v if good_when_high else -v) for v in variances if v is not None]
+    if not favorable:
         return NEUTRAL
-    v = variance_pct if good_when_high else -variance_pct
-    if v >= 0:
+    worst = min(favorable)
+    if worst >= 0:
         return GREEN
-    if v >= -WATCH_VARIANCE_PCT:
+    if worst >= -WATCH_VARIANCE_PCT:
         return YELLOW
     return RED
+
+
+def _rate_light(
+    actual: Any,
+    goal: Any,
+    prior: Any,
+    fmt: Any,
+    *,
+    good_when_high: bool = True,
+) -> str:
+    """A rate's dot, judged at the precision it is PRINTED at: if the actual and
+    the goal render identically ("1.60x vs 1.60x goal") the line is on goal,
+    never yellow over a third decimal the reader cannot see."""
+    goal_var = _chg(actual, goal)
+    if actual is not None and goal is not None and fmt(actual) == fmt(goal):
+        goal_var = 0.0
+    prior_var = _chg(actual, prior)
+    if actual is not None and prior is not None and fmt(actual) == fmt(prior):
+        prior_var = 0.0
+    return _light(goal_var, prior_var, good_when_high=good_when_high)
 
 
 def _table(rows: list[list[str]], aligns: str) -> str:
@@ -140,14 +240,33 @@ def _stat(light: str, label: str, text: str) -> str:
     return f"{light} **{label}**  {text}"
 
 
-def _vs_plan(actual: float | None, plan: float | None, fmt: Any, *, pct: bool = True) -> str:
-    """`$63.4K vs $66.9K plan (-5.2%)`, or just the actual when there is no plan."""
-    if plan is None:
+def _vs_goal(actual: float | None, goal: float | None, fmt: Any, *, pct: bool = True) -> str:
+    """`$63.4K vs $66.9K goal (-5.2%)`, or just the actual when there is no goal."""
+    if goal is None:
         return str(fmt(actual))
-    s = f"{fmt(actual)} vs {fmt(plan)} plan"
+    s = f"{fmt(actual)} vs {fmt(goal)} goal"
     if pct:
-        s += f" ({_pct(_pct_change(actual, plan))})"
+        s += f" ({_pct(_pct_change(actual, goal))})"
     return s
+
+
+def _vs_prior(
+    actual: float | None,
+    prior: float | None,
+    fmt: Any,
+    *,
+    label: str = "prior week",
+    as_level: bool = False,
+) -> str:
+    """The prior-period half of a line: a % change for volumes, the earlier
+    LEVEL for rates and for signed counts a percentage would make unreadable."""
+    if prior is None:
+        return ""
+    if as_level or _pct_change(actual, prior) is None:
+        # A zero base has no percentage: show the level it moved from instead
+        # of "n/a vs prior week", which reads as a tool failure.
+        return f" · {label} {fmt(prior)}"
+    return f" · {_pct(_pct_change(actual, prior))} vs {label}"
 
 
 # --------------------------------------------------------------------------------------
@@ -156,10 +275,10 @@ def _vs_plan(actual: float | None, plan: float | None, fmt: Any, *, pct: bool = 
 
 
 def plan_for(targets: PacingTargets | None, start: date, end: date) -> dict[str, float | None]:
-    """The team's plan for a span of days: the daily forecasts summed, plus the
+    """The team's goal for a span of days: the daily forecasts summed, plus the
     implied MER, NC ROAS and CAC as ratios of those sums (how the sheet's own BRoAS
     and NC RoAS columns are built). A series is None unless EVERY day in the span
-    carries it — a week straddling a month whose tab has not landed has no plan,
+    carries it — a week straddling a month whose tab has not landed has no goal,
     not half of one. NC ROAS falls back to the mean of the sheet's daily NC RoAS
     column when a tab carries that but not NC DMD, mirroring the pacing tool."""
     out: dict[str, float | None] = dict.fromkeys(PLAN_SERIES)
@@ -233,6 +352,17 @@ async def _days(wh: Any, start: date, end: date, what: str) -> dict[date, dict[s
     return out
 
 
+async def _subs(wh: Any, start: date, end: date, what: str) -> dict[str, Any]:
+    """Subscriber health for one window (see tools/dtc.get_subscription_health)."""
+    return _ok(
+        await dtc.get_subscription_health(
+            wh,
+            SubscriptionHealthInput(start_date=start, end_date=end, response_format="json"),
+        ),
+        what,
+    )
+
+
 async def gather(
     mode: str,
     as_of: date | None = None,
@@ -284,6 +414,22 @@ async def gather(
             )
             return {"mode": mode, "today": today, "pacing": pacing, "month": month}
 
+        if mode == "subpulse":
+            # The mid-week subscriber pulse asks two questions of the same tool:
+            # where the book stands month to date, and what has moved since the
+            # week opened. Monday is the week's own Monday even when the brief
+            # runs later; the window ends on the last COMPLETE day.
+            wk_start = yesterday - timedelta(days=yesterday.weekday())
+            m_start = yesterday.replace(day=1)
+            return {
+                "mode": mode,
+                "today": today,
+                "wtd": (wk_start, yesterday),
+                "mtd": (m_start, yesterday),
+                "since_monday": await _subs(wh, wk_start, yesterday, "subscribers (this week)"),
+                "month_subs": await _subs(wh, m_start, yesterday, "subscribers (month to date)"),
+            }
+
         pacing = _ok(
             # as_of is the last COMPLETE day, so a --as-of backtest paces through the
             # day before the simulated today, exactly as a live run does.
@@ -292,45 +438,32 @@ async def gather(
             ),
             "pacing",
         )
-        if mode == "weekly":
-            wk_start, wk_end = last_complete_week(today)
-            weeks = _ok(
-                await dtc.get_marketing_efficiency(
-                    wh,
-                    MarketingEfficiencyInput(
-                        grain="week",
-                        start_date=wk_start - timedelta(weeks=TREND_WEEKS - 1),
-                        end_date=wk_end,
-                        response_format="json",
-                    ),
+        wk_start, wk_end = last_complete_week(today)
+        prev_start, prev_end = wk_start - timedelta(days=7), wk_end - timedelta(days=7)
+        weeks = _ok(
+            await dtc.get_marketing_efficiency(
+                wh,
+                MarketingEfficiencyInput(
+                    grain="week",
+                    start_date=wk_start - timedelta(weeks=TREND_WEEKS - 1),
+                    end_date=wk_end,
+                    response_format="json",
                 ),
-                "efficiency (weeks)",
-            )
-            shift = timedelta(days=dtc.LY_SHIFT_DAYS)
-            return {
-                "mode": mode,
-                "today": today,
-                "week": (wk_start, wk_end),
-                "pacing": pacing,
-                "weeks": weeks,
-                "days": await _days(wh, wk_start, wk_end, "efficiency (days)"),
-                "ly_days": await _days(wh, wk_start - shift, wk_end - shift, "efficiency (LY)"),
-                "plan": plan_for(targets, wk_start, wk_end),
-                "targets": targets,
-            }
-
-        # pulse: Monday of the current week through yesterday, and the same
-        # weekdays one week earlier.
-        wk_start = yesterday - timedelta(days=yesterday.weekday())
-        wk = timedelta(days=7)
+            ),
+            "efficiency (weeks)",
+        )
+        shift = timedelta(days=dtc.LY_SHIFT_DAYS)
         return {
             "mode": mode,
             "today": today,
-            "wtd": (wk_start, yesterday),
+            "week": (wk_start, wk_end),
             "pacing": pacing,
-            "days": await _days(wh, wk_start, yesterday, "efficiency (this week)"),
-            "prev_days": await _days(wh, wk_start - wk, yesterday - wk, "efficiency (last week)"),
-            "plan": plan_for(targets, wk_start, yesterday),
+            "weeks": weeks,
+            "days": await _days(wh, wk_start, wk_end, "efficiency (days)"),
+            "ly_days": await _days(wh, wk_start - shift, wk_end - shift, "efficiency (LY)"),
+            "plan": plan_for(targets, wk_start, wk_end),
+            "subs": await _subs(wh, wk_start, wk_end, "subscribers (week)"),
+            "prev_subs": await _subs(wh, prev_start, prev_end, "subscribers (prior week)"),
             "targets": targets,
         }
     finally:
@@ -370,105 +503,212 @@ def _sum_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return tot
 
 
-def scorecard(
+def revenue_block(
     cur: dict[str, Any],
-    plan: dict[str, Any],
+    goal: dict[str, Any],
+    prev: dict[str, Any] | None = None,
     *,
-    demand_extra: str = "",
-    compare: dict[str, Any] | None = None,
-    compare_label: str = "",
-    prev_label: str = "",
+    prior_label: str = "prior week",
+    revenue_extra: str = "",
     spend_extra: str = "",
-    with_nc_demand: bool = False,
 ) -> list[str]:
-    """The stat lines, in a fixed order — demand, NC ROAS, MER, new customers,
-    [NC demand], CAC, spend — each scored against `plan` and, where `compare` is
-    given, set beside that window too: volumes as a % change (`compare_label`,
-    e.g. WoW), rates as the earlier level (`prev_label`, e.g. "prior week 3.05x").
+    """**Revenue & Efficiency** — total revenue, new-customer ROAS, ad spend.
 
-    NC ROAS (new-customer demand / spend, the sheet's "NC RoAS", a.k.a. aMER) leads
-    the efficiency pair because it is the ratio spend actually controls; blended
-    MER follows as the P&L guardrail. The pair reads as a diagnosis: NC ROAS red
-    with MER green means the repeat base is carrying the spend; the reverse means
-    acquisition is fine and the repeat base is soft.
+    "Total revenue" is the pacing sheet's own plan basis (it calls the column
+    Forecast and the actual Actual DMD): net sales after discounts plus shipping
+    on paid core-D2C orders. New-customer ROAS is NC demand / spend — the
+    sheet's "NC RoAS", a.k.a. aMER — the ratio acquisition spend actually
+    controls. Ad spend is judged as a cost: over goal is the unfavourable
+    direction, and an underspend gets a word rather than a red dot, because
+    spending under plan is a decision the team makes, not a miss.
     """
-
-    def vs(key: str) -> str:
-        if compare is None:
-            return ""
-        return f" · {_pct(_pct_change(cur.get(key), compare.get(key)))} {compare_label}"
-
-    # Spend is never scored, but being materially off plan in EITHER direction is
-    # worth a word: over plan is where efficiency needs a look, under plan is room.
-    spend_var = _pct_change(cur["spend"], plan.get("spend"))
+    p = prev or {}
+    spend_var = _pct_change(cur.get("spend"), goal.get("spend"))
     spend_note = ""
     if spend_var is not None and spend_var >= WATCH_VARIANCE_PCT:
-        spend_note = " · over plan — check efficiency"
+        spend_note = " · over goal — check efficiency"
     elif spend_var is not None and spend_var <= -WATCH_VARIANCE_PCT:
-        spend_note = spend_extra or " · under plan"
-
-    def was(key: str, fmt: Any) -> str:
-        if compare is None or compare.get(key) is None:
-            return ""
-        return f" · {prev_label or compare_label} {fmt(compare[key])}"
-
-    def rate_light(key: str, fmt: Any, *, good_when_high: bool = True) -> str:
-        """Rates are judged at the precision they are PRINTED at: if the actual and
-        the plan render identically ("1.60x vs 1.60x plan") the line is on plan,
-        never yellow over a third decimal the reader cannot see."""
-        a, b = cur.get(key), plan.get(key)
-        if a is not None and b is not None and fmt(a) == fmt(b):
-            return GREEN
-        return _light(_pct_change(a, b), good_when_high=good_when_high)
-
-    lines = [
+        spend_note = spend_extra or " · under goal"
+    return [
         _stat(
-            _light(_pct_change(cur["demand"], plan.get("demand"))),
-            "Demand",
-            _vs_plan(cur["demand"], plan.get("demand"), _k) + vs("demand") + demand_extra,
+            _light(
+                _chg(cur.get("demand"), goal.get("demand")),
+                _chg(cur.get("demand"), p.get("demand")),
+            ),
+            "Total revenue",
+            _vs_goal(cur.get("demand"), goal.get("demand"), _k)
+            + _vs_prior(cur.get("demand"), p.get("demand"), _k, label=prior_label)
+            + revenue_extra,
         ),
         _stat(
-            rate_light("nc_roas", _x),
-            "NC ROAS (aMER)",
-            _vs_plan(cur.get("nc_roas"), plan.get("nc_roas"), _x, pct=False)
-            + was("nc_roas", _x)
+            _rate_light(cur.get("nc_roas"), goal.get("nc_roas"), p.get("nc_roas"), _x),
+            "New customer ROAS",
+            _vs_goal(cur.get("nc_roas"), goal.get("nc_roas"), _x)
+            + _vs_prior(
+                cur.get("nc_roas"), p.get("nc_roas"), _x, label=prior_label, as_level=True
+            )
             + (f" · NC AOV {_money(cur['nc_aov'])}" if cur.get("nc_aov") is not None else ""),
         ),
         _stat(
-            rate_light("mer", _x),
-            "MER (blended)",
-            _vs_plan(cur["mer"], plan.get("mer"), _x, pct=False) + was("mer", _x),
-        ),
-        _stat(
-            _light(_pct_change(cur["new_customers"], plan.get("new_customers"))),
-            "New customers",
-            _vs_plan(cur["new_customers"], plan.get("new_customers"), _n) + vs("new_customers"),
-        ),
-        _stat(
-            rate_light("cac", _money, good_when_high=False),
-            "CAC",
-            _vs_plan(cur["cac"], plan.get("cac"), _money, pct=False) + was("cac", _money),
-        ),
-        _stat(
-            NEUTRAL,
-            "Spend",
-            _vs_plan(cur["spend"], plan.get("spend"), _k) + vs("spend") + spend_note,
+            # Spend is scored against the GOAL only, as a cost: over goal is the
+            # unfavourable direction, under goal is money the team chose not to
+            # spend. The prior-period move rides along as context and never
+            # colours the line — spending more than last week is not a miss when
+            # the week is still inside plan, and treating it as one made every
+            # scaling week yellow.
+            _light(_chg(cur.get("spend"), goal.get("spend")), good_when_high=False),
+            "Ad spend",
+            _vs_goal(cur.get("spend"), goal.get("spend"), _k)
+            + _vs_prior(cur.get("spend"), p.get("spend"), _k, label=prior_label)
+            + spend_note,
         ),
     ]
-    if with_nc_demand:
-        lines.insert(
-            4,
-            _stat(
-                _light(_pct_change(cur.get("nc_demand"), plan.get("nc_demand"))),
-                "NC demand",
-                _vs_plan(cur.get("nc_demand"), plan.get("nc_demand"), _k) + vs("nc_demand"),
+
+
+def acquisition_block(
+    cur: dict[str, Any],
+    goal: dict[str, Any],
+    prev: dict[str, Any] | None = None,
+    *,
+    take_rate: float | None = None,
+    prev_take_rate: float | None = None,
+    prior_label: str = "prior week",
+) -> list[str]:
+    """**Acquisition** — CAC, subscriber take rate, NC demand, new customers.
+
+    Take rate is the share of the window's new customers whose acquiring order
+    carried a subscription (tools/dtc.get_subscription_health). The sheet states
+    no goal for it, so it is judged on the prior period alone.
+    """
+    p = prev or {}
+    lines = [
+        _stat(
+            _rate_light(
+                cur.get("cac"), goal.get("cac"), p.get("cac"), _money, good_when_high=False
             ),
-        )
+            "New customer CAC",
+            _vs_goal(cur.get("cac"), goal.get("cac"), _money)
+            + _vs_prior(cur.get("cac"), p.get("cac"), _money, label=prior_label, as_level=True),
+        ),
+        _stat(
+            _light(_chg(take_rate, prev_take_rate)),
+            "Subscriber take rate",
+            _share(take_rate)
+            + _vs_prior(take_rate, prev_take_rate, _share, label=prior_label, as_level=True),
+        ),
+        _stat(
+            _light(
+                _chg(cur.get("nc_demand"), goal.get("nc_demand")),
+                _chg(cur.get("nc_demand"), p.get("nc_demand")),
+            ),
+            "NC demand",
+            _vs_goal(cur.get("nc_demand"), goal.get("nc_demand"), _k)
+            + _vs_prior(cur.get("nc_demand"), p.get("nc_demand"), _k, label=prior_label),
+        ),
+        _stat(
+            _light(
+                _chg(cur.get("new_customers"), goal.get("new_customers")),
+                _chg(cur.get("new_customers"), p.get("new_customers")),
+            ),
+            "New customers",
+            _vs_goal(cur.get("new_customers"), goal.get("new_customers"), _n)
+            + _vs_prior(cur.get("new_customers"), p.get("new_customers"), _n, label=prior_label),
+        ),
+    ]
     return lines
 
 
+def retention_block(
+    subs: dict[str, Any],
+    prev_subs: dict[str, Any] | None,
+    goal: dict[str, Any],
+    *,
+    prior_label: str = "prior week",
+) -> list[str]:
+    """**Retention & Subscription Health** — the subscriber book and what it bills.
+
+    Six lines off one `bpd_get_subscription_health` payload per window, so
+    additions minus reductions is always the net growth shown and always the
+    move in active subscribers. The pacing sheet states one goal here — the
+    recurring half of subscription revenue ("Projected Sub Rev") — so the other
+    five lines are judged on the prior period alone.
+
+    Two lines break the default direction. Subscriber reductions read as a cost:
+    more of them is worse. Net subscriber growth is red whenever it is negative,
+    whatever the percentages say — a shrinking book is not a watch item.
+    """
+    s, r = subs["subscribers"], subs["revenue"]
+    ps = (prev_subs or {}).get("subscribers") or {}
+    pr = (prev_subs or {}).get("revenue") or {}
+    if not subs.get("point_in_time_available"):
+        # No point-in-time history for this window: say so once instead of six
+        # ⚪ lines that look like a tool failure.
+        return [f"⚪ **Subscribers**  n/a — {subs.get('note')}"]
+
+    active, prior_active = s.get("active"), ps.get("active")
+    net, prior_net = s.get("net_growth"), ps.get("net_growth")
+    recurring_goal = goal.get("recurring_revenue")
+    return [
+        _stat(
+            _light(_chg(active, prior_active)),
+            "Active subscribers",
+            _n(active) + _vs_prior(active, prior_active, _n, label=prior_label),
+        ),
+        _stat(
+            _light(_chg(s.get("additions"), ps.get("additions"))),
+            "Subscriber additions",
+            _n(s.get("additions"))
+            + _vs_prior(s.get("additions"), ps.get("additions"), _n, label=prior_label),
+        ),
+        _stat(
+            _light(
+                _chg(s.get("reductions"), ps.get("reductions")), good_when_high=False
+            ),
+            "Subscriber reductions",
+            _n(s.get("reductions"))
+            + _vs_prior(s.get("reductions"), ps.get("reductions"), _n, label=prior_label),
+        ),
+        _stat(
+            _light(
+                _chg(net, prior_net),
+                force_red=net is not None and net < 0,
+            ),
+            "Net subscriber growth",
+            _signed(net)
+            + _vs_prior(net, prior_net, _signed, label=prior_label, as_level=True),
+        ),
+        _stat(
+            _light(
+                _chg(r.get("recurring_revenue"), recurring_goal),
+                _chg(r.get("subscription_revenue"), pr.get("subscription_revenue")),
+            ),
+            "Subscription revenue",
+            f"{_k(r.get('subscription_revenue'))} — checkout {_k(r.get('checkout_revenue'))} · "
+            f"recurring {_vs_goal(r.get('recurring_revenue'), recurring_goal, _k)}"
+            + _vs_prior(
+                r.get("subscription_revenue"),
+                pr.get("subscription_revenue"),
+                _k,
+                label=prior_label,
+            ),
+        ),
+        _stat(
+            _light(_chg(s.get("active_mrr"), ps.get("active_mrr"))),
+            "Active MRR",
+            _k(s.get("active_mrr"))
+            + _vs_prior(s.get("active_mrr"), ps.get("active_mrr"), _k, label=prior_label),
+        ),
+    ]
+
+
 def month_block(p: dict[str, Any]) -> list[str]:
-    """The month to date, scored against the sheet's plan; `final` shape once closed."""
+    """The month to date, scored against the sheet's goal; `final` shape once closed.
+
+    The same vocabulary as the week's buckets (total revenue, new-customer ROAS,
+    CAC, ad spend) so one number never has two names in one message. It carries
+    no subscriber lines: the sheet has no month goal for them, and the week's
+    Retention block already answers the question.
+    """
     s = p["summary"]
     mtd, fc = s["mtd"], s.get("forecast_mtd") or {}
     fm, tg, rd = (
@@ -485,14 +725,13 @@ def month_block(p: dict[str, Any]) -> list[str]:
         if done
         else f"**{through:%B} — day {s['elapsed_days']} of {s['days_in_month']}**"
     )
-    demand_extra = ""
+    revenue_extra = ""
     if not done and fm.get("demand") is not None:
-        demand_extra = (
+        revenue_extra = (
             f" · run-rate {_k(rr['demand'])} vs {_k(fm['demand'])} forecast "
             f"({_pct(pvf.get('demand_pct'))})"
         )
-    spend_extra = " · room to scale if efficiency holds"  # used only when spend is under plan
-    plan = {
+    goal = {
         "demand": fc.get("demand"),
         "spend": fc.get("spend"),
         "new_customers": fc.get("new_customers"),
@@ -503,8 +742,22 @@ def month_block(p: dict[str, Any]) -> list[str]:
     }
     lines = [
         head,
-        *scorecard(
-            mtd, plan, demand_extra=demand_extra, spend_extra=spend_extra, with_nc_demand=True
+        *revenue_block(
+            mtd,
+            goal,
+            revenue_extra=revenue_extra,
+            spend_extra=" · room to scale if efficiency holds",
+        ),
+        *acquisition_block(mtd, goal)[:1],  # CAC; take rate and NC lines follow
+        _stat(
+            _light(_chg(mtd.get("nc_demand"), goal.get("nc_demand"))),
+            "NC demand",
+            _vs_goal(mtd.get("nc_demand"), goal.get("nc_demand"), _k),
+        ),
+        _stat(
+            _light(_chg(mtd.get("new_customers"), goal.get("new_customers"))),
+            "New customers",
+            _vs_goal(mtd.get("new_customers"), goal.get("new_customers"), _n),
         ),
     ]
     tail = []
@@ -532,24 +785,38 @@ def notes_block(p: dict[str, Any]) -> list[str]:
     t = p.get("targets") or {}
     if t.get("status") != "ok":
         notes.append(
-            f"No plan loaded for this month ({t.get('status')}); the month lines show actuals "
+            f"No goal loaded for this month ({t.get('status')}); the month lines show actuals "
             f"only. {t.get('note') or ''}".strip()
         )
     return notes
 
 
+def subscriber_notes(subs: dict[str, Any] | None) -> list[str]:
+    """What the subscriber lines are judged against, and what they cannot say."""
+    if not subs:
+        return []
+    notes = [
+        "The pacing sheet sets no goal for the subscriber lines or the take rate ("
+        + ", ".join(GOALLESS_METRICS)
+        + "), so those are scored against the prior period alone."
+    ]
+    if subs.get("note"):
+        notes.append(str(subs["note"]) + ".")
+    return notes
+
+
 def week_plan_note(plan: dict[str, Any], start: date, end: date) -> list[str]:
     """Why the week lines are unscored, when they are: a day in the span has no
-    forecast (its month's tab is not in the config), so there is no week plan."""
+    forecast (its month's tab is not in the config), so there is no week goal."""
     if plan.get("demand") is not None:
         return []
     return [
-        f"No plan for {_span(start, end)}: the pacing sheet has no forecast for every day in "
+        f"No goal for {_span(start, end)}: the pacing sheet has no forecast for every day in "
         f"it (a month's tab is missing from the config), so those lines show actuals only."
     ]
 
 
-def footer(p: dict[str, Any], through: date) -> str:
+def footer(p: dict[str, Any], through: date, *, with_subscribers: bool = False) -> str:
     """Provenance line. `through` is the brief's own window end; when the month
     block runs further (an off-schedule run mid-week) both dates are shown."""
     t = p.get("targets") or {}
@@ -561,14 +828,21 @@ def footer(p: dict[str, Any], through: date) -> str:
     ]
     if t.get("status") == "ok":
         bits.append(
-            f'plan: "{t.get("month_tab")}" tab of the pacing sheet, refreshed '
+            f'goals: "{t.get("month_tab")}" tab of the pacing sheet, refreshed '
             f"{str(src.get('refreshed_at', '?'))[:10]}"
         )
     bits.append(
-        "demand = net sales + shipping (Shopify total less tax) on paid core-D2C orders; "
-        "NC ROAS (aMER) = new-customer demand / spend; MER (blended) = demand / spend; "
-        "spend = Meta + Google"
+        "total revenue = net sales + shipping (Shopify total less tax) on paid core-D2C orders "
+        "(the sheet's demand); NC ROAS = new-customer demand / spend; CAC = spend / new "
+        "customers; spend = Meta + Google"
     )
+    if with_subscribers:
+        bits.append(
+            "a subscriber is a customer with an ACTIVE Loop contract, counted point-in-time; "
+            "additions and reductions are the two differences of the week's opening and "
+            "closing subscriber sets, so they always net to the change in active; active MRR "
+            "is the book's monthly-normalised billing value, not cash"
+        )
     return "_" + " · ".join(bits) + "_"
 
 
@@ -581,9 +855,9 @@ def daily_table(
     *,
     title: str,
 ) -> str:
-    """Day-by-day rows for a span, with the plan and LY per day and a total row."""
+    """Day-by-day rows for a span, with the goal and LY per day and a total row."""
     shift = timedelta(days=dtc.LY_SHIFT_DAYS)
-    tbl = [["Day", "Demand", "vs plan", "vs LY", "Spend", "NCs", "CAC"]]
+    tbl = [["Day", "Revenue", "vs goal", "vs LY", "Spend", "NCs", "CAC"]]
     d = start
     while d <= end:
         r = days.get(d, {})
@@ -641,29 +915,36 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     prev = _sum_rows([prev_row]) if prev_row else None
     trailing = [by[k] for k in sorted(by) if k < str(wk_start)][-4:]
     avg4 = _sum_rows(trailing)["demand"] / len(trailing) if trailing else None
-    demand_extra = (
+    revenue_extra = (
         f" · {_pct(_pct_change(cur['demand'], avg4))} vs {len(trailing)}-wk avg" if avg4 else ""
     )
+    subs, prev_subs = d.get("subs") or {}, d.get("prev_subs") or {}
+    take = (subs.get("acquisition") or {}).get("take_rate")
+    prev_take = (prev_subs.get("acquisition") or {}).get("take_rate")
 
-    lines = [f"🛒 **DTC — week of {_span(wk_start, wk_end)}**", "", "**Week vs plan**"]
-    lines += scorecard(
-        cur,
-        d["plan"],
-        demand_extra=demand_extra,
-        compare=prev,
-        compare_label="WoW",
-        prev_label="prior week",
+    lines = [f"🛒 **DTC — week of {_span(wk_start, wk_end)}**", "", "**Revenue & Efficiency**"]
+    lines += revenue_block(cur, d["plan"], prev, revenue_extra=revenue_extra)
+    lines += ["", "**Acquisition**"]
+    lines += acquisition_block(
+        cur, d["plan"], prev, take_rate=take, prev_take_rate=prev_take
     )
+    lines += ["", "**Retention & Subscription Health**"]
+    lines += retention_block(subs, prev_subs, d["plan"])
     share = f"{cur['nc_share'] * 100:.0f}%" if cur["nc_share"] is not None else "n/a"
-    lines.append(
-        f"Platform ROAS {_x(cur_row.get('platform_roas'))} · AOV {_money(cur['aov'])} · "
-        f"{share} of orders were first orders"
-    )
+    lines += [
+        "",
+        f"Blended MER {_x(cur['mer'])} · platform ROAS {_x(cur_row.get('platform_roas'))} · "
+        f"AOV {_money(cur['aov'])} · {share} of orders were first orders",
+    ]
     lines += ["", *month_block(d["pacing"])]
-    notes = week_plan_note(d["plan"], wk_start, wk_end) + notes_block(d["pacing"])
+    notes = (
+        week_plan_note(d["plan"], wk_start, wk_end)
+        + notes_block(d["pacing"])
+        + subscriber_notes(subs)
+    )
     if notes:
         lines += ["", "**Notes**", *[f"• {n}" for n in notes]]
-    lines += ["", footer(d["pacing"], wk_end)]
+    lines += ["", footer(d["pacing"], wk_end, with_subscribers=True)]
 
     replies = [
         daily_table(
@@ -675,7 +956,7 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
             title=f"Day by day — {_span(wk_start, wk_end)}",
         )
     ]
-    tbl = [["Week", "Demand", "WoW", "Spend", "NC ROAS", "MER", "NCs", "CAC", "NC share"]]
+    tbl = [["Week", "Revenue", "WoW", "Spend", "NC ROAS", "MER", "NCs", "CAC", "NC share"]]
     p_row = None
     for r in rows[-TREND_WEEKS:]:
         p_start = date.fromisoformat(str(r["period"]))
@@ -702,35 +983,43 @@ def render_weekly(d: dict[str, Any]) -> dict[str, Any]:
     return {"main": "\n".join(lines), "replies": replies}
 
 
-def render_pulse(d: dict[str, Any]) -> dict[str, Any]:
+def render_subpulse(d: dict[str, Any]) -> dict[str, Any]:
+    """The mid-week subscriber pulse: three lines, each a level month to date
+    with what has moved since Monday beside it.
+
+    No dots. The weekly brief is the scorecard; this exists so a subscriber
+    problem — a cancellation spike, a stalled book — is visible on Thursday
+    instead of the following Monday, and a colour on three days of data would
+    claim more than the numbers support.
+    """
     wk_start, through = d["wtd"]
-    cur = _sum_rows(list(d["days"].values()))
-    prev = _sum_rows(list(d["prev_days"].values()))
+    m_start, _ = d["mtd"]
+    wk, mtd = d["since_monday"]["subscribers"], d["month_subs"]["subscribers"]
+    if not d["since_monday"].get("point_in_time_available"):
+        body = f"⚪ Subscriber counts unavailable — {d['since_monday'].get('note')}"
+        return {"main": f"🔁 **DTC — mid-week subscriber pulse**\n\n{body}", "replies": []}
+
     n = (through - wk_start).days + 1
     lines = [
-        f"🛒 **DTC — week so far** ({_span(wk_start, through)})",
+        f"🔁 **DTC — mid-week subscriber pulse** ({_span(wk_start, through)})",
         "",
-        f"**{n} day{'' if n == 1 else 's'} in, vs plan** · WoW is the same weekdays last week",
+        f"**Active subscribers**  {_n(mtd.get('active'))} "
+        f"({_signed(wk.get('net_growth'))} since Monday)",
+        f"**New subscribers**  {_n(mtd.get('additions'))} so far this month "
+        f"({_signed(wk.get('additions'))} since Monday)",
+        f"**Subscriber reductions**  {_n(mtd.get('reductions'))} so far this month "
+        f"({_signed(wk.get('reductions'))} since Monday)",
     ]
-    lines += scorecard(cur, d["plan"], compare=prev, compare_label="WoW", prev_label="last week")
     if n <= 1:
-        lines.append("ⓘ Only one day of the week has closed — read this as directional.")
-    lines += ["", *month_block(d["pacing"])]
-    notes = week_plan_note(d["plan"], wk_start, through) + notes_block(d["pacing"])
-    if notes:
-        lines += ["", "**Notes**", *[f"• {x}" for x in notes]]
-    lines += ["", footer(d["pacing"], through)]
-    replies = [
-        daily_table(
-            wk_start,
-            through,
-            d["days"],
-            None,
-            d.get("targets"),
-            title=f"Day by day — {_span(wk_start, through)}",
-        )
+        lines += ["", "ⓘ Only one day of the week has closed — read this as directional."]
+    lines += [
+        "",
+        f"_month to date {m_start:%b %-d}–{through:%b %-d}; since Monday is "
+        f"{_span(wk_start, through)} · a subscriber is a customer with an ACTIVE Loop "
+        f"contract, counted point-in-time from BigQuery (bpd_get_subscription_health); "
+        f"additions and reductions always net to the change in active subscribers_",
     ]
-    return {"main": "\n".join(lines), "replies": replies}
+    return {"main": "\n".join(lines), "replies": []}
 
 
 def render_recap(d: dict[str, Any]) -> dict[str, Any]:
@@ -749,7 +1038,7 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
     lines = [f"🛒 **DTC — {label} recap**{verdict}", "", "**Month vs forecast**"]
     # Every "vs forecast" is against the sheet's stated month Total — the same
     # base for every line, not the MTD variance whose base is the summed daily series.
-    plan = {
+    goal = {
         "demand": fm.get("demand"),
         "spend": fm.get("spend"),
         "new_customers": fm.get("new_customers"),
@@ -761,10 +1050,23 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
         "nc_roas": fc.get("nc_roas"),
         "cac": dtc._ratio(fm.get("spend"), fm.get("new_customers")),
     }
-    lines += scorecard(mtd, plan, with_nc_demand=True)
+    lines += revenue_block(mtd, goal)
+    lines += acquisition_block(mtd, goal)[:1]
+    lines += [
+        _stat(
+            _light(_chg(mtd.get("nc_demand"), goal.get("nc_demand"))),
+            "NC demand",
+            _vs_goal(mtd.get("nc_demand"), goal.get("nc_demand"), _k),
+        ),
+        _stat(
+            _light(_chg(mtd.get("new_customers"), goal.get("new_customers"))),
+            "New customers",
+            _vs_goal(mtd.get("new_customers"), goal.get("new_customers"), _n),
+        ),
+    ]
     lines.append(
-        f"{_n(mtd['orders'])} orders · AOV {_money(mtd['aov'])} · platform ROAS "
-        f"{_x(mtd['platform_roas'])}"
+        f"{_n(mtd['orders'])} orders · AOV {_money(mtd['aov'])} · blended MER "
+        f"{_x(mtd['mer'])} · platform ROAS {_x(mtd['platform_roas'])}"
     )
 
     # Finance tie-out: the certified figure, after refunds, beside the plan-basis demand.
@@ -774,13 +1076,13 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
         lines += [
             "",
             f"**Net revenue (certified, after refunds)** {_k(m['admin_net_revenue'])} · "
-            f"{_pct(_pct_change(m['admin_net_revenue'], mtd['demand']))} vs demand, the gap "
-            f"being shipping and refunds",
+            f"{_pct(_pct_change(m['admin_net_revenue'], mtd['demand']))} vs total revenue, the "
+            f"gap being shipping and refunds",
         ]
 
     lines += [
         "",
-        f"**vs last year** demand {_pct(ly['demand_change_pct'])} · new customers "
+        f"**vs last year** revenue {_pct(ly['demand_change_pct'])} · new customers "
         f"{_pct(ly['new_customers_change_pct'])} · spend {_pct(ly['spend_change_pct'])} "
         f"(full LY month {_k(lym['demand'])}) · **vs prior month** {_pct(pm['demand_change_pct'])}",
     ]
@@ -799,7 +1101,7 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
 
     # Replies: the week-by-week build, then every day.
     wk = p.get("weekly") or []
-    tbl = [["Week", "Days", "Demand", "vs plan", "vs LY", "Spend", "NCs"]]
+    tbl = [["Week", "Days", "Revenue", "vs goal", "vs LY", "Spend", "NCs"]]
     for w in wk:
         tbl.append(
             [
@@ -816,7 +1118,7 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
         f"**{label} by week** (Monday-anchored; first and last are partial)\n"
         f"```\n{_table(tbl, 'lrrrrrr')}\n```"
     ]
-    dt = [["Day", "Demand", "vs plan", "vs LY", "Spend", "NCs"]]
+    dt = [["Day", "Revenue", "vs goal", "vs LY", "Spend", "NCs"]]
     for r in daily:
         dd = date.fromisoformat(str(r["day"]))
         dt.append(
@@ -834,10 +1136,19 @@ def render_recap(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def render(d: dict[str, Any]) -> dict[str, Any]:
-    return {"weekly": render_weekly, "pulse": render_pulse, "recap": render_recap}[d["mode"]](d)
+    return {"weekly": render_weekly, "subpulse": render_subpulse, "recap": render_recap}[
+        d["mode"]
+    ](d)
+
+
+#: `pulse` was the Thursday week-so-far brief the subscriber pulse replaced on
+#: 2026-09-21. It stays accepted so a Routine or bookmark that still says
+#: `--mode pulse` posts the new pulse instead of dying on an argparse error.
+MODE_ALIASES = {"pulse": "subpulse"}
 
 
 def build(mode: str, as_of: date | None = None, targets_path: str | None = None) -> dict[str, Any]:
+    mode = MODE_ALIASES.get(mode, mode)
     targets = load_targets(targets_path) if targets_path else None
     return render(asyncio.run(gather(mode, as_of, targets=targets)))
 
@@ -846,7 +1157,13 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--mode", choices=["weekly", "pulse", "recap"], default="weekly")
+    ap.add_argument(
+        "--mode",
+        choices=["weekly", "subpulse", "recap", "pulse"],
+        default="weekly",
+        help="weekly (Mondays), subpulse (mid-week subscriber pulse), recap (the 1st). "
+        "`pulse` is the retired name for subpulse and still runs it.",
+    )
     ap.add_argument(
         "--as-of",
         help="YYYY-MM-DD: run as if today were this date (Central), to backtest a past Monday/Thursday/1st",

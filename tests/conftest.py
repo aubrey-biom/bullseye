@@ -239,6 +239,22 @@ _TYPES: dict[str, str] = {
     "allocated_refund": "FLOAT64",
     "refund_amount": "FLOAT64",
     "lifetime_orders": "INT64",
+    # ---- Loop subscriptions (dtc_subscriptions is SCD2 history: `valid_from`
+    # orders the row versions of one contract and is a real TIMESTAMP) ----
+    "subscription_id": "STRING",
+    "subscription_created_date": "DATE",
+    "cancelled_date": "DATE",
+    "paused_date": "DATE",
+    "next_order_date": "DATE",
+    "recurring_price": "FLOAT64",
+    "recurring_delivery": "FLOAT64",
+    "billing_interval": "STRING",
+    "billing_interval_count": "INT64",
+    "completed_orders_count": "INT64",
+    "is_loop_subscription_certified": "BOOL",
+    "valid_from": "TIMESTAMP",
+    "valid_to": "TIMESTAMP",
+    "is_current": "BOOL",
     "channel": "STRING",
     "campaign_id": "STRING",
     "campaign_name": "STRING",
@@ -261,6 +277,8 @@ def _literal(col: str, value: Any) -> str:
         return f"CAST(NULL AS {sql_type})"
     if sql_type == "DATE":
         return f"DATE '{value}'"
+    if sql_type == "TIMESTAMP":
+        return f"TIMESTAMP '{value}'"
     if sql_type == "STRING":
         escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
         return f"'{escaped}'"

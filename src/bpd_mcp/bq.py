@@ -1023,6 +1023,71 @@ GROUP BY customer_id
 )
 
 
+# ---------- DTC: Loop subscriptions ----------
+
+_register(
+    LogicalTable(
+        name="dtc_subscriptions",
+        domain="dtc",
+        # THE ONE ENTRY THAT DELIBERATELY DOES NOT FILTER `is_current`.
+        #
+        # Every other SCD2 body here reduces to the current version (Rule 1),
+        # because every other question is about now. Subscriber health is not:
+        # "active subscribers a week ago" is a question about the row version
+        # that was current THEN, and `is_current` has thrown that away. So the
+        # history comes through whole and the caller picks the version:
+        #
+        #   the state of a subscription as of T = its latest row with
+        #   valid_from < T  (tools/dtc.py get_subscription_health)
+        #
+        # `is_deleted` rows ARE dropped: a hard-deleted contract was never a
+        # subscriber. The SCD2 history starts when the Loop feed was first
+        # snapshotted (2026-06-11) — `history_start` in the tool's response —
+        # and a point-in-time question before that day has no answer here, so
+        # the tool refuses it rather than counting a partial book.
+        #
+        # `subscription_created_date` / `cancelled_date` are Central to match
+        # `dtc_order_lines.order_date_ct`; the price columns are per BILLING
+        # PERIOD, so a monthly-normalised figure must divide by the interval
+        # (`billing_interval_count` months), never sum them raw.
+        sql=f"""
+SELECT subscription_id, customer_id, status,
+       DATE(subscription_created_at, 'America/Chicago') AS subscription_created_date,
+       DATE(cancelled_at, 'America/Chicago') AS cancelled_date,
+       DATE(paused_at, 'America/Chicago') AS paused_date,
+       CAST(total_line_item_discounted_price AS FLOAT64) AS recurring_price,
+       CAST(delivery_price AS FLOAT64) AS recurring_delivery,
+       billing_interval, billing_interval_count,
+       DATE(next_order_date, 'America/Chicago') AS next_order_date,
+       completed_orders_count, is_loop_subscription_certified,
+       valid_from, valid_to, is_current
+FROM `{_P}.biom_canvas.fct_subscriptions`
+WHERE NOT is_deleted
+""",
+        base_tables=(f"{_P}.biom_canvas.fct_subscriptions",),
+        date_column="subscription_created_date",
+        latest_state_note=(
+            "SCD2 history, NOT reduced to is_current: point-in-time subscriber counts need "
+            "the version that was current on the day asked about. Every row version is here, "
+            "so one subscription contributes several rows — de-duplicate on subscription_id "
+            "(latest valid_from before the as-of instant) before counting anything."
+        ),
+        column_contract=(
+            "subscription_id",
+            "customer_id",
+            "status",
+            "subscription_created_date",
+            "cancelled_date",
+            "recurring_price",
+            "billing_interval",
+            "billing_interval_count",
+            "valid_from",
+            "is_current",
+        ),
+    )
+)
+
+
 # ---------- Ads: Meta and Google daily performance ----------
 #
 # None of the ad facts is SCD2 (no is_current); each row is keyed by row_id and

@@ -5,7 +5,8 @@ Pacing & Performance D2C | Biom", with one tab per month. Each tab has a header
 row, one row per calendar day, and a summary block (Total / To Date / To Go /
 Days Left / Daily Average Needed / weekly subtotals). The daily *forecast*
 columns — Forecast (demand), Forecasted Spend, Forecasted NCs, Forecasted BRoAS,
-Forecasted NC DMD / RoAS / AOV — are set once, when the month's tab is created,
+Forecasted NC DMD / RoAS / AOV, Projected Sub Rev — are set once, when the
+month's tab is created,
 and are the targets the team paces against. The *actual* columns are their own
 pulls from Shopify and the ad platforms.
 
@@ -57,6 +58,22 @@ FIELD_MAP: dict[str, str] = {
     "forecast_nc_demand": "Forecasted NC DMD",
     "forecast_nc_roas": "Forecasted NC RoAS",
     "forecast_nc_aov": "Forecasted NC AOV",
+    # "Projected Sub Rev" is the subscription line of the demand build: on the
+    # tabs that also carry "Projected Ship Rev" / "Projected Repeat Rev" those
+    # three plus Forecasted NC DMD add up to the day's Forecast. It paces the
+    # RECURRING half of subscription revenue — the orders Loop generates — not
+    # the checkout orders that start a subscription, which land in the
+    # new-customer demand line instead. Reconciled against BigQuery on
+    # 2026-09-21: Jul $83.9K target vs $81.7K realised recurring, Aug $86.2K vs
+    # $73.4K, while TOTAL subscription revenue those months ran $150K+. Hence
+    # the field name: it is the recurring target, whatever the column is called.
+    #
+    # It is also the ONLY subscription target the sheet states. The "Active
+    # subscribers / New subscribers / Cancelled subscribers / Checkout Revenue /
+    # Recurring Revenue" block on the right of each tab is the team's own
+    # hand-pulled Loop ACTUALS, not goals, and stays out of FIELD_MAP for the
+    # same reason Actual DMD does.
+    "forecast_recurring_revenue": "Projected Sub Rev",
 }
 
 TARGET_FIELDS: tuple[str, ...] = tuple(FIELD_MAP)

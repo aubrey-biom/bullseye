@@ -33,12 +33,14 @@ from bpd_mcp.schemas import (
     AdsPerformanceInput,
     DtcSalesSummaryInput,
     MarketingEfficiencyInput,
+    SubscriptionHealthInput,
 )
 from bpd_mcp.tools import dtc
 from bpd_mcp.tools.dtc import (
     get_ads_performance,
     get_dtc_sales_summary,
     get_marketing_efficiency,
+    get_subscription_health,
 )
 
 # ---------------------------------------------------------------------------
@@ -431,6 +433,9 @@ def test_days_in_window_clips_the_period() -> None:
         lambda wh: get_marketing_efficiency(
             wh, MarketingEfficiencyInput(start_date=date(2026, 8, 10), end_date=date(2026, 8, 3))
         ),
+        lambda wh: get_subscription_health(
+            wh, SubscriptionHealthInput(start_date=date(2026, 8, 10), end_date=date(2026, 8, 3))
+        ),
     ],
 )
 async def test_inverted_window_is_rejected_before_any_query(call: Any) -> None:
@@ -447,6 +452,10 @@ async def test_inverted_window_is_rejected_before_any_query(call: Any) -> None:
         (
             lambda wh: get_marketing_efficiency(wh, MarketingEfficiencyInput(**WINDOW)),
             "dtc_order_lines",
+        ),
+        (
+            lambda wh: get_subscription_health(wh, SubscriptionHealthInput(**WINDOW)),
+            "dtc_subscriptions",
         ),
     ],
 )
@@ -898,3 +907,267 @@ async def test_schema_incompatible_names_the_role_and_the_columns(fixture_wareho
     assert resp.error.details["role"] == "gross"
     assert resp.error.details["dataset"] == "dtc_order_lines"
     assert "net_line" in resp.error.details["actual_columns"]
+
+
+# ---------------------------------------------------------------------------
+# bpd_get_subscription_health
+# ---------------------------------------------------------------------------
+#
+# dtc_subscriptions is SCD2 HISTORY (see the registry entry): one row per
+# version of a contract, and the tool reads the version whose valid_from is the
+# latest before the instant it means. The fixture puts one of every case inside
+# the window Aug 3..16:
+#
+#   k1  customer 1, active throughout            — in both sets, neither count
+#   k2  customer 2, starts Aug 4                 — an ADDITION
+#   k3  customer 4, starts Aug 6                 — an ADDITION
+#   k4  customer 5, cancelled Aug 10 (2 versions)— a REDUCTION
+#   k5  customer 1's SECOND contract, Aug 12     — neither: already a subscriber
+#
+# so subscribers go 2 -> 3 on 2 additions and 1 reduction, while CONTRACTS go
+# 2 -> 4. MRR at the close is k1 (30+5, monthly) + k2 (24 / 2mo) + k3 (60 / 3mo)
+# + k5 (12, monthly) = 35 + 12 + 20 + 12 = 79.
+SUBSCRIPTIONS = [
+    {
+        "subscription_id": "k1",
+        "customer_id": 1,
+        "status": "ACTIVE",
+        "subscription_created_date": "2026-07-15",
+        "cancelled_date": None,
+        "recurring_price": 30.0,
+        "recurring_delivery": 5.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 1,
+        "valid_from": "2026-07-15 11:00:00+00",
+        "is_current": True,
+    },
+    {
+        "subscription_id": "k2",
+        "customer_id": 2,
+        "status": "ACTIVE",
+        "subscription_created_date": "2026-08-04",
+        "cancelled_date": None,
+        "recurring_price": 24.0,
+        "recurring_delivery": 0.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 2,
+        "valid_from": "2026-08-04 11:00:00+00",
+        "is_current": True,
+    },
+    {
+        "subscription_id": "k3",
+        "customer_id": 4,
+        "status": "ACTIVE",
+        "subscription_created_date": "2026-08-06",
+        "cancelled_date": None,
+        "recurring_price": 60.0,
+        "recurring_delivery": 0.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 3,
+        "valid_from": "2026-08-06 11:00:00+00",
+        "is_current": True,
+    },
+    {
+        "subscription_id": "k4",
+        "customer_id": 5,
+        "status": "ACTIVE",
+        "subscription_created_date": "2026-07-20",
+        "cancelled_date": None,
+        "recurring_price": 45.0,
+        "recurring_delivery": 0.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 1,
+        "valid_from": "2026-07-20 11:00:00+00",
+        "is_current": False,
+    },
+    {
+        "subscription_id": "k4",
+        "customer_id": 5,
+        "status": "CANCELLED",
+        "subscription_created_date": "2026-07-20",
+        "cancelled_date": "2026-08-10",
+        "recurring_price": 45.0,
+        "recurring_delivery": 0.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 1,
+        "valid_from": "2026-08-10 11:00:00+00",
+        "is_current": True,
+    },
+    {
+        "subscription_id": "k5",
+        "customer_id": 1,
+        "status": "ACTIVE",
+        "subscription_created_date": "2026-08-12",
+        "cancelled_date": None,
+        "recurring_price": 12.0,
+        "recurring_delivery": 0.0,
+        "billing_interval": "MONTH",
+        "billing_interval_count": 1,
+        "valid_from": "2026-08-12 11:00:00+00",
+        "is_current": True,
+    },
+]
+
+# o6 is the storefront checkout that STARTS customer 4's subscription; o2 (in
+# ORDER_LINES above) is a Loop renewal. Checkout 55, recurring 25.
+SUB_ORDER_LINES = [
+    *ORDER_LINES,
+    {
+        "order_date_ct": "2026-08-06",
+        "order_id": "o6",
+        "customer_id": 4,
+        "order_source": "web",
+        "channel_bucket": "core_d2c",
+        "purchase_type": "Subscription",
+        "is_paid_order": True,
+        "is_product_line": True,
+        "order_subtotal": 50.0,
+        "order_shipping": 5.0,
+        "quantity": 1,
+        "gross_line": 55.0,
+        "net_line": 50.0,
+        "order_total": 60.0,
+        "order_tax": 5.0,
+        "order_discounts": 0.0,
+        "variant_id": "v1",
+    },
+]
+SUB_FIRST_ORDERS = [
+    *FIRST_ORDERS,
+    {"first_order_date": "2026-08-06", "customer_id": 4, "lifetime_orders": 1},
+]
+
+
+def _subscription_warehouse(fixture_warehouse: Any, **over: Any) -> Any:
+    return fixture_warehouse(
+        **{
+            "dtc_subscriptions": SUBSCRIPTIONS,
+            "dtc_order_lines": SUB_ORDER_LINES,
+            "dtc_customer_first_order": SUB_FIRST_ORDERS,
+            **over,
+        }
+    )
+
+
+@pytest.mark.bq
+async def test_subscription_health_counts_subscribers_not_contracts(
+    fixture_warehouse: Any,
+) -> None:
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(
+        wh, SubscriptionHealthInput(**WINDOW, response_format="json")
+    )
+    assert resp.ok is True, resp.error
+    s = resp.data["subscribers"]
+    # Customer 1 holds two contracts at the close and still counts once.
+    assert (s["active"], s["active_start"]) == (3, 2)
+    assert (s["active_subscriptions"], s["active_subscriptions_start"]) == (4, 2)
+    assert (s["additions"], s["reductions"], s["net_growth"]) == (2, 1, 1)
+    assert resp.data["point_in_time_available"] is True
+    assert resp.data["history_start"] == date(2026, 7, 15)
+
+
+@pytest.mark.bq
+async def test_subscription_health_net_growth_always_ties_to_the_two_counts(
+    fixture_warehouse: Any,
+) -> None:
+    """The guarantee the brief's Retention block rests on: whatever the window,
+    net growth is additions minus reductions AND the move in active subscribers.
+    Nothing in the brief can show three numbers that do not add up."""
+    wh = _subscription_warehouse(fixture_warehouse)
+    for start, end in (
+        (date(2026, 8, 3), date(2026, 8, 16)),
+        (date(2026, 8, 3), date(2026, 8, 9)),
+        (date(2026, 8, 10), date(2026, 8, 16)),
+        (date(2026, 8, 17), date(2026, 8, 23)),  # a window after everything
+    ):
+        resp = await get_subscription_health(
+            wh,
+            SubscriptionHealthInput(start_date=start, end_date=end, response_format="json"),
+        )
+        assert resp.ok is True, resp.error
+        s = resp.data["subscribers"]
+        assert s["net_growth"] == s["additions"] - s["reductions"], (start, end)
+        assert s["net_growth"] == s["active"] - s["active_start"], (start, end)
+
+
+@pytest.mark.bq
+async def test_subscription_health_mrr_normalises_the_billing_interval(
+    fixture_warehouse: Any,
+) -> None:
+    """A contract that bills $60 every three months is $20 of MRR, never $60."""
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(
+        wh, SubscriptionHealthInput(**WINDOW, response_format="json")
+    )
+    s = resp.data["subscribers"]
+    assert s["active_mrr"] == pytest.approx(79.0)  # 35 + 12 + 20 + 12
+    assert s["active_mrr_start"] == pytest.approx(80.0)  # k1 35 + k4 45
+
+
+@pytest.mark.bq
+async def test_subscription_health_splits_checkout_from_recurring_revenue(
+    fixture_warehouse: Any,
+) -> None:
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(
+        wh, SubscriptionHealthInput(**WINDOW, response_format="json")
+    )
+    r = resp.data["revenue"]
+    # o6 through the storefront starts a subscription; o2 is Loop renewing one.
+    assert r["checkout_revenue"] == pytest.approx(55.0) and r["checkout_orders"] == 1
+    assert r["recurring_revenue"] == pytest.approx(25.0) and r["recurring_orders"] == 1
+    assert r["subscription_revenue"] == pytest.approx(80.0)
+    # Demand over the same paid core-D2C orders: gifting and the unknown bucket
+    # are out, so 40 + 25 + 20 + 55.
+    assert r["total_demand"] == pytest.approx(140.0)
+    assert r["subscription_share"] == pytest.approx(80.0 / 140.0)
+
+
+@pytest.mark.bq
+async def test_subscription_health_take_rate_is_new_customers_who_arrived_on_a_plan(
+    fixture_warehouse: Any,
+) -> None:
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(
+        wh, SubscriptionHealthInput(**WINDOW, response_format="json")
+    )
+    a = resp.data["acquisition"]
+    # Three new customers in the window; 2 and 4 arrived on a subscription.
+    assert (a["new_customers"], a["new_subscribers"]) == (3, 2)
+    assert a["take_rate"] == pytest.approx(2 / 3)
+
+
+@pytest.mark.bq
+async def test_subscription_health_refuses_a_window_before_the_history_starts(
+    fixture_warehouse: Any,
+) -> None:
+    """Point-in-time counts before the first SCD2 snapshot would describe a
+    partial book. Null them and say why, rather than report a number that looks
+    like a collapse in subscribers."""
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(
+        wh,
+        SubscriptionHealthInput(
+            start_date=date(2026, 7, 1), end_date=date(2026, 8, 16), response_format="json"
+        ),
+    )
+    assert resp.ok is True, resp.error
+    assert resp.data["point_in_time_available"] is False
+    assert all(v is None for v in resp.data["subscribers"].values())
+    assert "2026-07-15" in resp.data["note"]
+    # The revenue and take-rate halves do not depend on the history and stand.
+    assert resp.data["revenue"]["subscription_revenue"] == pytest.approx(80.0)
+
+
+@pytest.mark.bq
+async def test_subscription_health_markdown_leads_with_the_book(fixture_warehouse: Any) -> None:
+    wh = _subscription_warehouse(fixture_warehouse)
+    resp = await get_subscription_health(wh, SubscriptionHealthInput(**WINDOW))
+    lines = resp.rendered.splitlines()
+    assert lines[0] == "### Subscriber health (2026-08-03..2026-08-16)"
+    assert "**Active subscribers** 3 (from 2) · additions 2 · reductions 1 · net 1" in lines[2]
+    assert "**Active MRR** $79 over 4 contracts" in lines[3]
+    assert "checkout $55 (1 orders) + recurring $25 (1 orders)" in lines[4]
+    assert "**Take rate** 66.7% — 2 of 3 new customers" in lines[5]
+
